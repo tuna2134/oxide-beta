@@ -21,12 +21,13 @@ fn main() -> Result<()> {
     let epochs = environment_usize("MNIST_EPOCHS", 1);
     // The reference kernels favor clarity over speed. These defaults are deliberately
     // small so the complete example is practical on a CPU; raise them for a real run.
-    let batch_size = environment_usize("MNIST_BATCH_SIZE", 1);
+    let batch_size = environment_usize("MNIST_BATCH_SIZE", 2);
     let train_limit = environment_usize("MNIST_TRAIN_LIMIT", 4);
     let test_limit = environment_usize("MNIST_TEST_LIMIT", 8);
 
     let mnist = Mnist::load(&data_directory)?;
     let mut model = MobileNetV4ConvSmall::mnist(device)?;
+    model.train();
     let mut optimizer = AdamW::new(1e-3, 1e-4)?;
 
     println!(
@@ -71,6 +72,7 @@ fn main() -> Result<()> {
         );
     }
 
+    model.eval();
     let mut correct = 0;
     let mut seen = 0;
     for batch in mnist

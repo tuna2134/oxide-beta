@@ -1,7 +1,7 @@
 //! `MobileNetV4` models described by tables 11-15 of `mobilenet.pdf`.
 
 use crate::nn::{
-    ConvNormAct, FusedInvertedBottleneck, Module, ModuleMode, Parameter, Trainable,
+    Conv2d, ConvNormAct, FusedInvertedBottleneck, Module, ModuleMode, Parameter, Trainable,
     UniversalInvertedBottleneck,
 };
 use crate::{Device, Error, Result, Tensor};
@@ -12,6 +12,7 @@ use std::path::Path;
 #[derive(Clone, Debug)]
 enum Block {
     Conv(ConvNormAct),
+    Classifier(Conv2d),
     Fused(FusedInvertedBottleneck),
     Uib(UniversalInvertedBottleneck),
     GlobalAverage,
@@ -21,6 +22,7 @@ impl Block {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         match self {
             Self::Conv(layer) => layer.forward(input),
+            Self::Classifier(layer) => layer.forward(input),
             Self::Fused(layer) => layer.forward(input),
             Self::Uib(layer) => layer.forward(input),
             Self::GlobalAverage => input.global_avg_pool2d(),
@@ -32,6 +34,7 @@ impl Trainable for Block {
     fn visit_parameters(&self, visitor: &mut dyn FnMut(&Parameter)) {
         match self {
             Self::Conv(layer) => layer.visit_parameters(visitor),
+            Self::Classifier(layer) => layer.visit_parameters(visitor),
             Self::Fused(layer) => layer.visit_parameters(visitor),
             Self::Uib(layer) => layer.visit_parameters(visitor),
             Self::GlobalAverage => {}
@@ -41,6 +44,7 @@ impl Trainable for Block {
     fn visit_parameters_mut(&mut self, visitor: &mut dyn FnMut(&mut Parameter)) {
         match self {
             Self::Conv(layer) => layer.visit_parameters_mut(visitor),
+            Self::Classifier(layer) => layer.visit_parameters_mut(visitor),
             Self::Fused(layer) => layer.visit_parameters_mut(visitor),
             Self::Uib(layer) => layer.visit_parameters_mut(visitor),
             Self::GlobalAverage => {}
@@ -50,6 +54,7 @@ impl Trainable for Block {
     fn visit_buffers(&self, visitor: &mut dyn FnMut(&[usize], &[f32])) -> Result<()> {
         match self {
             Self::Conv(layer) => layer.visit_buffers(visitor),
+            Self::Classifier(_) => Ok(()),
             Self::Fused(layer) => layer.visit_buffers(visitor),
             Self::Uib(layer) => layer.visit_buffers(visitor),
             Self::GlobalAverage => Ok(()),
@@ -61,6 +66,7 @@ impl ModuleMode for Block {
     fn set_training(&mut self, training: bool) {
         match self {
             Self::Conv(layer) => layer.set_training(training),
+            Self::Classifier(_) => {}
             Self::Fused(layer) => layer.set_training(training),
             Self::Uib(layer) => layer.set_training(training),
             Self::GlobalAverage => {}
@@ -81,7 +87,7 @@ pub struct MobileNetV4ConvSmall {
 impl MobileNetV4ConvSmall {
     pub const INPUT_RESOLUTION: usize = 224;
 
-    /// Builds the table-11 network with zero-initialized/folded parameters.
+    /// Builds the table-11 network with trainable convolution and BatchNorm parameters.
     ///
     /// # Errors
     ///
@@ -148,7 +154,7 @@ impl MobileNetV4ConvSmall {
             Block::Conv(ConvNormAct::new(128, 960, 1, 1, 1, true, device)?),
             Block::GlobalAverage,
             Block::Conv(ConvNormAct::new(960, 1280, 1, 1, 1, true, device)?),
-            Block::Conv(ConvNormAct::new(1280, num_classes, 1, 1, 1, false, device)?),
+            Block::Classifier(Conv2d::new(1280, num_classes, 1, 1, 1, device)?),
         ]);
         Ok(Self {
             blocks,
@@ -346,8 +352,8 @@ mod tests {
         use crate::optim::{AdamW, Optimizer};
 
         let mut model = MobileNetV4ConvSmall::mnist(Device::Cpu).unwrap();
-        let input = Tensor::zeros(vec![1, 1, 28, 28]).unwrap();
-        let target = Tensor::from_vec(vec![3.0], vec![1]).unwrap();
+        let input = Tensor::zeros(vec![2, 1, 28, 28]).unwrap();
+        let target = Tensor::from_vec(vec![3.0, 7.0], vec![2]).unwrap();
         let mut optimizer = AdamW::new(1e-3, 1e-4).unwrap();
         optimizer.zero_grad(&model).unwrap();
         let loss = cross_entropy(&model.forward(&input).unwrap(), &target).unwrap();

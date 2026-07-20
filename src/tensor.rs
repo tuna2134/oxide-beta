@@ -408,8 +408,7 @@ impl Tensor {
             let buffers = state
                 .lock()
                 .map_err(|_| Error::Execution("BatchNorm state lock was poisoned".into()))?;
-            if buffers.running_mean.len() != channels
-                || buffers.running_variance.len() != channels
+            if buffers.running_mean.len() != channels || buffers.running_variance.len() != channels
             {
                 return Err(Error::InvalidShape(
                     "batch_norm2d running statistics must match the channel count".into(),
@@ -947,8 +946,7 @@ fn update_running_statistics(
         let biased_variance = statistics.inverse_standard_deviation[channel].powi(-2);
         buffers.running_mean[channel] =
             (1.0 - momentum) * buffers.running_mean[channel] + momentum * statistics.mean[channel];
-        buffers.running_variance[channel] = (1.0 - momentum)
-            * buffers.running_variance[channel]
+        buffers.running_variance[channel] = (1.0 - momentum) * buffers.running_variance[channel]
             + momentum * biased_variance * unbiased_correction;
     }
     Ok(())
@@ -1209,8 +1207,7 @@ fn backward_batch_norm2d(
     let mut gradient_sum = vec![0.0; channels];
     let mut gradient_normalized_sum = vec![0.0; channels];
 
-    for (index, (&output_gradient, &input_value)) in
-        gradient.iter().zip(&input_values).enumerate()
+    for (index, (&output_gradient, &input_value)) in gradient.iter().zip(&input_values).enumerate()
     {
         let channel = (index / spatial) % channels;
         let normalized = (input_value - statistics.mean[channel])
@@ -1221,15 +1218,13 @@ fn backward_batch_norm2d(
         gradient_normalized_sum[channel] += output_gradient * normalized;
     }
 
-    for (index, (&output_gradient, &input_value)) in
-        gradient.iter().zip(&input_values).enumerate()
+    for (index, (&output_gradient, &input_value)) in gradient.iter().zip(&input_values).enumerate()
     {
         let channel = (index / spatial) % channels;
         input_gradient[index] = if training {
             let normalized = (input_value - statistics.mean[channel])
                 * statistics.inverse_standard_deviation[channel];
-            weight_values[channel] * statistics.inverse_standard_deviation[channel]
-                / samples_f32
+            weight_values[channel] * statistics.inverse_standard_deviation[channel] / samples_f32
                 * (samples_f32 * output_gradient
                     - gradient_sum[channel]
                     - normalized * gradient_normalized_sum[channel])
