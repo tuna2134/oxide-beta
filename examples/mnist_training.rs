@@ -8,11 +8,14 @@ use std::path::PathBuf;
 
 fn main() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let use_cuda = arguments.iter().any(|argument| argument == "--cuda");
+    let use_cuda = arguments.iter().any(|argument| argument == "--cuda")
+        || environment_flag("OXIDE_TORCH_CUDA");
     let data_directory = arguments
         .iter()
         .find(|argument| !argument.starts_with("--"))
-        .map_or_else(|| PathBuf::from("data/mnist"), PathBuf::from);
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("MNIST_DATA_DIR").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("data/mnist"));
     let device = if use_cuda {
         Device::Cuda(0)
     } else {
@@ -75,9 +78,10 @@ fn main() -> Result<()> {
     model.eval();
     let mut correct = 0;
     let mut seen = 0;
+    let evaluation_batch_size = batch_size.max(16).min(test_limit);
     for batch in mnist
-        .test_batches(batch_size.max(16))?
-        .take(test_limit.div_ceil(batch_size.max(16)))
+        .test_batches(evaluation_batch_size)?
+        .take(test_limit.div_ceil(evaluation_batch_size))
     {
         let (images, labels) = batch?;
         let logits = model.forward(&images.to(device))?;
@@ -131,4 +135,10 @@ fn environment_usize(name: &str, default: usize) -> usize {
         .and_then(|value| value.parse().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+fn environment_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    })
 }

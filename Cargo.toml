@@ -28,3 +28,7 @@ pedantic = "warn"
 name = "mlp"
 required-features = []
 
+[[bin]]
+name = "mnist-training"
+path = "examples/mnist_training.rs"
+required-features = []
