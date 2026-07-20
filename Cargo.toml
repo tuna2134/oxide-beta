@@ -1,0 +1,30 @@
+[package]
+name = "oxide-torch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A tiny Torch-like lazy tensor library powered by NVLabs cuda-oxide"
+license = "Apache-2.0"
+
+[workspace]
+
+[features]
+default = []
+cuda = ["dep:cuda-core", "dep:cuda-device", "dep:cuda-host"]
+
+[dependencies]
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6a92f548f25899352e47e173bfd387b2cd0d1e18", optional = true }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6a92f548f25899352e47e173bfd387b2cd0d1e18", optional = true }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6a92f548f25899352e47e173bfd387b2cd0d1e18", optional = true }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[[example]]
+name = "mlp"
+required-features = []
+
