@@ -29,6 +29,18 @@ pub(crate) struct Node {
 }
 
 #[derive(Debug)]
+pub(crate) struct BatchNormState {
+    pub(crate) running_mean: Vec<f32>,
+    pub(crate) running_variance: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+struct BatchNormStatistics {
+    mean: Vec<f32>,
+    inverse_standard_deviation: Vec<f32>,
+}
+
+#[derive(Debug)]
 pub(crate) enum Op {
     Data(Arc<[f32]>),
     Placeholder(usize),
@@ -53,6 +65,16 @@ pub(crate) enum Op {
     CrossEntropy {
         logits: Tensor,
         targets: Tensor,
+    },
+    BatchNorm2d {
+        input: Tensor,
+        weight: Tensor,
+        bias: Tensor,
+        state: Arc<Mutex<BatchNormState>>,
+        saved_statistics: Arc<Mutex<Option<BatchNormStatistics>>>,
+        training: bool,
+        momentum: f32,
+        epsilon: f32,
     },
 }
 
@@ -348,6 +370,68 @@ impl Tensor {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batch_norm2d(
+        &self,
+        weight: &Self,
+        bias: &Self,
+        state: Arc<Mutex<BatchNormState>>,
+        training: bool,
+        momentum: f32,
+        epsilon: f32,
+    ) -> Result<Self> {
+        if self.device() != weight.device() || self.device() != bias.device() {
+            return Err(Error::DeviceMismatch);
+        }
+        if self.shape().len() != 4 || weight.shape().len() != 1 || bias.shape().len() != 1 {
+            return Err(Error::InvalidShape(
+                "batch_norm2d expects NCHW input and rank-1 weight/bias".into(),
+            ));
+        }
+        let channels = self.shape()[1];
+        if weight.shape() != [channels] || bias.shape() != [channels] {
+            return Err(Error::InvalidShape(
+                "batch_norm2d weight/bias must match the channel count".into(),
+            ));
+        }
+        if !momentum.is_finite() || !(0.0..=1.0).contains(&momentum) {
+            return Err(Error::Execution(
+                "batch_norm2d momentum must be finite and in 0..=1".into(),
+            ));
+        }
+        if !epsilon.is_finite() || epsilon <= 0.0 {
+            return Err(Error::Execution(
+                "batch_norm2d epsilon must be positive and finite".into(),
+            ));
+        }
+        {
+            let buffers = state
+                .lock()
+                .map_err(|_| Error::Execution("BatchNorm state lock was poisoned".into()))?;
+            if buffers.running_mean.len() != channels
+                || buffers.running_variance.len() != channels
+            {
+                return Err(Error::InvalidShape(
+                    "batch_norm2d running statistics must match the channel count".into(),
+                ));
+            }
+        }
+        Ok(Self::new(
+            self.shape().to_vec(),
+            self.device(),
+            Op::BatchNorm2d {
+                input: self.clone(),
+                weight: weight.clone(),
+                bias: bias.clone(),
+                state,
+                saved_statistics: Arc::new(Mutex::new(None)),
+                training,
+                momentum,
+                epsilon,
+            },
+        ))
+    }
+
     /// Runs reverse-mode automatic differentiation from a scalar tensor.
     ///
     /// CUDA graphs currently use a correct CPU fallback for backward while
@@ -542,6 +626,27 @@ pub(crate) fn eval_cpu(
         } => eval_avg_pool2d(input, *kernel, *stride, cache, inputs)?,
         Op::Reshape(input) => eval_cpu(input, cache, inputs)?,
         Op::CrossEntropy { logits, targets } => eval_cross_entropy(logits, targets, cache, inputs)?,
+        Op::BatchNorm2d {
+            input,
+            weight,
+            bias,
+            state,
+            saved_statistics,
+            training,
+            momentum,
+            epsilon,
+        } => eval_batch_norm2d(
+            input,
+            weight,
+            bias,
+            state,
+            saved_statistics,
+            *training,
+            *momentum,
+            *epsilon,
+            cache,
+            inputs,
+        )?,
     };
     cache.insert(tensor.node.id, value.clone());
     Ok(value)
@@ -595,6 +700,25 @@ fn clone_to_device(tensor: &Tensor, device: Device, cache: &mut HashMap<u64, Ten
         Op::CrossEntropy { logits, targets } => Op::CrossEntropy {
             logits: clone_to_device(logits, device, cache),
             targets: clone_to_device(targets, device, cache),
+        },
+        Op::BatchNorm2d {
+            input,
+            weight,
+            bias,
+            state,
+            training,
+            momentum,
+            epsilon,
+            ..
+        } => Op::BatchNorm2d {
+            input: clone_to_device(input, device, cache),
+            weight: clone_to_device(weight, device, cache),
+            bias: clone_to_device(bias, device, cache),
+            state: state.clone(),
+            saved_statistics: Arc::new(Mutex::new(None)),
+            training: *training,
+            momentum: *momentum,
+            epsilon: *epsilon,
         },
     };
     let result = Tensor::new(tensor.node.shape.clone(), device, op);
