@@ -1849,42 +1849,6 @@ pub(crate) fn adamw_step(
     Ok(())
 }
 
-fn collect_node_ids(tensor: &Tensor, nodes: &mut HashSet<u64>) {
-    if !nodes.insert(tensor.node.id) {
-        return;
-    }
-    match &tensor.node.op {
-        Op::Data(_) | Op::Placeholder(_) => {}
-        Op::Add(left, right) | Op::Mul(left, right) | Op::MatMul(left, right) => {
-            collect_node_ids(left, nodes);
-            collect_node_ids(right, nodes);
-        }
-        Op::Relu(input) | Op::Reshape(input) | Op::AvgPool2d { input, .. } => {
-            collect_node_ids(input, nodes);
-        }
-        Op::Conv2d {
-            input,
-            weight,
-            bias,
-            ..
-        }
-        | Op::BatchNorm2d {
-            input,
-            weight,
-            bias,
-            ..
-        } => {
-            collect_node_ids(input, nodes);
-            collect_node_ids(weight, nodes);
-            collect_node_ids(bias, nodes);
-        }
-        Op::CrossEntropy { logits, targets } => {
-            collect_node_ids(logits, nodes);
-            collect_node_ids(targets, nodes);
-        }
-    }
-}
-
 fn collect_topological(tensor: &Tensor, seen: &mut HashSet<u64>, output: &mut Vec<Tensor>) {
     if !seen.insert(tensor.node.id) {
         return;
