@@ -2,11 +2,13 @@
 
 use crate::{Device, Error, Result, Tensor};
 use half::{bf16, f16};
+use memmap2::{Mmap, MmapOptions};
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
 struct ShardIndex {
@@ -18,6 +20,12 @@ struct ShardIndex {
 pub struct LoadedTensor {
     pub shape: Vec<usize>,
     pub data: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TensorMetadata {
+    pub shape: Vec<usize>,
+    pub dtype: Dtype,
 }
 
 impl LoadedTensor {
@@ -37,8 +45,8 @@ impl LoadedTensor {
 /// not duplicated in host memory during construction.
 #[derive(Clone, Debug)]
 pub struct SafeTensorLoader {
-    root: PathBuf,
     weight_map: HashMap<String, PathBuf>,
+    shards: HashMap<PathBuf, Arc<Mmap>>,
 }
 
 impl SafeTensorLoader {
@@ -74,9 +82,8 @@ impl SafeTensorLoader {
     }
 
     fn from_file(path: &Path) -> Result<Self> {
-        let bytes = fs::read(path)
-            .map_err(|error| load_error(format!("failed to read {}: {error}", path.display())))?;
-        let tensors = SafeTensors::deserialize(&bytes).map_err(safetensor_error)?;
+        let mapping = map_file(path)?;
+        let tensors = SafeTensors::deserialize(&mapping).map_err(safetensor_error)?;
         let file_name = path
             .file_name()
             .ok_or_else(|| load_error("SafeTensors path has no file name"))?;
@@ -85,9 +92,10 @@ impl SafeTensorLoader {
             .into_iter()
             .map(|name| (name.to_owned(), PathBuf::from(file_name)))
             .collect();
+        let relative = PathBuf::from(file_name);
         Ok(Self {
-            root: path.parent().unwrap_or_else(|| Path::new(".")).to_owned(),
             weight_map,
+            shards: HashMap::from([(relative, Arc::new(mapping))]),
         })
     }
 
@@ -98,18 +106,19 @@ impl SafeTensorLoader {
             .map_err(|error| load_error(format!("invalid SafeTensors index: {error}")))?;
         let root = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
         let mut validated = BTreeSet::new();
+        let mut shards = HashMap::new();
         for shard in index.weight_map.values() {
-            if validated.insert(shard) && !root.join(shard).is_file() {
-                return Err(load_error(format!("missing SafeTensors shard {shard}")));
+            if validated.insert(shard) {
+                shards.insert(PathBuf::from(shard), Arc::new(map_file(&root.join(shard))?));
             }
         }
         Ok(Self {
-            root,
             weight_map: index
                 .weight_map
                 .into_iter()
                 .map(|(name, shard)| (name, PathBuf::from(shard)))
                 .collect(),
+            shards,
         })
     }
 
@@ -132,15 +141,7 @@ impl SafeTensorLoader {
     ///
     /// Returns an error if the tensor is missing, malformed, or has an unsupported dtype.
     pub fn load(&self, name: &str) -> Result<LoadedTensor> {
-        let shard = self
-            .weight_map
-            .get(name)
-            .ok_or_else(|| load_error(format!("tensor `{name}` is missing")))?;
-        let path = self.root.join(shard);
-        let bytes = fs::read(&path)
-            .map_err(|error| load_error(format!("failed to read {}: {error}", path.display())))?;
-        let tensors = SafeTensors::deserialize(&bytes).map_err(safetensor_error)?;
-        let view = tensors.tensor(name).map_err(safetensor_error)?;
+        let view = self.view(name)?;
         let shape = view.shape().to_vec();
         let data = decode_f32(view.dtype(), view.data())?;
         let expected = shape.iter().try_fold(1usize, |size, dimension| {
@@ -154,6 +155,36 @@ impl SafeTensorLoader {
             )));
         }
         Ok(LoadedTensor { shape, data })
+    }
+
+    /// Reads shape and dtype without decoding or copying the payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensor or mapped shard is invalid.
+    pub fn metadata(&self, name: &str) -> Result<TensorMetadata> {
+        let view = self.view(name)?;
+        Ok(TensorMetadata {
+            shape: view.shape().to_vec(),
+            dtype: view.dtype(),
+        })
+    }
+
+    fn view<'a>(&'a self, name: &str) -> Result<safetensors::tensor::TensorView<'a>> {
+        let shard = self
+            .weight_map
+            .get(name)
+            .ok_or_else(|| load_error(format!("tensor `{name}` is missing")))?;
+        let mapping = self.shards.get(shard).ok_or_else(|| {
+            load_error(format!(
+                "SafeTensors shard {} is not mapped",
+                shard.display()
+            ))
+        })?;
+        SafeTensors::deserialize(mapping)
+            .map_err(safetensor_error)?
+            .tensor(name)
+            .map_err(safetensor_error)
     }
 
     /// Tries aliases in order. This handles `model.*`, `language_model.*`, and
@@ -174,6 +205,17 @@ impl SafeTensorLoader {
             names.join(", ")
         )))
     }
+}
+
+#[allow(unsafe_code)]
+fn map_file(path: &Path) -> Result<Mmap> {
+    let file = File::open(path)
+        .map_err(|error| load_error(format!("failed to open {}: {error}", path.display())))?;
+    // SAFETY: the mapping is read-only and kept alive in an Arc for every
+    // TensorView derived from it. The checkpoint file must remain immutable
+    // and must not be truncated while SafeTensorLoader is alive.
+    unsafe { MmapOptions::new().map(&file) }
+        .map_err(|error| load_error(format!("failed to map {}: {error}", path.display())))
 }
 
 fn decode_f32(dtype: Dtype, bytes: &[u8]) -> Result<Vec<f32>> {

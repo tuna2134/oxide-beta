@@ -4,3 +4,4 @@
 *.ltoir
 /data/
 /*.oxtr
+/models/

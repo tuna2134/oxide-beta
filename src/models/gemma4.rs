@@ -4,7 +4,7 @@
 //! token embeddings, 5:1 local/global decoder layers, GQA, PLE, gated MLP,
 //! final `RMSNorm`, and a tied or independent LM head.
 
-use crate::safetensors::{LoadedTensor, SafeTensorLoader};
+use crate::safetensors::{LoadedTensor, SafeTensorLoader, TensorMetadata};
 use crate::{Device, Error, Result, Tensor};
 use serde::Deserialize;
 use std::fs;
@@ -297,6 +297,23 @@ impl Gemma4ForCausalLM {
         self.weight(suffix)?.into_tensor(self.device)
     }
 
+    /// Returns checkpoint metadata without decoding the weight payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no compatible parameter alias exists.
+    pub fn weight_metadata(&self, suffix: &str) -> Result<TensorMetadata> {
+        let names = Self::weight_aliases(suffix);
+        for name in &names {
+            if self.weights.contains(name) {
+                return self.weights.metadata(name);
+            }
+        }
+        Err(Error::Execution(format!(
+            "required Gemma 4 tensor `{suffix}` is missing"
+        )))
+    }
+
     /// Performs the scaled token-embedding lookup used at the model input.
     ///
     /// # Errors
@@ -354,21 +371,23 @@ impl Gemma4ForCausalLM {
     }
 
     fn require_weight(&self, suffix: &str) -> Result<()> {
-        let model = format!("model.{suffix}");
-        let model_language = format!("model.language_model.{suffix}");
-        let language = format!("language_model.{suffix}");
-        if self.weights.contains_any([
-            model.as_str(),
-            model_language.as_str(),
-            language.as_str(),
-            suffix,
-        ]) {
+        let names = Self::weight_aliases(suffix);
+        if self.weights.contains_any(names.iter().map(String::as_str)) {
             Ok(())
         } else {
             Err(Error::Execution(format!(
                 "required Gemma 4 tensor `{suffix}` is missing"
             )))
         }
+    }
+
+    fn weight_aliases(suffix: &str) -> [String; 4] {
+        [
+            format!("model.{suffix}"),
+            format!("model.language_model.{suffix}"),
+            format!("language_model.{suffix}"),
+            suffix.to_owned(),
+        ]
     }
 }
 
