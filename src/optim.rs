@@ -3,6 +3,9 @@
 use crate::nn::{Parameter, Trainable};
 use crate::{Error, Result};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_OPTIMIZER_ID: AtomicU64 = AtomicU64::new(1);
 
 pub trait Optimizer {
     /// Clears gradients on every model parameter.
@@ -29,6 +32,7 @@ struct State {
 /// `AdamW` with bias correction and decoupled weight decay.
 #[derive(Debug)]
 pub struct AdamW {
+    id: u64,
     learning_rate: f32,
     weight_decay: f32,
     beta1: f32,
@@ -56,6 +60,7 @@ impl AdamW {
             ));
         }
         Ok(Self {
+            id: NEXT_OPTIMIZER_ID.fetch_add(1, Ordering::Relaxed),
             learning_rate,
             weight_decay,
             beta1: 0.9,
@@ -67,6 +72,25 @@ impl AdamW {
     }
 
     fn update_parameter(&mut self, parameter: &mut Parameter) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if matches!(parameter.value().device(), crate::Device::Cuda(_)) {
+            let step_i32 = i32::try_from(self.step)
+                .map_err(|_| Error::Execution("AdamW step counter exceeded i32".into()))?;
+            return crate::cuda::adamw_step(
+                parameter,
+                self.id,
+                crate::cuda::AdamWHyperparameters {
+                    learning_rate: self.learning_rate,
+                    weight_decay: self.weight_decay,
+                    beta1: self.beta1,
+                    beta2: self.beta2,
+                    first_correction: 1.0 - self.beta1.powi(step_i32),
+                    second_correction: 1.0 - self.beta2.powi(step_i32),
+                    epsilon: self.epsilon,
+                },
+            );
+        }
+
         let Some(gradient) = parameter.value().grad()? else {
             return Ok(());
         };
