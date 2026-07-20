@@ -173,7 +173,7 @@ cd -- "${PROJECT_DIR}"
 if ((USE_CUDA == 1)); then
     export MNIST_DATA_DIR="${DATA_DIR}"
     export OXIDE_TORCH_CUDA=1
-    exec cargo oxide run --features cuda --bin mnist-training
+    exec cargo oxide run --features cuda,cudnn --bin mnist-training
 else
     exec cargo +stable run --release --example mnist_training -- "${DATA_DIR}"
 fi

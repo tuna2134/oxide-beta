@@ -862,6 +862,8 @@ struct Executor {
     batch_norm_states: HashMap<usize, BatchNormDeviceState>,
     batch_norm_statistics: HashMap<u64, BatchNormDeviceStatistics>,
     adam_moments: HashMap<(u64, u64), AdamMoments>,
+    #[cfg(feature = "cudnn")]
+    cudnn: Option<crate::cudnn::Cudnn>,
 }
 
 impl Executor {
@@ -869,6 +871,17 @@ impl Executor {
         let context = CudaContext::new(device).map_err(cuda_error)?;
         let stream = context.default_stream();
         let module = kernels::load(&context).map_err(cuda_error)?;
+        #[cfg(feature = "cudnn")]
+        let cudnn = crate::cudnn::Cudnn::try_new();
+        #[cfg(feature = "cudnn")]
+        eprintln!(
+            "CUDA device {device}: cuDNN {}",
+            if cudnn.is_some() {
+                "enabled"
+            } else {
+                "unavailable; using cuda-oxide kernels"
+            }
+        );
         Ok(Self {
             _context: context,
             stream,
@@ -878,11 +891,19 @@ impl Executor {
             batch_norm_states: HashMap::new(),
             batch_norm_statistics: HashMap::new(),
             adam_moments: HashMap::new(),
+            #[cfg(feature = "cudnn")]
+            cudnn,
         })
     }
 
     fn zeroed(&self, len: usize) -> Result<DeviceBuffer<f32>> {
         DeviceBuffer::zeroed(&self.stream, len).map_err(cuda_error)
+    }
+
+    fn cache_value(&mut self, tensor: &Tensor, output: DeviceBuffer<f32>) -> Result<Buffer> {
+        let output = Arc::new(output);
+        self.values.insert(tensor.node.id, output.clone());
+        Ok(output)
     }
 
     fn eval_node(&mut self, tensor: &Tensor) -> Result<Buffer> {
@@ -962,6 +983,24 @@ impl Executor {
                 let weight_buffer = self.eval_node(weight)?;
                 let bias_buffer = self.eval_node(bias)?;
                 let mut output = self.zeroed(tensor.numel())?;
+                #[cfg(feature = "cudnn")]
+                if let Some(cudnn) = &mut self.cudnn {
+                    let result = cudnn.forward(
+                        cudnn_shape(input, weight, tensor, *stride, *padding, *groups),
+                        &self.stream,
+                        &input_buffer,
+                        &weight_buffer,
+                        &bias_buffer,
+                        &mut output,
+                    );
+                    match result {
+                        Ok(()) => return self.cache_value(tensor, output),
+                        Err(error) => {
+                            eprintln!("cuDNN disabled after convolution error: {error}");
+                            self.cudnn = None;
+                        }
+                    }
+                }
                 // SAFETY: Tensor::conv2d validated NCHW/OIHW dimensions,
                 // grouping, kernel extent, and output length.
                 unsafe {
@@ -1392,6 +1431,32 @@ impl Executor {
         let mut input_gradient = self.zeroed(input.numel())?;
         let mut weight_gradient = self.zeroed(weight.numel())?;
         let mut bias_gradient = self.zeroed(bias.numel())?;
+        #[cfg(feature = "cudnn")]
+        if let Some(cudnn) = &mut self.cudnn {
+            let result = cudnn.backward(
+                cudnn_shape_from_parts(
+                    input, weight, out_height, out_width, stride, padding, groups,
+                ),
+                &self.stream,
+                &input_value,
+                &weight_value,
+                gradient,
+                &mut input_gradient,
+                &mut weight_gradient,
+                &mut bias_gradient,
+            );
+            match result {
+                Ok(()) => {
+                    self.backward_node(input, Arc::new(input_gradient))?;
+                    self.backward_node(weight, Arc::new(weight_gradient))?;
+                    return self.backward_node(bias, Arc::new(bias_gradient));
+                }
+                Err(error) => {
+                    eprintln!("cuDNN disabled after convolution backward error: {error}");
+                    self.cudnn = None;
+                }
+            }
+        }
         // SAFETY: conv2d validated all NCHW/OIHW/group dimensions. Each
         // backward kernel writes one independent output element.
         unsafe {
@@ -1845,4 +1910,49 @@ fn tiled_launch_config_with_tile(
 
 fn cuda_error(error: impl std::fmt::Display) -> Error {
     Error::Execution(error.to_string())
+}
+
+#[cfg(feature = "cudnn")]
+fn cudnn_shape(
+    input: &Tensor,
+    weight: &Tensor,
+    output: &Tensor,
+    stride: usize,
+    padding: usize,
+    groups: usize,
+) -> crate::cudnn::ConvShape {
+    cudnn_shape_from_parts(
+        input,
+        weight,
+        output.shape()[2],
+        output.shape()[3],
+        stride,
+        padding,
+        groups,
+    )
+}
+
+#[cfg(feature = "cudnn")]
+fn cudnn_shape_from_parts(
+    input: &Tensor,
+    weight: &Tensor,
+    out_height: usize,
+    out_width: usize,
+    stride: usize,
+    padding: usize,
+    groups: usize,
+) -> crate::cudnn::ConvShape {
+    crate::cudnn::ConvShape {
+        batch: input.shape()[0],
+        in_channels: input.shape()[1],
+        height: input.shape()[2],
+        width: input.shape()[3],
+        out_channels: weight.shape()[0],
+        out_height,
+        out_width,
+        kernel: weight.shape()[2],
+        stride,
+        padding,
+        groups,
+    }
 }

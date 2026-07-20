@@ -343,6 +343,7 @@ dependencies = [
  "cuda-core",
  "cuda-device",
  "cuda-host",
+ "libloading",
 ]
 
 [[package]]

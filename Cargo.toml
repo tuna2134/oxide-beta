@@ -11,11 +11,13 @@ license = "Apache-2.0"
 [features]
 default = []
 cuda = ["dep:cuda-core", "dep:cuda-device", "dep:cuda-host"]
+cudnn = ["cuda", "dep:libloading"]
 
 [dependencies]
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6a92f548f25899352e47e173bfd387b2cd0d1e18", optional = true }
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6a92f548f25899352e47e173bfd387b2cd0d1e18", optional = true }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6a92f548f25899352e47e173bfd387b2cd0d1e18", optional = true }
+libloading = { version = "0.8", optional = true }
 
 [lints.rust]
 unsafe_code = "warn"

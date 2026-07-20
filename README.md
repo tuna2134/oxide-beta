@@ -161,7 +161,7 @@ CUDA環境ではscriptへ `--cuda` を付けます。直接起動する場合は
 ```bash
 OXIDE_TORCH_CUDA=1 \
 MNIST_DATA_DIR=data/mnist \
-cargo oxide run --features cuda --bin mnist-training
+cargo oxide run --features cuda,cudnn --bin mnist-training
 ```
 
 終了時に`mobilenetv4-mnist.oxtr`を保存します。checkpointには学習parameterに加えて

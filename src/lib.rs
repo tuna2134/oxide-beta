@@ -15,6 +15,8 @@ mod tensor;
 
 #[cfg(feature = "cuda")]
 mod cuda;
+#[cfg(feature = "cudnn")]
+mod cudnn;
 
 pub use error::{Error, Result};
 pub use tensor::{Device, Tensor};
