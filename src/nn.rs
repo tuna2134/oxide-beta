@@ -65,6 +65,7 @@ impl Parameter {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn replace_value(&mut self, value: Tensor) -> Result<()> {
         if value.shape() != self.value.shape() || value.device() != self.value.device() {
             return Err(Error::Execution(
@@ -120,6 +121,7 @@ impl BatchNorm2d {
             state: Arc::new(Mutex::new(BatchNormState {
                 running_mean: vec![0.0; channels],
                 running_variance: vec![1.0; channels],
+                #[cfg(feature = "cuda")]
                 device,
             })),
             training: true,

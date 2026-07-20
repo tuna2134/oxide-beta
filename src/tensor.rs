@@ -32,6 +32,7 @@ pub(crate) struct Node {
 pub(crate) struct BatchNormState {
     pub(crate) running_mean: Vec<f32>,
     pub(crate) running_variance: Vec<f32>,
+    #[cfg(feature = "cuda")]
     pub(crate) device: Device,
 }
 
@@ -554,15 +555,6 @@ impl Tensor {
                 grad: Mutex::new(None),
             }),
         }
-    }
-
-    pub(crate) fn set_gradient(&self, gradient: Vec<f32>) -> Result<()> {
-        *self
-            .node
-            .grad
-            .lock()
-            .map_err(|_| Error::Execution("gradient lock was poisoned".into()))? = Some(gradient);
-        Ok(())
     }
 
     fn binary(&self, rhs: &Self, make_op: fn(Tensor, Tensor) -> Op) -> Result<Self> {
@@ -1552,6 +1544,7 @@ mod tests {
             let state = Arc::new(Mutex::new(BatchNormState {
                 running_mean: vec![0.0; 2],
                 running_variance: vec![1.0; 2],
+                #[cfg(feature = "cuda")]
                 device: Device::Cpu,
             }));
             let targets = Tensor::from_vec(vec![0.0, 1.0, 0.0], vec![3]).unwrap();
@@ -1573,6 +1566,7 @@ mod tests {
         let state = Arc::new(Mutex::new(BatchNormState {
             running_mean: vec![0.0; 2],
             running_variance: vec![1.0; 2],
+            #[cfg(feature = "cuda")]
             device: Device::Cpu,
         }));
         let targets = Tensor::from_vec(vec![0.0, 1.0, 0.0], vec![3]).unwrap();

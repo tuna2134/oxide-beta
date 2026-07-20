@@ -530,15 +530,17 @@ mod kernels {
 
     #[kernel]
     pub fn batch_norm_input_backward(
-        batch: usize,
         channels: usize,
         spatial: usize,
+        samples: usize,
         training: bool,
         gradient: &[f32],
         input: &[f32],
         weight: &[f32],
         mean: &[f32],
         inverse_std: &[f32],
+        weight_gradient: &[f32],
+        bias_gradient: &[f32],
         mut output: DisjointSlice<f32>,
     ) {
         let index = thread::index_1d();
@@ -549,28 +551,12 @@ mod kernels {
                 *value = gradient[raw] * weight[channel] * inverse_std[channel];
                 return;
             }
-            let samples = batch * spatial;
             let normalized = (input[raw] - mean[channel]) * inverse_std[channel];
-            let mut gradient_sum = 0.0;
-            let mut normalized_gradient_sum = 0.0;
-            let mut batch_index = 0;
-            while batch_index < batch {
-                let start = (batch_index * channels + channel) * spatial;
-                let mut position = 0;
-                while position < spatial {
-                    let item = start + position;
-                    let item_normalized = (input[item] - mean[channel]) * inverse_std[channel];
-                    gradient_sum += gradient[item];
-                    normalized_gradient_sum += gradient[item] * item_normalized;
-                    position += 1;
-                }
-                batch_index += 1;
-            }
             let samples_f32 = samples as f32;
             *value = weight[channel] * inverse_std[channel] / samples_f32
                 * (samples_f32 * gradient[raw]
-                    - gradient_sum
-                    - normalized * normalized_gradient_sum);
+                    - bias_gradient[channel]
+                    - normalized * weight_gradient[channel]);
         }
     }
 
@@ -1180,7 +1166,12 @@ impl Executor {
                         &gradient,
                         &right_value,
                         &mut left_gradient,
-                    )?;
+                    )
+                }
+                .map_err(cuda_error)?;
+                // SAFETY: same invariant as above; this writes the other
+                // distinct gradient allocation.
+                unsafe {
                     self.module.mul_backward(
                         &self.stream,
                         launch_config(right.numel())?,
@@ -1276,7 +1267,12 @@ impl Executor {
                 gradient,
                 &right_value,
                 &mut left_gradient,
-            )?;
+            )
+        }
+        .map_err(cuda_error)?;
+        // SAFETY: same validated M/K/N dimensions; the right-gradient
+        // allocation is distinct from all inputs.
+        unsafe {
             self.module.matmul_right_backward(
                 &self.stream,
                 launch_config(right.numel())?,
@@ -1332,7 +1328,12 @@ impl Executor {
                 gradient,
                 &weight_value,
                 &mut input_gradient,
-            )?;
+            )
+        }
+        .map_err(cuda_error)?;
+        // SAFETY: the convolution dimensions are unchanged and this kernel
+        // writes only the distinct weight-gradient allocation.
+        unsafe {
             self.module.conv2d_weight_backward(
                 &self.stream,
                 launch_config(weight.numel())?,
@@ -1350,7 +1351,11 @@ impl Executor {
                 gradient,
                 &input_value,
                 &mut weight_gradient,
-            )?;
+            )
+        }
+        .map_err(cuda_error)?;
+        // SAFETY: one thread writes each independent bias-gradient element.
+        unsafe {
             self.module.conv2d_bias_backward(
                 &self.stream,
                 launch_config(bias.numel())?,
@@ -1422,23 +1427,9 @@ impl Executor {
         let mut input_gradient = self.zeroed(input.numel())?;
         let mut weight_gradient = self.zeroed(weight.numel())?;
         let mut bias_gradient = self.zeroed(bias.numel())?;
-        // SAFETY: all NCHW, affine, and statistics lengths were validated by
-        // batch_norm2d; each output allocation is distinct.
+        // SAFETY: affine outputs are distinct channel-sized allocations and
+        // all read buffers retain the validated NCHW layout.
         unsafe {
-            self.module.batch_norm_input_backward(
-                &self.stream,
-                launch_config(input.numel())?,
-                input.shape()[0],
-                channels,
-                spatial,
-                training,
-                gradient,
-                &input_value,
-                &weight_value,
-                &statistics.mean,
-                &statistics.inverse_standard_deviation,
-                &mut input_gradient,
-            )?;
             self.module.batch_norm_affine_backward(
                 &self.stream,
                 launch_config(channels)?,
@@ -1451,6 +1442,27 @@ impl Executor {
                 &statistics.inverse_standard_deviation,
                 &mut weight_gradient,
                 &mut bias_gradient,
+            )
+        }
+        .map_err(cuda_error)?;
+        // SAFETY: all NCHW, affine, statistics, and pre-reduced gradient
+        // lengths were validated by batch_norm2d.
+        unsafe {
+            self.module.batch_norm_input_backward(
+                &self.stream,
+                launch_config(input.numel())?,
+                channels,
+                spatial,
+                input.shape()[0] * spatial,
+                training,
+                gradient,
+                &input_value,
+                &weight_value,
+                &statistics.mean,
+                &statistics.inverse_standard_deviation,
+                &weight_gradient,
+                &bias_gradient,
+                &mut input_gradient,
             )
         }
         .map_err(cuda_error)?;
@@ -1518,6 +1530,20 @@ pub(crate) fn zero_gradient(tensor: &Tensor, device: usize) -> Result<()> {
         executor.gradients.remove(&tensor.node.id);
         Ok(())
     })
+}
+
+pub(crate) fn release_optimizer(id: u64) {
+    let Some(executors) = EXECUTORS.get() else {
+        return;
+    };
+    let Ok(mut devices) = executors.try_lock() else {
+        return;
+    };
+    for executor in devices.values_mut() {
+        executor
+            .adam_moments
+            .retain(|(optimizer_id, _), _| *optimizer_id != id);
+    }
 }
 
 pub(crate) fn release_node(id: u64, device: usize) {

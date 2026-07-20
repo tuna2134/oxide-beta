@@ -3,8 +3,10 @@
 use crate::nn::{Parameter, Trainable};
 use crate::{Error, Result};
 use std::collections::HashMap;
+#[cfg(feature = "cuda")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(feature = "cuda")]
 static NEXT_OPTIMIZER_ID: AtomicU64 = AtomicU64::new(1);
 
 pub trait Optimizer {
@@ -32,6 +34,7 @@ struct State {
 /// `AdamW` with bias correction and decoupled weight decay.
 #[derive(Debug)]
 pub struct AdamW {
+    #[cfg(feature = "cuda")]
     id: u64,
     learning_rate: f32,
     weight_decay: f32,
@@ -60,6 +63,7 @@ impl AdamW {
             ));
         }
         Ok(Self {
+            #[cfg(feature = "cuda")]
             id: NEXT_OPTIMIZER_ID.fetch_add(1, Ordering::Relaxed),
             learning_rate,
             weight_decay,
@@ -145,6 +149,13 @@ impl Optimizer for AdamW {
             }
         });
         result
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for AdamW {
+    fn drop(&mut self) {
+        crate::cuda::release_optimizer(self.id);
     }
 }
 
