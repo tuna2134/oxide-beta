@@ -26,7 +26,7 @@ struct State {
     second_moment: Vec<f32>,
 }
 
-/// AdamW with bias correction and decoupled weight decay.
+/// `AdamW` with bias correction and decoupled weight decay.
 #[derive(Debug)]
 pub struct AdamW {
     learning_rate: f32,
@@ -39,7 +39,7 @@ pub struct AdamW {
 }
 
 impl AdamW {
-    /// Creates an AdamW optimizer.
+    /// Creates an `AdamW` optimizer.
     ///
     /// # Errors
     ///
@@ -121,5 +121,54 @@ impl Optimizer for AdamW {
             }
         });
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Tensor;
+    use crate::nn::{Conv2d, Module};
+
+    #[test]
+    fn adamw_reduces_a_tiny_classification_loss() {
+        let mut layer = Conv2d::new(1, 2, 1, 1, 1, crate::Device::Cpu).unwrap();
+        let input = Tensor::from_vec(vec![-1.0, 1.0], vec![2, 1, 1, 1]).unwrap();
+        let targets = Tensor::from_vec(vec![0.0, 1.0], vec![2]).unwrap();
+        let initial = layer
+            .forward(&input)
+            .unwrap()
+            .reshape(vec![2, 2])
+            .unwrap()
+            .cross_entropy(&targets)
+            .unwrap()
+            .item()
+            .unwrap();
+        let mut optimizer = AdamW::new(0.05, 0.0).unwrap();
+        for _ in 0..10 {
+            optimizer.zero_grad(&layer).unwrap();
+            let loss = layer
+                .forward(&input)
+                .unwrap()
+                .reshape(vec![2, 2])
+                .unwrap()
+                .cross_entropy(&targets)
+                .unwrap();
+            loss.backward().unwrap();
+            optimizer.step(&mut layer).unwrap();
+        }
+        let final_loss = layer
+            .forward(&input)
+            .unwrap()
+            .reshape(vec![2, 2])
+            .unwrap()
+            .cross_entropy(&targets)
+            .unwrap()
+            .item()
+            .unwrap();
+        assert!(
+            final_loss < initial,
+            "{final_loss} should be below {initial}"
+        );
     }
 }

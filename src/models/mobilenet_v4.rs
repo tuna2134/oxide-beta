@@ -4,6 +4,9 @@ use crate::nn::{
     ConvNormAct, FusedInvertedBottleneck, Module, Parameter, Trainable, UniversalInvertedBottleneck,
 };
 use crate::{Device, Error, Result, Tensor};
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 
 #[derive(Clone, Debug)]
 enum Block {
@@ -160,6 +163,57 @@ impl MobileNetV4ConvSmall {
         self.device
     }
 
+    /// Saves parameters in oxide-torch's simple little-endian checkpoint format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when parameters cannot be materialized or the file cannot be written.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        let mut parameters = Vec::new();
+        let mut materialize_error = None;
+        self.visit_parameters(&mut |parameter| {
+            if materialize_error.is_none() {
+                match parameter.value().to_vec() {
+                    Ok(data) => parameters.push((parameter.value().shape().to_vec(), data)),
+                    Err(error) => materialize_error = Some(error),
+                }
+            }
+        });
+        if let Some(error) = materialize_error {
+            return Err(error);
+        }
+        let file = File::create(path.as_ref()).map_err(|error| {
+            Error::Execution(format!(
+                "failed to create checkpoint {}: {error}",
+                path.as_ref().display()
+            ))
+        })?;
+        let mut writer = BufWriter::new(file);
+        writer
+            .write_all(b"OXTR\x01")
+            .and_then(|()| writer.write_all(&(parameters.len() as u64).to_le_bytes()))
+            .map_err(checkpoint_error)?;
+        for (shape, data) in parameters {
+            writer
+                .write_all(&(shape.len() as u64).to_le_bytes())
+                .map_err(checkpoint_error)?;
+            for dimension in shape {
+                writer
+                    .write_all(&(dimension as u64).to_le_bytes())
+                    .map_err(checkpoint_error)?;
+            }
+            writer
+                .write_all(&(data.len() as u64).to_le_bytes())
+                .map_err(checkpoint_error)?;
+            for value in data {
+                writer
+                    .write_all(&value.to_le_bytes())
+                    .map_err(checkpoint_error)?;
+            }
+        }
+        writer.flush().map_err(checkpoint_error)
+    }
+
     fn validate_input(&self, input: &Tensor) -> Result<()> {
         if input.device() != self.device {
             return Err(Error::DeviceMismatch);
@@ -179,6 +233,11 @@ impl MobileNetV4ConvSmall {
         }
         Ok(())
     }
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn checkpoint_error(error: std::io::Error) -> Error {
+    Error::Execution(format!("checkpoint write failed: {error}"))
 }
 
 impl Module for MobileNetV4ConvSmall {
@@ -222,5 +281,29 @@ mod tests {
         assert_eq!(shapes[16], [1, 960, 1, 1]);
         assert_eq!(shapes[17], [1, 1280, 1, 1]);
         assert_eq!(shapes[18], [1, 1000]);
+    }
+
+    #[test]
+    fn mnist_variant_accepts_grayscale_images() {
+        let model = MobileNetV4ConvSmall::mnist(Device::Cpu).unwrap();
+        let input = Tensor::zeros(vec![2, 1, 28, 28]).unwrap();
+        assert_eq!(model.forward(&input).unwrap().shape(), &[2, 10]);
+    }
+
+    #[test]
+    #[ignore = "full naive-CPU MobileNet backward is intentionally expensive"]
+    fn mnist_variant_completes_a_full_training_step() {
+        use crate::loss::cross_entropy;
+        use crate::optim::{AdamW, Optimizer};
+
+        let mut model = MobileNetV4ConvSmall::mnist(Device::Cpu).unwrap();
+        let input = Tensor::zeros(vec![1, 1, 28, 28]).unwrap();
+        let target = Tensor::from_vec(vec![3.0], vec![1]).unwrap();
+        let mut optimizer = AdamW::new(1e-3, 1e-4).unwrap();
+        optimizer.zero_grad(&model).unwrap();
+        let loss = cross_entropy(&model.forward(&input).unwrap(), &target).unwrap();
+        assert!(loss.item().unwrap().is_finite());
+        loss.backward().unwrap();
+        optimizer.step(&mut model).unwrap();
     }
 }

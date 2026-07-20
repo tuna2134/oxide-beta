@@ -25,9 +25,8 @@ impl Mnist {
     /// Returns an error for missing files, malformed IDX headers, or inconsistent counts.
     pub fn load(directory: impl AsRef<Path>) -> Result<Self> {
         let directory = directory.as_ref();
-        let (train_images, train_count) = parse_images(&read(
-            &directory.join("train-images-idx3-ubyte"),
-        )?)?;
+        let (train_images, train_count) =
+            parse_images(&read(&directory.join("train-images-idx3-ubyte"))?)?;
         let train_labels = parse_labels(&read(&directory.join("train-labels-idx1-ubyte"))?)?;
         let (test_images, test_count) =
             parse_images(&read(&directory.join("t10k-images-idx3-ubyte"))?)?;
@@ -51,12 +50,7 @@ impl Mnist {
     ///
     /// Returns an error when `batch_size` is zero.
     pub fn train_batches(&self, batch_size: usize, shuffle: bool) -> Result<MnistBatches<'_>> {
-        MnistBatches::new(
-            &self.train_images,
-            &self.train_labels,
-            batch_size,
-            shuffle,
-        )
+        MnistBatches::new(&self.train_images, &self.train_labels, batch_size, shuffle)
     }
 
     /// Creates normalized test batches in dataset order.
@@ -140,7 +134,10 @@ impl Iterator for MnistBatches<'_> {
 
 fn read(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).map_err(|error| {
-        Error::Execution(format!("failed to read MNIST file {}: {error}", path.display()))
+        Error::Execution(format!(
+            "failed to read MNIST file {}: {error}",
+            path.display()
+        ))
     })
 }
 
@@ -163,7 +160,9 @@ fn parse_images(bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
         .checked_mul(rows * columns)
         .ok_or_else(|| Error::Execution("MNIST image payload overflow".into()))?;
     if bytes.len() != 16 + payload_len {
-        return Err(Error::Execution("invalid MNIST image payload length".into()));
+        return Err(Error::Execution(
+            "invalid MNIST image payload length".into(),
+        ));
     }
     Ok((bytes[16..].to_vec(), count))
 }
@@ -226,4 +225,3 @@ mod tests {
         assert_eq!(targets.to_vec().unwrap(), vec![3.0, 7.0]);
     }
 }
-

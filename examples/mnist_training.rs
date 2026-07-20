@@ -1,0 +1,130 @@
+use oxide_torch::data::Mnist;
+use oxide_torch::loss::cross_entropy;
+use oxide_torch::models::mobilenet_v4::MobileNetV4ConvSmall;
+use oxide_torch::nn::Module;
+use oxide_torch::optim::{AdamW, Optimizer};
+use oxide_torch::{Device, Result, Tensor};
+use std::path::PathBuf;
+
+fn main() -> Result<()> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let use_cuda = arguments.iter().any(|argument| argument == "--cuda");
+    let data_directory = arguments
+        .iter()
+        .find(|argument| !argument.starts_with("--"))
+        .map_or_else(|| PathBuf::from("data/mnist"), PathBuf::from);
+    let device = if use_cuda {
+        Device::Cuda(0)
+    } else {
+        Device::Cpu
+    };
+    let epochs = environment_usize("MNIST_EPOCHS", 1);
+    let batch_size = environment_usize("MNIST_BATCH_SIZE", 4);
+    let train_limit = environment_usize("MNIST_TRAIN_LIMIT", 64);
+    let test_limit = environment_usize("MNIST_TEST_LIMIT", 128);
+
+    let mnist = Mnist::load(&data_directory)?;
+    let mut model = MobileNetV4ConvSmall::mnist(device)?;
+    let mut optimizer = AdamW::new(1e-3, 1e-4)?;
+
+    println!(
+        "MNIST: train={} test={} device={device:?}",
+        mnist.train_len(),
+        mnist.test_len()
+    );
+
+    for epoch in 1..=epochs {
+        let mut total_loss = 0.0;
+        let mut correct = 0;
+        let mut seen = 0;
+        let maximum_batches = train_limit.div_ceil(batch_size);
+
+        for batch in mnist.train_batches(batch_size, true)?.take(maximum_batches) {
+            let (images, labels) = batch?;
+            let images = images.to(device);
+            let labels = labels.to(device);
+
+            optimizer.zero_grad(&model)?;
+            let logits = model.forward(&images)?;
+            let loss = cross_entropy(&logits, &labels)?;
+            total_loss += loss.item()?;
+            let batch_correct = count_correct(&logits, &labels)?;
+            loss.backward()?;
+            optimizer.step(&mut model)?;
+
+            correct += batch_correct;
+            seen += labels.shape()[0];
+            println!(
+                "epoch={epoch} samples={seen}/{train_limit} loss={:.4}",
+                total_loss / as_f32(seen.div_ceil(batch_size))
+            );
+            if seen >= train_limit {
+                break;
+            }
+        }
+        println!(
+            "epoch={epoch} train_loss={:.4} train_accuracy={:.2}%",
+            total_loss / as_f32(seen.div_ceil(batch_size)),
+            100.0 * as_f32(correct) / as_f32(seen)
+        );
+    }
+
+    let mut correct = 0;
+    let mut seen = 0;
+    for batch in mnist
+        .test_batches(batch_size.max(16))?
+        .take(test_limit.div_ceil(batch_size.max(16)))
+    {
+        let (images, labels) = batch?;
+        let logits = model.forward(&images.to(device))?;
+        correct += count_correct(&logits, &labels.to(device))?;
+        seen += labels.shape()[0];
+        if seen >= test_limit {
+            break;
+        }
+    }
+    println!(
+        "test_accuracy={:.2}%",
+        100.0 * as_f32(correct) / as_f32(seen)
+    );
+    model.save("mobilenetv4-mnist.oxtr")?;
+    println!("saved mobilenetv4-mnist.oxtr");
+    Ok(())
+}
+
+fn count_correct(logits: &Tensor, labels: &Tensor) -> Result<usize> {
+    let logits = logits.to_vec()?;
+    let labels = labels.to_vec()?;
+    let classes = 10;
+    Ok(labels
+        .iter()
+        .enumerate()
+        .filter(|(batch, label)| {
+            let row = &logits[*batch * classes..(*batch + 1) * classes];
+            let prediction = row
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .map_or(0, |(index, _)| index);
+            prediction == label_to_usize(**label)
+        })
+        .count())
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn as_f32(value: usize) -> f32 {
+    value as f32
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn label_to_usize(value: f32) -> usize {
+    value as usize
+}
+
+fn environment_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}

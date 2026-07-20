@@ -4,8 +4,8 @@
 //! `cargo oxide` to compile the same crate's kernels to PTX with `NVLabs`
 //! cuda-oxide.
 
-mod error;
 pub mod data;
+mod error;
 pub mod jit;
 pub mod loss;
 pub mod models;

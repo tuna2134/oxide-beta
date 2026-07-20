@@ -918,7 +918,7 @@ fn backward_conv2d(
     let mut weight_gradient = vec![0.0; weight.numel()];
     let mut bias_gradient = vec![0.0; bias.numel()];
     for batch_index in 0..batch {
-        for out_channel in 0..out_channels {
+        for (out_channel, bias_grad) in bias_gradient.iter_mut().enumerate().take(out_channels) {
             let group = out_channel / out_per_group;
             for out_y in 0..out_h {
                 for out_x in 0..out_w {
@@ -926,7 +926,7 @@ fn backward_conv2d(
                         * out_w
                         + out_x;
                     let output_gradient = gradient[output_index];
-                    bias_gradient[out_channel] += output_gradient;
+                    *bias_grad += output_gradient;
                     for local_channel in 0..in_per_group {
                         let in_channel = group * in_per_group + local_channel;
                         for kernel_y in 0..kernel_h {
@@ -1111,5 +1111,16 @@ mod tests {
                 .unwrap(),
             vec![2., 4., 6., 8., 15., 18., 21., 24.]
         );
+    }
+
+    #[test]
+    fn cross_entropy_backpropagates_softmax_gradient() {
+        let logits = Tensor::zeros(vec![2, 2]).unwrap();
+        let targets = Tensor::from_vec(vec![0.0, 1.0], vec![2]).unwrap();
+        let loss = logits.cross_entropy(&targets).unwrap();
+        assert!((loss.item().unwrap() - 2.0_f32.ln()).abs() < 1e-6);
+        loss.backward().unwrap();
+        let gradient = logits.grad().unwrap().unwrap();
+        assert_eq!(gradient, vec![-0.25, 0.25, 0.25, -0.25]);
     }
 }
