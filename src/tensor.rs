@@ -32,12 +32,13 @@ pub(crate) struct Node {
 pub(crate) struct BatchNormState {
     pub(crate) running_mean: Vec<f32>,
     pub(crate) running_variance: Vec<f32>,
+    pub(crate) device: Device,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct BatchNormStatistics {
-    mean: Vec<f32>,
-    inverse_standard_deviation: Vec<f32>,
+    pub(crate) mean: Vec<f32>,
+    pub(crate) inverse_standard_deviation: Vec<f32>,
 }
 
 #[derive(Debug)]
@@ -445,8 +446,23 @@ impl Tensor {
                 "backward requires a scalar loss tensor".into(),
             ));
         }
-        clear_graph_grads(self, &mut HashSet::new())?;
-        backward_node(self, vec![1.0], &mut HashMap::new())
+        match self.device() {
+            Device::Cpu => {
+                clear_graph_grads(self, &mut HashSet::new())?;
+                backward_node(self, vec![1.0], &mut HashMap::new())
+            }
+            Device::Cuda(device) => {
+                #[cfg(feature = "cuda")]
+                {
+                    crate::cuda::backward(self, device)
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let _ = device;
+                    Err(Error::CudaUnavailable)
+                }
+            }
+        }
     }
 
     /// Returns the accumulated gradient, if this tensor participated in backward.
@@ -455,11 +471,20 @@ impl Tensor {
     ///
     /// Returns an error if the gradient lock was poisoned.
     pub fn grad(&self) -> Result<Option<Vec<f32>>> {
-        self.node
+        let host_gradient = self
+            .node
             .grad
             .lock()
             .map(|gradient| gradient.clone())
-            .map_err(|_| Error::Execution("gradient lock was poisoned".into()))
+            .map_err(|_| Error::Execution("gradient lock was poisoned".into()))?;
+        if host_gradient.is_some() || self.device() == Device::Cpu {
+            return Ok(host_gradient);
+        }
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(device) = self.device() {
+            return crate::cuda::gradient(self, device);
+        }
+        Ok(None)
     }
 
     /// Clears this tensor's accumulated gradient.
@@ -473,6 +498,10 @@ impl Tensor {
             .grad
             .lock()
             .map_err(|_| Error::Execution("gradient lock was poisoned".into()))? = None;
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(device) = self.device() {
+            crate::cuda::zero_gradient(self, device)?;
+        }
         Ok(())
     }
 
@@ -527,6 +556,15 @@ impl Tensor {
         }
     }
 
+    pub(crate) fn set_gradient(&self, gradient: Vec<f32>) -> Result<()> {
+        *self
+            .node
+            .grad
+            .lock()
+            .map_err(|_| Error::Execution("gradient lock was poisoned".into()))? = Some(gradient);
+        Ok(())
+    }
+
     fn binary(&self, rhs: &Self, make_op: fn(Tensor, Tensor) -> Op) -> Result<Self> {
         if self.device() != rhs.device() {
             return Err(Error::DeviceMismatch);
@@ -543,6 +581,15 @@ impl Tensor {
             self.device(),
             make_op(self.clone(), rhs.clone()),
         ))
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(device) = self.device {
+            crate::cuda::release_node(self.id, device);
+        }
     }
 }
 
@@ -1505,6 +1552,7 @@ mod tests {
             let state = Arc::new(Mutex::new(BatchNormState {
                 running_mean: vec![0.0; 2],
                 running_variance: vec![1.0; 2],
+                device: Device::Cpu,
             }));
             let targets = Tensor::from_vec(vec![0.0, 1.0, 0.0], vec![3]).unwrap();
             input
@@ -1525,6 +1573,7 @@ mod tests {
         let state = Arc::new(Mutex::new(BatchNormState {
             running_mean: vec![0.0; 2],
             running_variance: vec![1.0; 2],
+            device: Device::Cpu,
         }));
         let targets = Tensor::from_vec(vec![0.0, 1.0, 0.0], vec![3]).unwrap();
         let loss_tensor = input

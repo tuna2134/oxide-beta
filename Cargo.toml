@@ -30,5 +30,5 @@ required-features = []
 
 [[bin]]
 name = "mnist-training"
-path = "examples/mnist_training.rs"
+path = "src/bin/mnist_training.rs"
 required-features = []

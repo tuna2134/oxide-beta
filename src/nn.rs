@@ -64,6 +64,16 @@ impl Parameter {
         self.value = Tensor::from_vec(data, self.value.shape().to_vec())?.to(device);
         Ok(())
     }
+
+    pub(crate) fn replace_value(&mut self, value: Tensor) -> Result<()> {
+        if value.shape() != self.value.shape() || value.device() != self.value.device() {
+            return Err(Error::Execution(
+                "replacement parameter shape/device mismatch".into(),
+            ));
+        }
+        self.value = value;
+        Ok(())
+    }
 }
 
 /// Provides structured traversal without exposing a model's internal layout.
@@ -110,6 +120,7 @@ impl BatchNorm2d {
             state: Arc::new(Mutex::new(BatchNormState {
                 running_mean: vec![0.0; channels],
                 running_variance: vec![1.0; channels],
+                device,
             })),
             training: true,
             momentum: 0.1,
@@ -128,6 +139,8 @@ impl BatchNorm2d {
     ///
     /// Returns an error when the state lock is poisoned.
     pub fn running_mean(&self) -> Result<Vec<f32>> {
+        #[cfg(feature = "cuda")]
+        crate::cuda::sync_batch_norm_state(&self.state)?;
         self.state
             .lock()
             .map(|state| state.running_mean.clone())
@@ -140,6 +153,8 @@ impl BatchNorm2d {
     ///
     /// Returns an error when the state lock is poisoned.
     pub fn running_variance(&self) -> Result<Vec<f32>> {
+        #[cfg(feature = "cuda")]
+        crate::cuda::sync_batch_norm_state(&self.state)?;
         self.state
             .lock()
             .map(|state| state.running_variance.clone())
@@ -178,6 +193,8 @@ impl Trainable for BatchNorm2d {
     }
 
     fn visit_buffers(&self, visitor: &mut dyn FnMut(&[usize], &[f32])) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        crate::cuda::sync_batch_norm_state(&self.state)?;
         let state = self
             .state
             .lock()

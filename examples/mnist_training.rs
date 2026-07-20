@@ -138,7 +138,6 @@ fn environment_usize(name: &str, default: usize) -> usize {
 }
 
 fn environment_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
-    })
+    std::env::var(name)
+        .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
