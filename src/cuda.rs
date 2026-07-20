@@ -1267,13 +1267,12 @@ impl Executor {
         Ok(())
     }
 
-    fn backward_node(&mut self, tensor: &Tensor, gradient: Buffer) -> Result<()> {
-        self.accumulate_gradient(tensor, &gradient)?;
+    fn propagate_node(&mut self, tensor: &Tensor, gradient: Buffer) -> Result<()> {
         match &tensor.node.op {
             Op::Data(_) | Op::Placeholder(_) => Ok(()),
             Op::Add(left, right) => {
-                self.backward_node(left, gradient.clone())?;
-                self.backward_node(right, gradient)
+                self.accumulate_gradient(left, &gradient)?;
+                self.accumulate_gradient(right, &gradient)
             }
             Op::Mul(left, right) => {
                 let left_value = self.eval_node(left)?;
@@ -1304,8 +1303,8 @@ impl Executor {
                     )
                 }
                 .map_err(cuda_error)?;
-                self.backward_node(left, Arc::new(left_gradient))?;
-                self.backward_node(right, Arc::new(right_gradient))
+                self.accumulate_gradient(left, &Arc::new(left_gradient))?;
+                self.accumulate_gradient(right, &Arc::new(right_gradient))
             }
             Op::Relu(input) => {
                 let input_value = self.eval_node(input)?;
@@ -1322,9 +1321,9 @@ impl Executor {
                     )
                 }
                 .map_err(cuda_error)?;
-                self.backward_node(input, Arc::new(input_gradient))
+                self.accumulate_gradient(input, &Arc::new(input_gradient))
             }
-            Op::Reshape(input) => self.backward_node(input, gradient),
+            Op::Reshape(input) => self.accumulate_gradient(input, &gradient),
             Op::MatMul(left, right) => self.backward_matmul(left, right, &gradient),
             Op::Conv2d {
                 input,
@@ -1358,7 +1357,7 @@ impl Executor {
                     )
                 }
                 .map_err(cuda_error)?;
-                self.backward_node(logits, Arc::new(logits_gradient))
+                self.accumulate_gradient(logits, &Arc::new(logits_gradient))
             }
             Op::BatchNorm2d {
                 input,
@@ -1408,8 +1407,8 @@ impl Executor {
             )
         }
         .map_err(cuda_error)?;
-        self.backward_node(left, Arc::new(left_gradient))?;
-        self.backward_node(right, Arc::new(right_gradient))
+        self.accumulate_gradient(left, &Arc::new(left_gradient))?;
+        self.accumulate_gradient(right, &Arc::new(right_gradient))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1447,9 +1446,9 @@ impl Executor {
             );
             match result {
                 Ok(()) => {
-                    self.backward_node(input, Arc::new(input_gradient))?;
-                    self.backward_node(weight, Arc::new(weight_gradient))?;
-                    return self.backward_node(bias, Arc::new(bias_gradient));
+                    self.accumulate_gradient(input, &Arc::new(input_gradient))?;
+                    self.accumulate_gradient(weight, &Arc::new(weight_gradient))?;
+                    return self.accumulate_gradient(bias, &Arc::new(bias_gradient));
                 }
                 Err(error) => {
                     eprintln!("cuDNN disabled after convolution backward error: {error}");
@@ -1523,9 +1522,9 @@ impl Executor {
             )
         }
         .map_err(cuda_error)?;
-        self.backward_node(input, Arc::new(input_gradient))?;
-        self.backward_node(weight, Arc::new(weight_gradient))?;
-        self.backward_node(bias, Arc::new(bias_gradient))
+        self.accumulate_gradient(input, &Arc::new(input_gradient))?;
+        self.accumulate_gradient(weight, &Arc::new(weight_gradient))?;
+        self.accumulate_gradient(bias, &Arc::new(bias_gradient))
     }
 
     fn backward_avg_pool(
@@ -1558,7 +1557,7 @@ impl Executor {
             )
         }
         .map_err(cuda_error)?;
-        self.backward_node(input, Arc::new(input_gradient))
+        self.accumulate_gradient(input, &Arc::new(input_gradient))
     }
 
     fn backward_batch_norm(
@@ -1622,9 +1621,9 @@ impl Executor {
             )
         }
         .map_err(cuda_error)?;
-        self.backward_node(input, Arc::new(input_gradient))?;
-        self.backward_node(weight, Arc::new(weight_gradient))?;
-        self.backward_node(bias, Arc::new(bias_gradient))
+        self.accumulate_gradient(input, &Arc::new(input_gradient))?;
+        self.accumulate_gradient(weight, &Arc::new(weight_gradient))?;
+        self.accumulate_gradient(bias, &Arc::new(bias_gradient))
     }
 }
 
@@ -1667,14 +1666,21 @@ pub(crate) fn materialize(tensor: &Tensor, device: usize) -> Result<()> {
 
 pub(crate) fn backward(tensor: &Tensor, device: usize) -> Result<()> {
     with_executor(device, |executor| {
-        let mut nodes = HashSet::new();
-        collect_node_ids(tensor, &mut nodes);
-        for node in nodes {
-            executor.gradients.remove(&node);
+        let mut seen = HashSet::new();
+        let mut topological = Vec::new();
+        collect_topological(tensor, &mut seen, &mut topological);
+        for node in &topological {
+            executor.gradients.remove(&node.node.id);
         }
         let _ = executor.eval_node(tensor)?;
         let root = Arc::new(DeviceBuffer::from_host(&executor.stream, &[1.0]).map_err(cuda_error)?);
-        executor.backward_node(tensor, root)
+        executor.gradients.insert(tensor.node.id, root);
+        for node in topological.iter().rev() {
+            if let Some(gradient) = executor.gradients.get(&node.node.id).cloned() {
+                executor.propagate_node(node, gradient)?;
+            }
+        }
+        Ok(())
     })
 }
 
@@ -1877,6 +1883,43 @@ fn collect_node_ids(tensor: &Tensor, nodes: &mut HashSet<u64>) {
             collect_node_ids(targets, nodes);
         }
     }
+}
+
+fn collect_topological(tensor: &Tensor, seen: &mut HashSet<u64>, output: &mut Vec<Tensor>) {
+    if !seen.insert(tensor.node.id) {
+        return;
+    }
+    match &tensor.node.op {
+        Op::Data(_) | Op::Placeholder(_) => {}
+        Op::Add(left, right) | Op::Mul(left, right) | Op::MatMul(left, right) => {
+            collect_topological(left, seen, output);
+            collect_topological(right, seen, output);
+        }
+        Op::Relu(input) | Op::Reshape(input) | Op::AvgPool2d { input, .. } => {
+            collect_topological(input, seen, output);
+        }
+        Op::Conv2d {
+            input,
+            weight,
+            bias,
+            ..
+        }
+        | Op::BatchNorm2d {
+            input,
+            weight,
+            bias,
+            ..
+        } => {
+            collect_topological(input, seen, output);
+            collect_topological(weight, seen, output);
+            collect_topological(bias, seen, output);
+        }
+        Op::CrossEntropy { logits, targets } => {
+            collect_topological(logits, seen, output);
+            collect_topological(targets, seen, output);
+        }
+    }
+    output.push(tensor.clone());
 }
 
 fn launch_config(numel: usize) -> Result<LaunchConfig> {
