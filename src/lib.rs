@@ -11,6 +11,7 @@ pub mod loss;
 pub mod models;
 pub mod nn;
 pub mod optim;
+pub mod safetensors;
 mod tensor;
 
 #[cfg(feature = "cuda")]
