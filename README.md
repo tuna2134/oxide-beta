@@ -21,8 +21,11 @@ println!("{:?}", y.to_vec()?);
 - 遅延 `Tensor` 計算グラフ
 - CPUと `Device::Cuda(n)`
 - `add`、`mul`、`relu`、rank-2 `matmul`
+- NCHW `conv2d`、group/depthwise convolution、average pooling
 - `&a + &b` / `&a * &b` のTorch風演算子
 - `jit::trace` による静的shapeトレースと特殊化キャッシュ
+- reverse-mode autograd、cross entropy、`Parameter`、AdamW
+- MNIST IDX loader、MobileNetV4 Conv-SのMNIST学習example、checkpoint保存
 - cuda-oxideの純Rust `#[kernel]`、PTX埋め込み、CUDA Driver JITロード
 
 ## CPUで実行
@@ -56,8 +59,9 @@ cuda-oxideは任意のRustソースを実行中にコンパイルするNVRTC風A
 oxide-torch側ではさらに、最初の `run` でトレース済みグラフを入力shape/deviceに
 特殊化してキャッシュします。
 
-これはMVPであり、autograd、broadcast、mixed precision、最適化済みGEMM、
-シリアライズは今後の拡張点です。
+これはMVPであり、broadcast、mixed precision、最適化済みGEMM、学習用BatchNorm、
+checkpointロードは今後の拡張点です。CUDAのforwardはGPUで実行しますが、現時点の
+backwardは正しさを優先したCPU fallbackです。
 
 ## MobileNetV4テストモデル
 
@@ -85,7 +89,40 @@ assert_eq!(logits.shape(), &[1, 1000]);
 # Ok::<(), oxide_torch::Error>(())
 ```
 
-パラメータはテスト用にゼロ初期化されています。実際の学習済み推論では
-`Conv2d::from_tensors` で重みを設定し、BatchNormを畳み込みのweight/biasへ
-foldしてロードします。Hybrid-M/LのMobile-MQA、学習、checkpointローダーは
-まだ含まれません。
+パラメータは再現可能なvariance-scaled初期値です。推論用の学習済み重みでは
+`Conv2d::from_tensors` で設定し、BatchNormを畳み込みのweight/biasへfoldできます。
+Hybrid-M/LのMobile-MQAとcheckpointローダーはまだ含まれません。
+
+## MNISTでMobileNetV4を学習
+
+`MobileNetV4ConvSmall::mnist` は入力をgrayscale `1x28x28`、分類headを10クラスに
+した学習用variantです。MNISTの展開済みIDXファイル4個を同じディレクトリへ置きます。
+
+```text
+data/mnist/
+├── train-images-idx3-ubyte
+├── train-labels-idx1-ubyte
+├── t10k-images-idx3-ubyte
+└── t10k-labels-idx1-ubyte
+```
+
+まず小さなCPU実行を試せます。第1引数を省略すると `data/mnist` を使います。
+
+```bash
+cargo +stable run --release --example mnist_training -- data/mnist
+```
+
+参照実装の畳み込みは最適化前なので、既定値は1 epoch、学習4枚、評価8枚です。
+環境変数で通常の学習量へ拡張できます。
+
+```bash
+MNIST_EPOCHS=10 \
+MNIST_BATCH_SIZE=32 \
+MNIST_TRAIN_LIMIT=60000 \
+MNIST_TEST_LIMIT=10000 \
+cargo +stable run --release --example mnist_training -- data/mnist
+```
+
+CUDA環境では末尾に `--cuda` を付け、cuda-oxideのビルド手順で実行します。終了時に
+`mobilenetv4-mnist.oxtr` を保存します。モデルは論文のConv-S構成を保ちますが、現在は
+学習用BatchNormを持たない最小実装なので、精度再現よりAPIと学習経路の検証向けです。

@@ -67,7 +67,7 @@ pub struct Conv2d {
 }
 
 impl Conv2d {
-    /// Creates a convolution with zero-initialized, inference-ready parameters.
+    /// Creates a convolution with deterministic variance-scaled weights and zero bias.
     ///
     /// Bias is always present so a trained `BatchNorm` can be folded into this
     /// layer before inference.

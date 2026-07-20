@@ -19,9 +19,11 @@ fn main() -> Result<()> {
         Device::Cpu
     };
     let epochs = environment_usize("MNIST_EPOCHS", 1);
-    let batch_size = environment_usize("MNIST_BATCH_SIZE", 4);
-    let train_limit = environment_usize("MNIST_TRAIN_LIMIT", 64);
-    let test_limit = environment_usize("MNIST_TEST_LIMIT", 128);
+    // The reference kernels favor clarity over speed. These defaults are deliberately
+    // small so the complete example is practical on a CPU; raise them for a real run.
+    let batch_size = environment_usize("MNIST_BATCH_SIZE", 1);
+    let train_limit = environment_usize("MNIST_TRAIN_LIMIT", 4);
+    let test_limit = environment_usize("MNIST_TEST_LIMIT", 8);
 
     let mnist = Mnist::load(&data_directory)?;
     let mut model = MobileNetV4ConvSmall::mnist(device)?;
