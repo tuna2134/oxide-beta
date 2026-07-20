@@ -862,6 +862,9 @@ struct Executor {
     batch_norm_states: HashMap<usize, BatchNormDeviceState>,
     batch_norm_statistics: HashMap<u64, BatchNormDeviceStatistics>,
     adam_moments: HashMap<(u64, u64), AdamMoments>,
+    root_gradient: Buffer,
+    pending_host_copies: Vec<Arc<[f32]>>,
+    pending_host_bytes: usize,
     #[cfg(feature = "cudnn")]
     cudnn: Option<crate::cudnn::Cudnn>,
 }
@@ -871,6 +874,7 @@ impl Executor {
         let context = CudaContext::new(device).map_err(cuda_error)?;
         let stream = context.default_stream();
         let module = kernels::load(&context).map_err(cuda_error)?;
+        let root_gradient = Arc::new(DeviceBuffer::from_host(&stream, &[1.0]).map_err(cuda_error)?);
         #[cfg(feature = "cudnn")]
         let cudnn = crate::cudnn::Cudnn::try_new();
         #[cfg(feature = "cudnn")]
@@ -891,13 +895,49 @@ impl Executor {
             batch_norm_states: HashMap::new(),
             batch_norm_statistics: HashMap::new(),
             adam_moments: HashMap::new(),
+            root_gradient,
+            pending_host_copies: Vec::new(),
+            pending_host_bytes: 0,
             #[cfg(feature = "cudnn")]
             cudnn,
         })
     }
 
-    fn zeroed(&self, len: usize) -> Result<DeviceBuffer<f32>> {
+    fn zero_buffer(&self, len: usize) -> Result<DeviceBuffer<f32>> {
         DeviceBuffer::zeroed(&self.stream, len).map_err(cuda_error)
+    }
+
+    fn output_buffer(&self, len: usize) -> Result<DeviceBuffer<f32>> {
+        // SAFETY: callers use this only for kernel outputs. Every output
+        // element is written on this stream before the buffer is read.
+        unsafe { DeviceBuffer::uninitialized_async(&self.stream, len) }.map_err(cuda_error)
+    }
+
+    fn upload(&mut self, data: &Arc<[f32]>) -> Result<DeviceBuffer<f32>> {
+        const MAX_PENDING_HOST_BYTES: usize = 64 * 1024 * 1024;
+        let bytes = data.len().saturating_mul(std::mem::size_of::<f32>());
+        if self.pending_host_bytes.saturating_add(bytes) > MAX_PENDING_HOST_BYTES {
+            self.synchronize()?;
+        }
+        let mut output = self.output_buffer(data.len())?;
+        // SAFETY: the Arc clone below keeps this exact allocation alive and
+        // immutable until synchronize() confirms that the H2D copy finished.
+        unsafe { output.copy_from_host_async_unchecked(&self.stream, data) }.map_err(cuda_error)?;
+        self.pending_host_copies.push(data.clone());
+        self.pending_host_bytes = self.pending_host_bytes.saturating_add(bytes);
+        Ok(output)
+    }
+
+    fn synchronize(&mut self) -> Result<()> {
+        self.stream.synchronize().map_err(cuda_error)?;
+        self.pending_host_copies.clear();
+        self.pending_host_bytes = 0;
+        Ok(())
+    }
+
+    fn clear_completed_host_copies(&mut self) {
+        self.pending_host_copies.clear();
+        self.pending_host_bytes = 0;
     }
 
     fn cache_value(&mut self, tensor: &Tensor, output: DeviceBuffer<f32>) -> Result<Buffer> {
@@ -911,7 +951,7 @@ impl Executor {
             return Ok(value.clone());
         }
         let output = match &tensor.node.op {
-            Op::Data(data) => DeviceBuffer::from_host(&self.stream, data).map_err(cuda_error)?,
+            Op::Data(data) => self.upload(data)?,
             Op::Placeholder(slot) => {
                 return Err(Error::Execution(format!(
                     "unbound CUDA JIT placeholder {slot}"
@@ -920,7 +960,7 @@ impl Executor {
             Op::Add(a, b) | Op::Mul(a, b) => {
                 let a = self.eval_node(a)?;
                 let b = self.eval_node(b)?;
-                let mut output = self.zeroed(tensor.numel())?;
+                let mut output = self.output_buffer(tensor.numel())?;
                 let config = launch_config(tensor.numel())?;
                 // SAFETY: Tensor::binary validates equal lengths. Output is a
                 // distinct allocation and every kernel write is bounds-checked.
@@ -936,7 +976,7 @@ impl Executor {
             }
             Op::Relu(input) => {
                 let input = self.eval_node(input)?;
-                let mut output = self.zeroed(tensor.numel())?;
+                let mut output = self.output_buffer(tensor.numel())?;
                 // SAFETY: input and output have tensor.numel() elements and
                 // output is not aliased by any input buffer.
                 unsafe {
@@ -953,7 +993,7 @@ impl Executor {
             Op::MatMul(a, b) => {
                 let a_buffer = self.eval_node(a)?;
                 let b_buffer = self.eval_node(b)?;
-                let mut output = self.zeroed(tensor.numel())?;
+                let mut output = self.output_buffer(tensor.numel())?;
                 // SAFETY: Tensor::matmul validated M/K/N and buffer lengths;
                 // the output kernel guards its one-dimensional index.
                 unsafe {
@@ -982,7 +1022,7 @@ impl Executor {
                 let input_buffer = self.eval_node(input)?;
                 let weight_buffer = self.eval_node(weight)?;
                 let bias_buffer = self.eval_node(bias)?;
-                let mut output = self.zeroed(tensor.numel())?;
+                let mut output = self.output_buffer(tensor.numel())?;
                 #[cfg(feature = "cudnn")]
                 if let Some(cudnn) = &mut self.cudnn {
                     let result = cudnn.forward(
@@ -1036,7 +1076,7 @@ impl Executor {
                 stride,
             } => {
                 let input_buffer = self.eval_node(input)?;
-                let mut output = self.zeroed(tensor.numel())?;
+                let mut output = self.output_buffer(tensor.numel())?;
                 // SAFETY: avg_pool2d validated all spatial extents. The input
                 // and output allocations are distinct and correctly sized.
                 unsafe {
@@ -1063,7 +1103,7 @@ impl Executor {
             Op::CrossEntropy { logits, targets } => {
                 let logits_buffer = self.eval_node(logits)?;
                 let targets_buffer = self.eval_node(targets)?;
-                let mut output = self.zeroed(1)?;
+                let mut output = self.output_buffer(1)?;
                 // SAFETY: cross_entropy validates [N,C] logits and [N]
                 // targets; the kernel checks target class bounds.
                 unsafe {
@@ -1143,9 +1183,9 @@ impl Executor {
         }
 
         let statistics = if training {
-            let mut mean = self.zeroed(channels)?;
-            let mut inverse_std = self.zeroed(channels)?;
-            let mut unbiased_variance = self.zeroed(channels)?;
+            let mut mean = self.output_buffer(channels)?;
+            let mut inverse_std = self.output_buffer(channels)?;
+            let mut unbiased_variance = self.output_buffer(channels)?;
             // SAFETY: each statistics output has one element per channel;
             // samples > 1 and the NCHW input length was validated.
             unsafe {
@@ -1167,8 +1207,8 @@ impl Executor {
                 .batch_norm_states
                 .remove(&state_key)
                 .ok_or_else(|| Error::Execution("missing BatchNorm CUDA state".into()))?;
-            let mut running_mean = self.zeroed(channels)?;
-            let mut running_variance = self.zeroed(channels)?;
+            let mut running_mean = self.output_buffer(channels)?;
+            let mut running_variance = self.output_buffer(channels)?;
             // SAFETY: all seven buffers contain exactly `channels` values and
             // output allocations do not alias any input allocation.
             unsafe {
@@ -1203,7 +1243,7 @@ impl Executor {
                 .ok_or_else(|| Error::Execution("missing BatchNorm CUDA state".into()))?;
             let mean = running.running_mean.clone();
             let variance = running.running_variance.clone();
-            let mut inverse_std = self.zeroed(channels)?;
+            let mut inverse_std = self.output_buffer(channels)?;
             // SAFETY: variance and inverse_std both contain `channels`
             // elements and are separate allocations.
             unsafe {
@@ -1221,7 +1261,7 @@ impl Executor {
                 inverse_standard_deviation: Arc::new(inverse_std),
             }
         };
-        let mut output = self.zeroed(tensor.numel())?;
+        let mut output = self.output_buffer(tensor.numel())?;
         // SAFETY: affine parameters/statistics have one value per channel;
         // input and output have matching NCHW lengths and do not alias.
         unsafe {
@@ -1246,7 +1286,7 @@ impl Executor {
 
     fn accumulate_gradient(&mut self, tensor: &Tensor, incoming: &Buffer) -> Result<()> {
         let gradient = if let Some(current) = self.gradients.remove(&tensor.node.id) {
-            let mut output = self.zeroed(tensor.numel())?;
+            let mut output = self.output_buffer(tensor.numel())?;
             // SAFETY: current, incoming, and output have tensor.numel()
             // elements; output is a distinct allocation.
             unsafe {
@@ -1277,8 +1317,8 @@ impl Executor {
             Op::Mul(left, right) => {
                 let left_value = self.eval_node(left)?;
                 let right_value = self.eval_node(right)?;
-                let mut left_gradient = self.zeroed(left.numel())?;
-                let mut right_gradient = self.zeroed(right.numel())?;
+                let mut left_gradient = self.output_buffer(left.numel())?;
+                let mut right_gradient = self.output_buffer(right.numel())?;
                 // SAFETY: elementwise operands and gradients all have the
                 // same validated length; outputs are distinct allocations.
                 unsafe {
@@ -1308,7 +1348,7 @@ impl Executor {
             }
             Op::Relu(input) => {
                 let input_value = self.eval_node(input)?;
-                let mut input_gradient = self.zeroed(input.numel())?;
+                let mut input_gradient = self.output_buffer(input.numel())?;
                 // SAFETY: all buffers have input.numel() elements and output
                 // does not alias the input buffers.
                 unsafe {
@@ -1341,7 +1381,7 @@ impl Executor {
             Op::CrossEntropy { logits, targets } => {
                 let logits_value = self.eval_node(logits)?;
                 let targets_value = self.eval_node(targets)?;
-                let mut logits_gradient = self.zeroed(logits.numel())?;
+                let mut logits_gradient = self.output_buffer(logits.numel())?;
                 // SAFETY: cross_entropy validated [N,C]/[N] shapes and the
                 // kernel guards target classes before indexing logits.
                 unsafe {
@@ -1375,8 +1415,8 @@ impl Executor {
         let rows = left.shape()[0];
         let inner = left.shape()[1];
         let columns = right.shape()[1];
-        let mut left_gradient = self.zeroed(left.numel())?;
-        let mut right_gradient = self.zeroed(right.numel())?;
+        let mut left_gradient = self.output_buffer(left.numel())?;
+        let mut right_gradient = self.output_buffer(right.numel())?;
         // SAFETY: matmul shape validation establishes all M/K/N buffer
         // lengths; each kernel writes to a distinct, correctly sized output.
         unsafe {
@@ -1427,9 +1467,9 @@ impl Executor {
         let out_channels = weight.shape()[0];
         let out_height = (input.shape()[2] + 2 * padding - weight.shape()[2]) / stride + 1;
         let out_width = (input.shape()[3] + 2 * padding - weight.shape()[3]) / stride + 1;
-        let mut input_gradient = self.zeroed(input.numel())?;
-        let mut weight_gradient = self.zeroed(weight.numel())?;
-        let mut bias_gradient = self.zeroed(bias.numel())?;
+        let mut input_gradient = self.output_buffer(input.numel())?;
+        let mut weight_gradient = self.output_buffer(weight.numel())?;
+        let mut bias_gradient = self.output_buffer(bias.numel())?;
         #[cfg(feature = "cudnn")]
         if let Some(cudnn) = &mut self.cudnn {
             let result = cudnn.backward(
@@ -1536,7 +1576,7 @@ impl Executor {
     ) -> Result<()> {
         let out_height = (input.shape()[2] - kernel[0]) / stride[0] + 1;
         let out_width = (input.shape()[3] - kernel[1]) / stride[1] + 1;
-        let mut input_gradient = self.zeroed(input.numel())?;
+        let mut input_gradient = self.output_buffer(input.numel())?;
         // SAFETY: avg_pool2d validated kernel/stride/output extents and the
         // backward kernel writes one value per input element.
         unsafe {
@@ -1579,9 +1619,9 @@ impl Executor {
             .ok_or_else(|| Error::Execution("missing BatchNorm CUDA statistics".into()))?;
         let channels = input.shape()[1];
         let spatial = input.shape()[2] * input.shape()[3];
-        let mut input_gradient = self.zeroed(input.numel())?;
-        let mut weight_gradient = self.zeroed(weight.numel())?;
-        let mut bias_gradient = self.zeroed(bias.numel())?;
+        let mut input_gradient = self.output_buffer(input.numel())?;
+        let mut weight_gradient = self.output_buffer(weight.numel())?;
+        let mut bias_gradient = self.output_buffer(bias.numel())?;
         // SAFETY: affine outputs are distinct channel-sized allocations and
         // all read buffers retain the validated NCHW layout.
         unsafe {
@@ -1653,14 +1693,16 @@ fn with_executor<T>(
 pub(crate) fn eval(tensor: &Tensor, device: usize) -> Result<Vec<f32>> {
     with_executor(device, |executor| {
         let output = executor.eval_node(tensor)?;
-        output.to_host_vec(&executor.stream).map_err(cuda_error)
+        let host = output.to_host_vec(&executor.stream).map_err(cuda_error)?;
+        executor.clear_completed_host_copies();
+        Ok(host)
     })
 }
 
 pub(crate) fn materialize(tensor: &Tensor, device: usize) -> Result<()> {
     with_executor(device, |executor| {
         let _ = executor.eval_node(tensor)?;
-        executor.stream.synchronize().map_err(cuda_error)
+        executor.synchronize()
     })
 }
 
@@ -1673,8 +1715,9 @@ pub(crate) fn backward(tensor: &Tensor, device: usize) -> Result<()> {
             executor.gradients.remove(&node.node.id);
         }
         let _ = executor.eval_node(tensor)?;
-        let root = Arc::new(DeviceBuffer::from_host(&executor.stream, &[1.0]).map_err(cuda_error)?);
-        executor.gradients.insert(tensor.node.id, root);
+        executor
+            .gradients
+            .insert(tensor.node.id, executor.root_gradient.clone());
         for node in topological.iter().rev() {
             if let Some(gradient) = executor.gradients.get(&node.node.id).cloned() {
                 executor.propagate_node(node, gradient)?;
@@ -1686,11 +1729,15 @@ pub(crate) fn backward(tensor: &Tensor, device: usize) -> Result<()> {
 
 pub(crate) fn gradient(tensor: &Tensor, device: usize) -> Result<Option<Vec<f32>>> {
     with_executor(device, |executor| {
-        executor
+        let host = executor
             .gradients
             .get(&tensor.node.id)
             .map(|gradient| gradient.to_host_vec(&executor.stream).map_err(cuda_error))
-            .transpose()
+            .transpose()?;
+        if host.is_some() {
+            executor.clear_completed_host_copies();
+        }
+        Ok(host)
     })
 }
 
@@ -1800,13 +1847,13 @@ pub(crate) fn adamw_step(
             (moments.first, moments.second)
         } else {
             (
-                Arc::new(executor.zeroed(parameter_tensor.numel())?),
-                Arc::new(executor.zeroed(parameter_tensor.numel())?),
+                Arc::new(executor.zero_buffer(parameter_tensor.numel())?),
+                Arc::new(executor.zero_buffer(parameter_tensor.numel())?),
             )
         };
-        let mut new_parameter = executor.zeroed(parameter_tensor.numel())?;
-        let mut new_first = executor.zeroed(parameter_tensor.numel())?;
-        let mut new_second = executor.zeroed(parameter_tensor.numel())?;
+        let mut new_parameter = executor.output_buffer(parameter_tensor.numel())?;
+        let mut new_first = executor.output_buffer(parameter_tensor.numel())?;
+        let mut new_second = executor.output_buffer(parameter_tensor.numel())?;
         // SAFETY: parameter, gradient, moments, and all outputs contain the
         // same number of f32 elements; the three outputs are distinct.
         unsafe {
