@@ -580,7 +580,7 @@ mod kernels {
             let variance = squared_sum / samples as f32;
             *mean_value = channel_mean;
             if let Some(value) = inverse_std.get_mut(thread::index_1d()) {
-                *value = (variance + epsilon).sqrt().recip();
+                *value = 1.0 / core::intrinsics::sqrtf32(variance + epsilon);
             }
             if let Some(value) = unbiased_variance.get_mut(thread::index_1d()) {
                 *value = squared_sum / (samples - 1) as f32;
@@ -698,13 +698,16 @@ mod kernels {
                 let mut maximum = f32::NEG_INFINITY;
                 let mut class = 0;
                 while class < classes {
-                    maximum = maximum.max(logits[start + class]);
+                    let candidate = logits[start + class];
+                    if candidate > maximum {
+                        maximum = candidate;
+                    }
                     class += 1;
                 }
                 let mut normalizer = 0.0;
                 class = 0;
                 while class < classes {
-                    normalizer += (logits[start + class] - maximum).exp();
+                    normalizer += core::intrinsics::expf32(logits[start + class] - maximum);
                     class += 1;
                 }
                 let target = targets[batch_index] as usize;
@@ -712,7 +715,7 @@ mod kernels {
                     *value = f32::NAN;
                     return;
                 }
-                loss += normalizer.ln() + maximum - logits[start + target];
+                loss += core::intrinsics::logf32(normalizer) + maximum - logits[start + target];
                 batch_index += 1;
             }
             *value = loss / batch as f32;
@@ -737,13 +740,16 @@ mod kernels {
             let mut maximum = f32::NEG_INFINITY;
             let mut class = 0;
             while class < classes && batch_index < batch {
-                maximum = maximum.max(logits[start + class]);
+                let candidate = logits[start + class];
+                if candidate > maximum {
+                    maximum = candidate;
+                }
                 class += 1;
             }
             let mut normalizer = 0.0;
             class = 0;
             while class < classes && batch_index < batch {
-                normalizer += (logits[start + class] - maximum).exp();
+                normalizer += core::intrinsics::expf32(logits[start + class] - maximum);
                 class += 1;
             }
             let target = targets[batch_index] as usize;
@@ -751,7 +757,7 @@ mod kernels {
                 *value = f32::NAN;
                 return;
             }
-            let probability = (logits[raw] - maximum).exp() / normalizer;
+            let probability = core::intrinsics::expf32(logits[raw] - maximum) / normalizer;
             *value = outer_gradient[0] / batch as f32
                 * (probability - if class_index == target { 1.0 } else { 0.0 });
         }
@@ -775,7 +781,7 @@ mod kernels {
         let index = thread::index_1d();
         let raw = index.get();
         if let Some(value) = inverse_std.get_mut(index) {
-            *value = (variance[raw] + epsilon).sqrt().recip();
+            *value = 1.0 / core::intrinsics::sqrtf32(variance[raw] + epsilon);
         }
     }
 
@@ -822,8 +828,8 @@ mod kernels {
         if let Some(value) = new_parameter.get_mut(index) {
             let first = beta1 * first_moment[raw] + (1.0 - beta1) * gradient[raw];
             let second = beta2 * second_moment[raw] + (1.0 - beta2) * gradient[raw] * gradient[raw];
-            let normalized =
-                (first / first_correction) / ((second / second_correction).sqrt() + epsilon);
+            let normalized = (first / first_correction)
+                / (core::intrinsics::sqrtf32(second / second_correction) + epsilon);
             *value = parameter[raw] - learning_rate * (normalized + weight_decay * parameter[raw]);
             if let Some(moment) = new_first_moment.get_mut(thread::index_1d()) {
                 *moment = first;
@@ -831,6 +837,133 @@ mod kernels {
             if let Some(moment) = new_second_moment.get_mut(thread::index_1d()) {
                 *moment = second;
             }
+        }
+    }
+
+    #[kernel]
+    pub fn gemma_rms_norm(
+        hidden: usize,
+        epsilon: f32,
+        input: &[f32],
+        weight_bf16: &[u16],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            let row = raw / hidden;
+            let column = raw % hidden;
+            let mut square_sum = 0.0;
+            let mut offset = 0;
+            while offset < hidden {
+                let x = input[row * hidden + offset];
+                square_sum += x * x;
+                offset += 1;
+            }
+            let scale = 1.0 / core::intrinsics::sqrtf32(square_sum / hidden as f32 + epsilon);
+            let weight = f32::from_bits((weight_bf16[column] as u32) << 16);
+            *value = input[raw] * scale * weight;
+        }
+    }
+
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemma_rope(
+        heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        position_offset: usize,
+        theta: f32,
+        input: &[f32],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            let dimension = raw % head_dim;
+            if dimension >= rotary_dim {
+                *value = input[raw];
+                return;
+            }
+            let token = raw / (heads * head_dim);
+            let head_base = raw - dimension;
+            let half = rotary_dim / 2;
+            let pair = if dimension < half {
+                dimension + half
+            } else {
+                dimension - half
+            };
+            let frequency_index = dimension % half;
+            let frequency =
+                core::intrinsics::powf32(theta, -(2 * frequency_index) as f32 / rotary_dim as f32);
+            let angle = (position_offset + token) as f32 * frequency;
+            let rotated = if dimension < half {
+                -input[head_base + pair]
+            } else {
+                input[head_base + pair]
+            };
+            *value = input[raw] * core::intrinsics::cosf32(angle)
+                + rotated * core::intrinsics::sinf32(angle);
+        }
+    }
+
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemma_gqa_decode(
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        sequence: usize,
+        window: usize,
+        query: &[f32],
+        key_cache: &[f32],
+        value_cache: &[f32],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            let head = raw / head_dim;
+            let dimension = raw % head_dim;
+            let kv_head = head / (heads / kv_heads);
+            let start = if window == 0 || sequence <= window {
+                0
+            } else {
+                sequence - window
+            };
+            let mut maximum = f32::NEG_INFINITY;
+            let mut position = start;
+            while position < sequence {
+                let mut score = 0.0;
+                let mut inner = 0;
+                while inner < head_dim {
+                    score += query[head * head_dim + inner]
+                        * key_cache[(position * kv_heads + kv_head) * head_dim + inner];
+                    inner += 1;
+                }
+                if score > maximum {
+                    maximum = score;
+                }
+                position += 1;
+            }
+            let mut normalizer = 0.0;
+            let mut weighted = 0.0;
+            position = start;
+            while position < sequence {
+                let mut score = 0.0;
+                let mut inner = 0;
+                while inner < head_dim {
+                    score += query[head * head_dim + inner]
+                        * key_cache[(position * kv_heads + kv_head) * head_dim + inner];
+                    inner += 1;
+                }
+                let probability = core::intrinsics::expf32(score - maximum);
+                normalizer += probability;
+                weighted += probability
+                    * value_cache[(position * kv_heads + kv_head) * head_dim + dimension];
+                position += 1;
+            }
+            *value = weighted / normalizer;
         }
     }
 }

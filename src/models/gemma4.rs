@@ -511,6 +511,20 @@ impl Gemma4ForCausalLM {
         &self.root
     }
 
+    #[cfg(feature = "cuda")]
+    pub(crate) fn checkpoint_weight_names(&self) -> impl Iterator<Item = &str> {
+        self.weights.names()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn with_checkpoint_view<R>(
+        &self,
+        name: &str,
+        visitor: impl FnOnce(safetensors::Dtype, &[usize], &[u8]) -> Result<R>,
+    ) -> Result<R> {
+        self.weights.with_view(name, visitor)
+    }
+
     /// Loads a Hugging Face parameter, accepting common multimodal prefixes.
     ///
     /// # Errors
