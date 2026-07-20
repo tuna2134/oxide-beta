@@ -314,6 +314,27 @@ impl Gemma4ForCausalLM {
         )))
     }
 
+    /// Borrows the original `SafeTensors` payload for a model weight.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no alias exists or `visitor` rejects the tensor.
+    pub fn with_weight_view<R>(
+        &self,
+        suffix: &str,
+        visitor: impl FnOnce(safetensors::Dtype, &[usize], &[u8]) -> Result<R>,
+    ) -> Result<R> {
+        let names = Self::weight_aliases(suffix);
+        for name in &names {
+            if self.weights.contains(name) {
+                return self.weights.with_view(name, visitor);
+            }
+        }
+        Err(Error::Execution(format!(
+            "required Gemma 4 tensor `{suffix}` is missing"
+        )))
+    }
+
     /// Performs the scaled token-embedding lookup used at the model input.
     ///
     /// # Errors

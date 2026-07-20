@@ -170,6 +170,24 @@ impl SafeTensorLoader {
         })
     }
 
+    /// Borrows a tensor payload directly from its memory map.
+    ///
+    /// The byte slice is valid only for the duration of `visitor`. This is the
+    /// zero-copy path used to upload BF16 weights without an intermediate f32
+    /// allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensor is invalid or `visitor` fails.
+    pub fn with_view<R>(
+        &self,
+        name: &str,
+        visitor: impl FnOnce(Dtype, &[usize], &[u8]) -> Result<R>,
+    ) -> Result<R> {
+        let view = self.view(name)?;
+        visitor(view.dtype(), view.shape(), view.data())
+    }
+
     fn view<'a>(&'a self, name: &str) -> Result<safetensors::tensor::TensorView<'a>> {
         let shard = self
             .weight_map
