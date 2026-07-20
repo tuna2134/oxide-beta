@@ -15,7 +15,7 @@ cudnn = ["cuda", "dep:libloading"]
 
 [dependencies]
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6a92f548f25899352e47e173bfd387b2cd0d1e18", optional = true }
-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6a92f548f25899352e47e173bfd387b2cd0d1e18", optional = true }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "52accfa488fe7ca148dd5f7746794119b15c5390", optional = true }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6a92f548f25899352e47e173bfd387b2cd0d1e18", optional = true }
 libloading = { version = "0.8", optional = true }
 half = "2.6"
