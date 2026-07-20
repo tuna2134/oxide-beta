@@ -10,8 +10,8 @@ license = "Apache-2.0"
 
 [features]
 default = []
-cuda = ["dep:cuda-core", "dep:cuda-device", "dep:cuda-host"]
-cudnn = ["cuda", "dep:libloading"]
+cuda = ["dep:cuda-core", "dep:cuda-device", "dep:cuda-host", "dep:libloading"]
+cudnn = ["cuda"]
 
 [dependencies]
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6a92f548f25899352e47e173bfd387b2cd0d1e18", optional = true }

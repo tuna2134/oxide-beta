@@ -173,8 +173,7 @@ pub fn sample_token(logits: &[f32], config: &GenerationConfig, random: &mut u64)
     let fallback = candidates
         .last()
         .ok_or_else(|| Error::Execution("sampling removed all candidates".into()))?;
-    u32::try_from(fallback.0)
-        .map_err(|_| Error::Execution("token id overflow".into()))
+    u32::try_from(fallback.0).map_err(|_| Error::Execution("token id overflow".into()))
 }
 
 /// Reference grouped-query causal attention used to validate the CUDA kernel.
@@ -241,12 +240,7 @@ pub fn grouped_query_attention(
                 })
                 .sum();
             let out_base = q_base;
-            for (position, score) in scores
-                .iter()
-                .enumerate()
-                .take(absolute_q + 1)
-                .skip(start)
-            {
+            for (position, score) in scores.iter().enumerate().take(absolute_q + 1).skip(start) {
                 let probability = score / normalizer;
                 let v_base = (position * kv_heads + kv_head) * head_dim;
                 for dimension in 0..head_dim {

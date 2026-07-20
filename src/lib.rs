@@ -15,6 +15,8 @@ pub mod safetensors;
 mod tensor;
 
 #[cfg(feature = "cuda")]
+mod cublas;
+#[cfg(feature = "cuda")]
 mod cuda;
 #[cfg(feature = "cudnn")]
 mod cudnn;
