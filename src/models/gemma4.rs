@@ -11,6 +11,253 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
+/// Generation parameters matching `google/gemma-4-E2B-it` defaults.
+#[derive(Clone, Debug)]
+pub struct GenerationConfig {
+    pub max_new_tokens: usize,
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub eos_token_ids: Vec<u32>,
+    pub seed: u64,
+}
+
+impl Default for GenerationConfig {
+    fn default() -> Self {
+        Self {
+            max_new_tokens: 128,
+            temperature: 1.0,
+            top_k: 64,
+            top_p: 0.95,
+            eos_token_ids: vec![1, 50, 106],
+            seed: 0x4d59_5df4_d0f3_3173,
+        }
+    }
+}
+
+/// Per-layer autoregressive key/value state in `[sequence, kv_head, head_dim]` order.
+#[derive(Clone, Debug, Default)]
+pub struct KvCache {
+    key: Vec<f32>,
+    value: Vec<f32>,
+    kv_heads: usize,
+    head_dim: usize,
+    sequence_len: usize,
+}
+
+impl KvCache {
+    /// Appends one or more positions, retaining only `window` latest positions when set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when K/V shapes are inconsistent.
+    pub fn append(
+        &mut self,
+        key: &[f32],
+        value: &[f32],
+        kv_heads: usize,
+        positions: usize,
+        head_dim: usize,
+        window: Option<usize>,
+    ) -> Result<()> {
+        let added = kv_heads
+            .checked_mul(positions)
+            .and_then(|size| size.checked_mul(head_dim))
+            .ok_or_else(|| Error::InvalidShape("KV cache shape overflow".into()))?;
+        if key.len() != added || value.len() != added || kv_heads == 0 || head_dim == 0 {
+            return Err(Error::InvalidShape("invalid KV cache update".into()));
+        }
+        if self.sequence_len != 0 && (self.kv_heads != kv_heads || self.head_dim != head_dim) {
+            return Err(Error::InvalidShape("KV cache dimensions changed".into()));
+        }
+        self.kv_heads = kv_heads;
+        self.head_dim = head_dim;
+        self.key.extend_from_slice(key);
+        self.value.extend_from_slice(value);
+        self.sequence_len += positions;
+        if let Some(window) = window {
+            if self.sequence_len > window {
+                let discard_positions = self.sequence_len - window;
+                let discard = discard_positions * kv_heads * head_dim;
+                self.key.drain(..discard);
+                self.value.drain(..discard);
+                self.sequence_len = window;
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn sequence_len(&self) -> usize {
+        self.sequence_len
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &[f32] {
+        &self.key
+    }
+
+    #[must_use]
+    pub fn value(&self) -> &[f32] {
+        &self.value
+    }
+}
+
+/// Samples one token using temperature, top-k, and nucleus filtering.
+///
+/// # Errors
+///
+/// Returns an error for empty/non-finite logits or invalid parameters.
+pub fn sample_token(logits: &[f32], config: &GenerationConfig, random: &mut u64) -> Result<u32> {
+    if logits.is_empty() || config.temperature <= 0.0 || !(0.0..=1.0).contains(&config.top_p) {
+        return Err(Error::Execution("invalid sampling input".into()));
+    }
+    let mut candidates: Vec<(usize, f32)> = logits
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &logit)| {
+            logit
+                .is_finite()
+                .then_some((index, logit / config.temperature))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Err(Error::Execution("all logits are non-finite".into()));
+    }
+    candidates.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
+    candidates.truncate(config.top_k.max(1).min(candidates.len()));
+    let maximum = candidates[0].1;
+    let mut total = 0.0;
+    for (_, score) in &mut candidates {
+        *score = (*score - maximum).exp();
+        total += *score;
+    }
+    if total == 0.0 || !total.is_finite() {
+        return Err(Error::Execution(
+            "sampling probability normalization failed".into(),
+        ));
+    }
+    for (_, probability) in &mut candidates {
+        *probability /= total;
+    }
+    if config.top_p < 1.0 {
+        let mut cumulative = 0.0;
+        let mut keep = 0;
+        for (_, probability) in &candidates {
+            cumulative += *probability;
+            keep += 1;
+            if cumulative >= config.top_p {
+                break;
+            }
+        }
+        candidates.truncate(keep.max(1));
+        total = candidates.iter().map(|(_, probability)| probability).sum();
+    } else {
+        total = 1.0;
+    }
+    if *random == 0 {
+        *random = 0x4d59_5df4_d0f3_3173;
+    }
+    *random ^= *random << 13;
+    *random ^= *random >> 7;
+    *random ^= *random << 17;
+    #[allow(clippy::cast_precision_loss)]
+    let unit = ((*random >> 40) as u32) as f32 / 16_777_216.0;
+    let mut threshold = unit * total;
+    for (index, probability) in &candidates {
+        if threshold <= *probability {
+            return u32::try_from(*index).map_err(|_| Error::Execution("token id overflow".into()));
+        }
+        threshold -= *probability;
+    }
+    let fallback = candidates
+        .last()
+        .ok_or_else(|| Error::Execution("sampling removed all candidates".into()))?;
+    u32::try_from(fallback.0)
+        .map_err(|_| Error::Execution("token id overflow".into()))
+}
+
+/// Reference grouped-query causal attention used to validate the CUDA kernel.
+/// Layouts are Q=`[q, heads, dim]`, K/V=`[kv, kv_heads, dim]`.
+///
+/// # Errors
+///
+/// Returns an error for incompatible shapes or an invalid sliding window.
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_query_attention(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    q_len: usize,
+    kv_len: usize,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    sliding_window: Option<usize>,
+) -> Result<Vec<f32>> {
+    if heads == 0
+        || kv_heads == 0
+        || heads % kv_heads != 0
+        || q_len > kv_len
+        || query.len() != q_len * heads * head_dim
+        || key.len() != kv_len * kv_heads * head_dim
+        || value.len() != key.len()
+        || sliding_window == Some(0)
+    {
+        return Err(Error::InvalidShape(
+            "invalid grouped-query attention shape".into(),
+        ));
+    }
+    let groups = heads / kv_heads;
+    let query_offset = kv_len - q_len;
+    let mut output = vec![0.0; query.len()];
+    let mut scores = vec![0.0; kv_len];
+    for q in 0..q_len {
+        let absolute_q = query_offset + q;
+        let start = sliding_window.map_or(0, |window| (absolute_q + 1).saturating_sub(window));
+        for head in 0..heads {
+            let kv_head = head / groups;
+            let q_base = (q * heads + head) * head_dim;
+            let mut maximum = f32::NEG_INFINITY;
+            for (position, score_slot) in scores
+                .iter_mut()
+                .enumerate()
+                .take(absolute_q + 1)
+                .skip(start)
+            {
+                let k_base = (position * kv_heads + kv_head) * head_dim;
+                let score = query[q_base..q_base + head_dim]
+                    .iter()
+                    .zip(&key[k_base..k_base + head_dim])
+                    .map(|(a, b)| a * b)
+                    .sum();
+                *score_slot = score;
+                maximum = maximum.max(score);
+            }
+            let normalizer: f32 = (start..=absolute_q)
+                .map(|position| {
+                    scores[position] = (scores[position] - maximum).exp();
+                    scores[position]
+                })
+                .sum();
+            let out_base = q_base;
+            for (position, score) in scores
+                .iter()
+                .enumerate()
+                .take(absolute_q + 1)
+                .skip(start)
+            {
+                let probability = score / normalizer;
+                let v_base = (position * kv_heads + kv_head) * head_dim;
+                for dimension in 0..head_dim {
+                    output[out_base + dimension] += probability * value[v_base + dimension];
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
 fn default_vocab_size() -> usize {
     262_144
 }
@@ -420,5 +667,46 @@ fn expect_shape(tensor: &LoadedTensor, expected: &[usize], name: &str) -> Result
             "Gemma 4 tensor {name} has shape {:?}, expected {expected:?}",
             tensor.shape
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kv_cache_applies_sliding_window() {
+        let mut cache = KvCache::default();
+        cache
+            .append(&[1.0, 2.0], &[3.0, 4.0], 1, 2, 1, Some(3))
+            .unwrap();
+        cache
+            .append(&[5.0, 6.0], &[7.0, 8.0], 1, 2, 1, Some(3))
+            .unwrap();
+        assert_eq!(cache.sequence_len(), 3);
+        assert_eq!(cache.key(), &[2.0, 5.0, 6.0]);
+        assert_eq!(cache.value(), &[4.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn grouped_query_attention_obeys_causality() {
+        let output =
+            grouped_query_attention(&[1.0, 1.0], &[1.0, 1.0], &[2.0, 6.0], 2, 2, 1, 1, 1, None)
+                .unwrap();
+        assert!((output[0] - 2.0).abs() < 1e-6);
+        assert!((output[1] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sampling_respects_top_k_one() {
+        let config = GenerationConfig {
+            top_k: 1,
+            ..GenerationConfig::default()
+        };
+        let mut random = config.seed;
+        assert_eq!(
+            sample_token(&[0.0, 5.0, 1.0], &config, &mut random).unwrap(),
+            1
+        );
     }
 }
