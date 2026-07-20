@@ -10,4 +10,3 @@ use crate::{Result, Tensor};
 pub fn cross_entropy(logits: &Tensor, targets: &Tensor) -> Result<Tensor> {
     logits.cross_entropy(targets)
 }
-

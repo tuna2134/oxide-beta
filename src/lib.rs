@@ -5,10 +5,12 @@
 //! cuda-oxide.
 
 mod error;
+pub mod data;
 pub mod jit;
 pub mod loss;
 pub mod models;
 pub mod nn;
+pub mod optim;
 mod tensor;
 
 #[cfg(feature = "cuda")]

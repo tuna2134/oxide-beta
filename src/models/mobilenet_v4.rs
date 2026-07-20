@@ -1,6 +1,8 @@
 //! `MobileNetV4` models described by tables 11-15 of `mobilenet.pdf`.
 
-use crate::nn::{ConvNormAct, FusedInvertedBottleneck, Module, UniversalInvertedBottleneck};
+use crate::nn::{
+    ConvNormAct, FusedInvertedBottleneck, Module, Parameter, Trainable, UniversalInvertedBottleneck,
+};
 use crate::{Device, Error, Result, Tensor};
 
 #[derive(Clone, Debug)]
@@ -22,12 +24,34 @@ impl Block {
     }
 }
 
+impl Trainable for Block {
+    fn visit_parameters(&self, visitor: &mut dyn FnMut(&Parameter)) {
+        match self {
+            Self::Conv(layer) => layer.visit_parameters(visitor),
+            Self::Fused(layer) => layer.visit_parameters(visitor),
+            Self::Uib(layer) => layer.visit_parameters(visitor),
+            Self::GlobalAverage => {}
+        }
+    }
+
+    fn visit_parameters_mut(&mut self, visitor: &mut dyn FnMut(&mut Parameter)) {
+        match self {
+            Self::Conv(layer) => layer.visit_parameters_mut(visitor),
+            Self::Fused(layer) => layer.visit_parameters_mut(visitor),
+            Self::Uib(layer) => layer.visit_parameters_mut(visitor),
+            Self::GlobalAverage => {}
+        }
+    }
+}
+
 /// The convolution-only small model from supplementary table 11.
 #[derive(Clone, Debug)]
 pub struct MobileNetV4ConvSmall {
     blocks: Vec<Block>,
     num_classes: usize,
     device: Device,
+    input_channels: usize,
+    input_resolution: usize,
 }
 
 impl MobileNetV4ConvSmall {
@@ -39,10 +63,36 @@ impl MobileNetV4ConvSmall {
     ///
     /// Returns an error if an internal paper specification is inconsistent.
     pub fn new(num_classes: usize, device: Device) -> Result<Self> {
+        Self::build(num_classes, 3, Self::INPUT_RESOLUTION, device)
+    }
+
+    /// Builds an MNIST variant accepting `[N, 1, 28, 28]` and producing 10 logits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an internal model specification is inconsistent.
+    pub fn mnist(device: Device) -> Result<Self> {
+        Self::build(10, 1, 28, device)
+    }
+
+    fn build(
+        num_classes: usize,
+        input_channels: usize,
+        input_resolution: usize,
+        device: Device,
+    ) -> Result<Self> {
         if num_classes == 0 {
             return Err(Error::InvalidShape("num_classes must be non-zero".into()));
         }
-        let mut blocks = vec![Block::Conv(ConvNormAct::new(3, 32, 3, 2, 1, true, device)?)];
+        let mut blocks = vec![Block::Conv(ConvNormAct::new(
+            input_channels,
+            32,
+            3,
+            2,
+            1,
+            true,
+            device,
+        )?)];
         blocks.push(Block::Fused(FusedInvertedBottleneck::new(
             32, 32, 32, 3, 2, device,
         )?));
@@ -80,6 +130,8 @@ impl MobileNetV4ConvSmall {
             blocks,
             num_classes,
             device,
+            input_channels,
+            input_resolution,
         })
     }
 
@@ -87,7 +139,7 @@ impl MobileNetV4ConvSmall {
     ///
     /// # Errors
     ///
-    /// Returns an error when the input is not `[N, 3, 224, 224]` or a layer fails.
+    /// Returns an error when input dimensions do not match this variant or a layer fails.
     pub fn forward_with_shapes(&self, input: &Tensor) -> Result<(Tensor, Vec<Vec<usize>>)> {
         self.validate_input(input)?;
         let mut output = input.clone();
@@ -113,12 +165,15 @@ impl MobileNetV4ConvSmall {
             return Err(Error::DeviceMismatch);
         }
         if input.shape().len() != 4
-            || input.shape()[1] != 3
-            || input.shape()[2] != Self::INPUT_RESOLUTION
-            || input.shape()[3] != Self::INPUT_RESOLUTION
+            || input.shape()[1] != self.input_channels
+            || input.shape()[2] != self.input_resolution
+            || input.shape()[3] != self.input_resolution
         {
             return Err(Error::InvalidShape(format!(
-                "MNv4-Conv-S expects [N, 3, 224, 224], got {:?}",
+                "MNv4-Conv-S expects [N, {}, {}, {}], got {:?}",
+                self.input_channels,
+                self.input_resolution,
+                self.input_resolution,
                 input.shape()
             )));
         }
@@ -129,6 +184,20 @@ impl MobileNetV4ConvSmall {
 impl Module for MobileNetV4ConvSmall {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         self.forward_with_shapes(input).map(|(output, _)| output)
+    }
+}
+
+impl Trainable for MobileNetV4ConvSmall {
+    fn visit_parameters(&self, visitor: &mut dyn FnMut(&Parameter)) {
+        for block in &self.blocks {
+            block.visit_parameters(visitor);
+        }
+    }
+
+    fn visit_parameters_mut(&mut self, visitor: &mut dyn FnMut(&mut Parameter)) {
+        for block in &mut self.blocks {
+            block.visit_parameters_mut(visitor);
+        }
     }
 }
 

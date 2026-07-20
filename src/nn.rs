@@ -1,6 +1,9 @@
 //! Minimal neural-network layers used by the paper models.
 
 use crate::{Device, Error, Result, Tensor};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_PARAMETER_ID: AtomicU64 = AtomicU64::new(1);
 
 pub trait Module {
     /// Runs a lazy forward pass.
@@ -11,10 +14,53 @@ pub trait Module {
     fn forward(&self, input: &Tensor) -> Result<Tensor>;
 }
 
+/// A trainable tensor with an optimizer-stable identity.
+#[derive(Clone, Debug)]
+pub struct Parameter {
+    id: u64,
+    value: Tensor,
+}
+
+impl Parameter {
+    #[must_use]
+    pub fn new(value: Tensor) -> Self {
+        Self {
+            id: NEXT_PARAMETER_ID.fetch_add(1, Ordering::Relaxed),
+            value,
+        }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn value(&self) -> &Tensor {
+        &self.value
+    }
+
+    /// Replaces the parameter data while retaining optimizer identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when data length differs from the parameter shape.
+    pub fn replace_data(&mut self, data: Vec<f32>) -> Result<()> {
+        let device = self.value.device();
+        self.value = Tensor::from_vec(data, self.value.shape().to_vec())?.to(device);
+        Ok(())
+    }
+}
+
+/// Provides structured traversal without exposing a model's internal layout.
+pub trait Trainable {
+    fn visit_parameters(&self, visitor: &mut dyn FnMut(&Parameter));
+    fn visit_parameters_mut(&mut self, visitor: &mut dyn FnMut(&mut Parameter));
+}
+
 #[derive(Clone, Debug)]
 pub struct Conv2d {
-    weight: Tensor,
-    bias: Tensor,
+    weight: Parameter,
+    bias: Parameter,
     stride: usize,
     padding: usize,
     groups: usize,
@@ -46,14 +92,15 @@ impl Conv2d {
                 "invalid Conv2d channel, group, or kernel configuration".into(),
             ));
         }
-        let weight = Tensor::zeros(vec![
-            out_channels,
-            in_channels / groups,
-            kernel_size,
-            kernel_size,
-        ])?
-        .to(device);
-        let bias = Tensor::zeros(vec![out_channels])?.to(device);
+        let weight_shape = vec![out_channels, in_channels / groups, kernel_size, kernel_size];
+        let weight = Parameter::new(
+            Tensor::from_vec(
+                initialized_weights(&weight_shape, in_channels / groups),
+                weight_shape,
+            )?
+            .to(device),
+        );
+        let bias = Parameter::new(Tensor::zeros(vec![out_channels])?.to(device));
         Ok(Self {
             weight,
             bias,
@@ -81,8 +128,8 @@ impl Conv2d {
             ));
         }
         Ok(Self {
-            weight,
-            bias,
+            weight: Parameter::new(weight),
+            bias: Parameter::new(bias),
             stride,
             padding,
             groups,
@@ -90,23 +137,35 @@ impl Conv2d {
     }
 
     pub fn weight(&self) -> &Tensor {
-        &self.weight
+        self.weight.value()
     }
 
     pub fn bias(&self) -> &Tensor {
-        &self.bias
+        self.bias.value()
     }
 }
 
 impl Module for Conv2d {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         input.conv2d(
-            &self.weight,
-            &self.bias,
+            self.weight.value(),
+            self.bias.value(),
             self.stride,
             self.padding,
             self.groups,
         )
+    }
+}
+
+impl Trainable for Conv2d {
+    fn visit_parameters(&self, visitor: &mut dyn FnMut(&Parameter)) {
+        visitor(&self.weight);
+        visitor(&self.bias);
+    }
+
+    fn visit_parameters_mut(&mut self, visitor: &mut dyn FnMut(&mut Parameter)) {
+        visitor(&mut self.weight);
+        visitor(&mut self.bias);
     }
 }
 
@@ -153,6 +212,16 @@ impl Module for ConvNormAct {
         } else {
             output
         })
+    }
+}
+
+impl Trainable for ConvNormAct {
+    fn visit_parameters(&self, visitor: &mut dyn FnMut(&Parameter)) {
+        self.conv.visit_parameters(visitor);
+    }
+
+    fn visit_parameters_mut(&mut self, visitor: &mut dyn FnMut(&mut Parameter)) {
+        self.conv.visit_parameters_mut(visitor);
     }
 }
 
@@ -248,6 +317,30 @@ impl Module for UniversalInvertedBottleneck {
     }
 }
 
+impl Trainable for UniversalInvertedBottleneck {
+    fn visit_parameters(&self, visitor: &mut dyn FnMut(&Parameter)) {
+        if let Some(layer) = &self.start_depthwise {
+            layer.visit_parameters(visitor);
+        }
+        self.expand.visit_parameters(visitor);
+        if let Some(layer) = &self.middle_depthwise {
+            layer.visit_parameters(visitor);
+        }
+        self.project.visit_parameters(visitor);
+    }
+
+    fn visit_parameters_mut(&mut self, visitor: &mut dyn FnMut(&mut Parameter)) {
+        if let Some(layer) = &mut self.start_depthwise {
+            layer.visit_parameters_mut(visitor);
+        }
+        self.expand.visit_parameters_mut(visitor);
+        if let Some(layer) = &mut self.middle_depthwise {
+            layer.visit_parameters_mut(visitor);
+        }
+        self.project.visit_parameters_mut(visitor);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FusedInvertedBottleneck {
     expand: ConvNormAct,
@@ -294,4 +387,35 @@ impl Module for FusedInvertedBottleneck {
             Ok(output)
         }
     }
+}
+
+impl Trainable for FusedInvertedBottleneck {
+    fn visit_parameters(&self, visitor: &mut dyn FnMut(&Parameter)) {
+        self.expand.visit_parameters(visitor);
+        self.project.visit_parameters(visitor);
+    }
+
+    fn visit_parameters_mut(&mut self, visitor: &mut dyn FnMut(&mut Parameter)) {
+        self.expand.visit_parameters_mut(visitor);
+        self.project.visit_parameters_mut(visitor);
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn initialized_weights(shape: &[usize], input_channels_per_group: usize) -> Vec<f32> {
+    let kernel_area = shape[2] * shape[3];
+    let fan_in = (input_channels_per_group * kernel_area) as f32;
+    let scale = (2.0 / fan_in).sqrt();
+    let mut state = (shape.iter().fold(0x9E37_79B9_u64, |seed, value| {
+        seed ^ (*value as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9)
+    })) | 1;
+    (0..shape.iter().product())
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let unit = ((state >> 40) as u32) as f32 / ((1_u32 << 24) as f32);
+            (unit * 2.0 - 1.0) * scale
+        })
+        .collect()
 }

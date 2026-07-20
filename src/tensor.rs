@@ -1,8 +1,8 @@
 use crate::{Error, Result};
 use std::collections::{HashMap, HashSet};
 use std::ops::{Add, Mul};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -50,7 +50,10 @@ pub(crate) enum Op {
         stride: [usize; 2],
     },
     Reshape(Tensor),
-    CrossEntropy { logits: Tensor, targets: Tensor },
+    CrossEntropy {
+        logits: Tensor,
+        targets: Tensor,
+    },
 }
 
 impl Tensor {
@@ -538,9 +541,7 @@ pub(crate) fn eval_cpu(
             stride,
         } => eval_avg_pool2d(input, *kernel, *stride, cache, inputs)?,
         Op::Reshape(input) => eval_cpu(input, cache, inputs)?,
-        Op::CrossEntropy { logits, targets } => {
-            eval_cross_entropy(logits, targets, cache, inputs)?
-        }
+        Op::CrossEntropy { logits, targets } => eval_cross_entropy(logits, targets, cache, inputs)?,
     };
     cache.insert(tensor.node.id, value.clone());
     Ok(value)
@@ -921,9 +922,9 @@ fn backward_conv2d(
             let group = out_channel / out_per_group;
             for out_y in 0..out_h {
                 for out_x in 0..out_w {
-                    let output_index =
-                        ((batch_index * out_channels + out_channel) * out_h + out_y) * out_w
-                            + out_x;
+                    let output_index = ((batch_index * out_channels + out_channel) * out_h + out_y)
+                        * out_w
+                        + out_x;
                     let output_gradient = gradient[output_index];
                     bias_gradient[out_channel] += output_gradient;
                     for local_channel in 0..in_per_group {
@@ -994,9 +995,8 @@ fn backward_avg_pool2d(
                         for kernel_x in 0..kernel[1] {
                             let in_y = out_y * stride[0] + kernel_y;
                             let in_x = out_x * stride[1] + kernel_x;
-                            let input_index = ((batch_index * channels + channel) * height + in_y)
-                                * width
-                                + in_x;
+                            let input_index =
+                                ((batch_index * channels + channel) * height + in_y) * width + in_x;
                             input_gradient[input_index] += contribution;
                         }
                     }
