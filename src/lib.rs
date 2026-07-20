@@ -1,4 +1,5 @@
 #![cfg_attr(feature = "cuda", feature(core_intrinsics))]
+#![cfg_attr(feature = "cuda", allow(internal_features))]
 
 //! A compact Torch-like tensor API with a lazy graph and a traced JIT.
 //!

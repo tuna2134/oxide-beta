@@ -894,8 +894,8 @@ mod kernels {
                 dimension - half
             };
             let frequency_index = dimension % half;
-            let frequency =
-                core::intrinsics::powf32(theta, -(2 * frequency_index) as f32 / rotary_dim as f32);
+            let exponent = -((2 * frequency_index) as f32) / rotary_dim as f32;
+            let frequency = core::intrinsics::powf32(theta, exponent);
             let angle = (position_offset + token) as f32 * frequency;
             let rotated = if dimension < half {
                 -input[head_base + pair]
