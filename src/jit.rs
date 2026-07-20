@@ -80,9 +80,8 @@ impl JitModule {
 
         let output = match self.device {
             Device::Cpu => {
-                let values: Vec<Vec<f32>> =
-                    inputs.iter().map(Tensor::to_vec).collect::<Result<_>>()?;
-                eval_cpu(&self.graph, &mut HashMap::new(), Some(&values))?
+                let bound = bind_placeholders(&self.graph, inputs)?;
+                eval_cpu(&bound, &mut HashMap::new(), None)?
             }
             Device::Cuda(device) => {
                 let bound = bind_placeholders(&self.graph, inputs)?;
@@ -222,5 +221,26 @@ mod tests {
             vec![0.0, 4.0]
         );
         assert_eq!(module.cached_specializations(), 1);
+    }
+
+    #[test]
+    fn traced_batch_norm_recomputes_batch_statistics_each_run() {
+        use crate::nn::{BatchNorm2d, Module};
+
+        let layer = BatchNorm2d::new(1, Device::Cpu).unwrap();
+        let example = Tensor::from_vec(vec![1.0, 3.0], vec![1, 1, 1, 2]).unwrap();
+        let module = trace(&[example], |inputs| layer.forward(&inputs[0])).unwrap();
+        let first = module
+            .run(&[Tensor::from_vec(vec![1.0, 3.0], vec![1, 1, 1, 2]).unwrap()])
+            .unwrap()
+            .to_vec()
+            .unwrap();
+        let second = module
+            .run(&[Tensor::from_vec(vec![10.0, 20.0], vec![1, 1, 1, 2]).unwrap()])
+            .unwrap()
+            .to_vec()
+            .unwrap();
+        assert!((first[0] + 1.0).abs() < 1e-4 && (first[1] - 1.0).abs() < 1e-4);
+        assert!((second[0] + 1.0).abs() < 1e-4 && (second[1] - 1.0).abs() < 1e-4);
     }
 }
