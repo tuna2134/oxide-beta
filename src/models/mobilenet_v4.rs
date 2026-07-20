@@ -11,10 +11,10 @@ use std::path::Path;
 
 #[derive(Clone, Debug)]
 enum Block {
-    Conv(ConvNormAct),
+    Conv(Box<ConvNormAct>),
     Classifier(Conv2d),
-    Fused(FusedInvertedBottleneck),
-    Uib(UniversalInvertedBottleneck),
+    Fused(Box<FusedInvertedBottleneck>),
+    Uib(Box<UniversalInvertedBottleneck>),
     GlobalAverage,
 }
 
@@ -54,10 +54,9 @@ impl Trainable for Block {
     fn visit_buffers(&self, visitor: &mut dyn FnMut(&[usize], &[f32])) -> Result<()> {
         match self {
             Self::Conv(layer) => layer.visit_buffers(visitor),
-            Self::Classifier(_) => Ok(()),
+            Self::Classifier(_) | Self::GlobalAverage => Ok(()),
             Self::Fused(layer) => layer.visit_buffers(visitor),
             Self::Uib(layer) => layer.visit_buffers(visitor),
-            Self::GlobalAverage => Ok(()),
         }
     }
 }
@@ -66,10 +65,9 @@ impl ModuleMode for Block {
     fn set_training(&mut self, training: bool) {
         match self {
             Self::Conv(layer) => layer.set_training(training),
-            Self::Classifier(_) => {}
+            Self::Classifier(_) | Self::GlobalAverage => {}
             Self::Fused(layer) => layer.set_training(training),
             Self::Uib(layer) => layer.set_training(training),
-            Self::GlobalAverage => {}
         }
     }
 }
@@ -87,7 +85,7 @@ pub struct MobileNetV4ConvSmall {
 impl MobileNetV4ConvSmall {
     pub const INPUT_RESOLUTION: usize = 224;
 
-    /// Builds the table-11 network with trainable convolution and BatchNorm parameters.
+    /// Builds the table-11 network with trainable convolution and `BatchNorm` parameters.
     ///
     /// # Errors
     ///
@@ -114,7 +112,7 @@ impl MobileNetV4ConvSmall {
         if num_classes == 0 {
             return Err(Error::InvalidShape("num_classes must be non-zero".into()));
         }
-        let mut blocks = vec![Block::Conv(ConvNormAct::new(
+        let mut blocks = vec![Block::Conv(Box::new(ConvNormAct::new(
             input_channels,
             32,
             3,
@@ -122,13 +120,13 @@ impl MobileNetV4ConvSmall {
             1,
             true,
             device,
-        )?)];
-        blocks.push(Block::Fused(FusedInvertedBottleneck::new(
+        )?))];
+        blocks.push(Block::Fused(Box::new(FusedInvertedBottleneck::new(
             32, 32, 32, 3, 2, device,
-        )?));
-        blocks.push(Block::Fused(FusedInvertedBottleneck::new(
+        )?)));
+        blocks.push(Block::Fused(Box::new(FusedInvertedBottleneck::new(
             32, 64, 96, 3, 2, device,
-        )?));
+        )?)));
 
         let specs = [
             // in, out, expanded, start DW, middle DW, stride
@@ -146,14 +144,16 @@ impl MobileNetV4ConvSmall {
             (128, 128, 512, None, Some(3), 1),
         ];
         for (input, output, expanded, start_dw, middle_dw, stride) in specs {
-            blocks.push(Block::Uib(UniversalInvertedBottleneck::new(
+            blocks.push(Block::Uib(Box::new(UniversalInvertedBottleneck::new(
                 input, output, expanded, start_dw, middle_dw, stride, device,
-            )?));
+            )?)));
         }
         blocks.extend([
-            Block::Conv(ConvNormAct::new(128, 960, 1, 1, 1, true, device)?),
+            Block::Conv(Box::new(ConvNormAct::new(128, 960, 1, 1, 1, true, device)?)),
             Block::GlobalAverage,
-            Block::Conv(ConvNormAct::new(960, 1280, 1, 1, 1, true, device)?),
+            Block::Conv(Box::new(ConvNormAct::new(
+                960, 1280, 1, 1, 1, true, device,
+            )?)),
             Block::Classifier(Conv2d::new(1280, num_classes, 1, 1, 1, device)?),
         ]);
         Ok(Self {
@@ -190,12 +190,12 @@ impl MobileNetV4ConvSmall {
         self.device
     }
 
-    /// Enables batch-statistics behavior for every BatchNorm layer.
+    /// Enables batch-statistics behavior for every `BatchNorm` layer.
     pub fn train(&mut self) {
         self.set_training(true);
     }
 
-    /// Enables running-statistics behavior for every BatchNorm layer.
+    /// Enables running-statistics behavior for every `BatchNorm` layer.
     pub fn eval(&mut self) {
         self.set_training(false);
     }

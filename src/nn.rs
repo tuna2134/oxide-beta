@@ -93,7 +93,7 @@ pub struct BatchNorm2d {
 }
 
 impl BatchNorm2d {
-    /// Creates a BatchNorm layer with γ=1, β=0, running mean=0, and variance=1.
+    /// Creates a `BatchNorm` layer with γ=1, β=0, running mean=0, and variance=1.
     ///
     /// # Errors
     ///
@@ -309,7 +309,7 @@ pub struct ConvNormAct {
 }
 
 impl ConvNormAct {
-    /// Creates a convolution followed by BatchNorm and an optional ReLU.
+    /// Creates a convolution followed by `BatchNorm` and an optional `ReLU`.
     ///
     /// # Errors
     ///

@@ -899,9 +899,9 @@ fn batch_statistics(
     let denominator = samples as f32;
     let mut mean = vec![0.0; channels];
     for batch in 0..input.shape()[0] {
-        for channel in 0..channels {
+        for (channel, channel_mean) in mean.iter_mut().enumerate() {
             let start = (batch * channels + channel) * spatial;
-            mean[channel] += input_data[start..start + spatial].iter().sum::<f32>();
+            *channel_mean += input_data[start..start + spatial].iter().sum::<f32>();
         }
     }
     for value in &mut mean {
@@ -1049,16 +1049,8 @@ fn clear_graph_grads(tensor: &Tensor, visited: &mut HashSet<u64>) -> Result<()> 
             weight,
             bias,
             ..
-        } => {
-            clear_graph_grads(input, visited)?;
-            clear_graph_grads(weight, visited)?;
-            clear_graph_grads(bias, visited)?;
         }
-        Op::CrossEntropy { logits, targets } => {
-            clear_graph_grads(logits, visited)?;
-            clear_graph_grads(targets, visited)?;
-        }
-        Op::BatchNorm2d {
+        | Op::BatchNorm2d {
             input,
             weight,
             bias,
@@ -1067,6 +1059,10 @@ fn clear_graph_grads(tensor: &Tensor, visited: &mut HashSet<u64>) -> Result<()> 
             clear_graph_grads(input, visited)?;
             clear_graph_grads(weight, visited)?;
             clear_graph_grads(bias, visited)?;
+        }
+        Op::CrossEntropy { logits, targets } => {
+            clear_graph_grads(logits, visited)?;
+            clear_graph_grads(targets, visited)?;
         }
     }
     Ok(())
