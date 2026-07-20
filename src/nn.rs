@@ -1,7 +1,9 @@
 //! Minimal neural-network layers used by the paper models.
 
+use crate::tensor::BatchNormState;
 use crate::{Device, Error, Result, Tensor};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 static NEXT_PARAMETER_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -12,6 +14,19 @@ pub trait Module {
     ///
     /// Returns an error when an input shape/device is incompatible with the module.
     fn forward(&self, input: &Tensor) -> Result<Tensor>;
+}
+
+/// Switches stateful layers between training and inference behavior.
+pub trait ModuleMode {
+    fn set_training(&mut self, training: bool);
+
+    fn train(&mut self) {
+        self.set_training(true);
+    }
+
+    fn eval(&mut self) {
+        self.set_training(false);
+    }
 }
 
 /// A trainable tensor with an optimizer-stable identity.
@@ -55,6 +70,123 @@ impl Parameter {
 pub trait Trainable {
     fn visit_parameters(&self, visitor: &mut dyn FnMut(&Parameter));
     fn visit_parameters_mut(&mut self, visitor: &mut dyn FnMut(&mut Parameter));
+
+    /// Visits persistent, non-optimizer state such as running statistics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a state lock is poisoned.
+    fn visit_buffers(&self, _visitor: &mut dyn FnMut(&[usize], &[f32])) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// NCHW Batch Normalization with affine parameters and running statistics.
+#[derive(Clone, Debug)]
+pub struct BatchNorm2d {
+    weight: Parameter,
+    bias: Parameter,
+    state: Arc<Mutex<BatchNormState>>,
+    training: bool,
+    momentum: f32,
+    epsilon: f32,
+}
+
+impl BatchNorm2d {
+    /// Creates a BatchNorm layer with γ=1, β=0, running mean=0, and variance=1.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `channels` is zero.
+    pub fn new(channels: usize, device: Device) -> Result<Self> {
+        if channels == 0 {
+            return Err(Error::InvalidShape(
+                "BatchNorm2d channels must be non-zero".into(),
+            ));
+        }
+        Ok(Self {
+            weight: Parameter::new(Tensor::ones(vec![channels])?.to(device)),
+            bias: Parameter::new(Tensor::zeros(vec![channels])?.to(device)),
+            state: Arc::new(Mutex::new(BatchNormState {
+                running_mean: vec![0.0; channels],
+                running_variance: vec![1.0; channels],
+            })),
+            training: true,
+            momentum: 0.1,
+            epsilon: 1e-5,
+        })
+    }
+
+    #[must_use]
+    pub fn is_training(&self) -> bool {
+        self.training
+    }
+
+    /// Returns a copy of the running mean.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the state lock is poisoned.
+    pub fn running_mean(&self) -> Result<Vec<f32>> {
+        self.state
+            .lock()
+            .map(|state| state.running_mean.clone())
+            .map_err(|_| Error::Execution("BatchNorm state lock was poisoned".into()))
+    }
+
+    /// Returns a copy of the running variance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the state lock is poisoned.
+    pub fn running_variance(&self) -> Result<Vec<f32>> {
+        self.state
+            .lock()
+            .map(|state| state.running_variance.clone())
+            .map_err(|_| Error::Execution("BatchNorm state lock was poisoned".into()))
+    }
+}
+
+impl Module for BatchNorm2d {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        input.batch_norm2d(
+            self.weight.value(),
+            self.bias.value(),
+            self.state.clone(),
+            self.training,
+            self.momentum,
+            self.epsilon,
+        )
+    }
+}
+
+impl ModuleMode for BatchNorm2d {
+    fn set_training(&mut self, training: bool) {
+        self.training = training;
+    }
+}
+
+impl Trainable for BatchNorm2d {
+    fn visit_parameters(&self, visitor: &mut dyn FnMut(&Parameter)) {
+        visitor(&self.weight);
+        visitor(&self.bias);
+    }
+
+    fn visit_parameters_mut(&mut self, visitor: &mut dyn FnMut(&mut Parameter)) {
+        visitor(&mut self.weight);
+        visitor(&mut self.bias);
+    }
+
+    fn visit_buffers(&self, visitor: &mut dyn FnMut(&[usize], &[f32])) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Execution("BatchNorm state lock was poisoned".into()))?;
+        let shape = [state.running_mean.len()];
+        visitor(&shape, &state.running_mean);
+        visitor(&shape, &state.running_variance);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -172,11 +304,12 @@ impl Trainable for Conv2d {
 #[derive(Clone, Debug)]
 pub struct ConvNormAct {
     conv: Conv2d,
+    norm: BatchNorm2d,
     activation: bool,
 }
 
 impl ConvNormAct {
-    /// Creates a convolution whose `BatchNorm` is represented as folded weights.
+    /// Creates a convolution followed by BatchNorm and an optional ReLU.
     ///
     /// # Errors
     ///
@@ -199,6 +332,7 @@ impl ConvNormAct {
                 groups,
                 device,
             )?,
+            norm: BatchNorm2d::new(out_channels, device)?,
             activation,
         })
     }
@@ -206,7 +340,7 @@ impl ConvNormAct {
 
 impl Module for ConvNormAct {
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
-        let output = self.conv.forward(input)?;
+        let output = self.norm.forward(&self.conv.forward(input)?)?;
         Ok(if self.activation {
             output.relu()
         } else {
@@ -218,10 +352,22 @@ impl Module for ConvNormAct {
 impl Trainable for ConvNormAct {
     fn visit_parameters(&self, visitor: &mut dyn FnMut(&Parameter)) {
         self.conv.visit_parameters(visitor);
+        self.norm.visit_parameters(visitor);
     }
 
     fn visit_parameters_mut(&mut self, visitor: &mut dyn FnMut(&mut Parameter)) {
         self.conv.visit_parameters_mut(visitor);
+        self.norm.visit_parameters_mut(visitor);
+    }
+
+    fn visit_buffers(&self, visitor: &mut dyn FnMut(&[usize], &[f32])) -> Result<()> {
+        self.norm.visit_buffers(visitor)
+    }
+}
+
+impl ModuleMode for ConvNormAct {
+    fn set_training(&mut self, training: bool) {
+        self.norm.set_training(training);
     }
 }
 

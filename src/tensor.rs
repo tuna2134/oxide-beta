@@ -1060,6 +1060,16 @@ fn clear_graph_grads(tensor: &Tensor, visited: &mut HashSet<u64>) -> Result<()> 
             clear_graph_grads(logits, visited)?;
             clear_graph_grads(targets, visited)?;
         }
+        Op::BatchNorm2d {
+            input,
+            weight,
+            bias,
+            ..
+        } => {
+            clear_graph_grads(input, visited)?;
+            clear_graph_grads(weight, visited)?;
+            clear_graph_grads(bias, visited)?;
+        }
     }
     Ok(())
 }
@@ -1137,7 +1147,101 @@ fn backward_node(
         Op::CrossEntropy { logits, targets } => {
             backward_cross_entropy(logits, targets, gradient[0], values)
         }
+        Op::BatchNorm2d {
+            input,
+            weight,
+            bias,
+            state,
+            saved_statistics,
+            training,
+            epsilon,
+            ..
+        } => backward_batch_norm2d(
+            input,
+            weight,
+            bias,
+            state,
+            saved_statistics,
+            *training,
+            *epsilon,
+            &gradient,
+            values,
+        ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn backward_batch_norm2d(
+    input: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    state: &Arc<Mutex<BatchNormState>>,
+    saved_statistics: &Arc<Mutex<Option<BatchNormStatistics>>>,
+    training: bool,
+    epsilon: f32,
+    gradient: &[f32],
+    values: &mut HashMap<u64, Vec<f32>>,
+) -> Result<()> {
+    let input_values = eval_cpu(input, values, None)?;
+    let weight_values = eval_cpu(weight, values, None)?;
+    let statistics = saved_statistics
+        .lock()
+        .map_err(|_| Error::Execution("BatchNorm statistics lock was poisoned".into()))?
+        .clone()
+        .map_or_else(
+            || {
+                if training {
+                    batch_statistics(input, &input_values, epsilon)
+                } else {
+                    running_statistics(state, epsilon)
+                }
+            },
+            Ok,
+        )?;
+    let channels = input.shape()[1];
+    let spatial = input.shape()[2] * input.shape()[3];
+    let samples = input.shape()[0] * spatial;
+    #[allow(clippy::cast_precision_loss)]
+    let samples_f32 = samples as f32;
+    let mut input_gradient = vec![0.0; input.numel()];
+    let mut weight_gradient = vec![0.0; channels];
+    let mut bias_gradient = vec![0.0; channels];
+    let mut gradient_sum = vec![0.0; channels];
+    let mut gradient_normalized_sum = vec![0.0; channels];
+
+    for (index, (&output_gradient, &input_value)) in
+        gradient.iter().zip(&input_values).enumerate()
+    {
+        let channel = (index / spatial) % channels;
+        let normalized = (input_value - statistics.mean[channel])
+            * statistics.inverse_standard_deviation[channel];
+        weight_gradient[channel] += output_gradient * normalized;
+        bias_gradient[channel] += output_gradient;
+        gradient_sum[channel] += output_gradient;
+        gradient_normalized_sum[channel] += output_gradient * normalized;
+    }
+
+    for (index, (&output_gradient, &input_value)) in
+        gradient.iter().zip(&input_values).enumerate()
+    {
+        let channel = (index / spatial) % channels;
+        input_gradient[index] = if training {
+            let normalized = (input_value - statistics.mean[channel])
+                * statistics.inverse_standard_deviation[channel];
+            weight_values[channel] * statistics.inverse_standard_deviation[channel]
+                / samples_f32
+                * (samples_f32 * output_gradient
+                    - gradient_sum[channel]
+                    - normalized * gradient_normalized_sum[channel])
+        } else {
+            output_gradient
+                * weight_values[channel]
+                * statistics.inverse_standard_deviation[channel]
+        };
+    }
+    backward_node(input, input_gradient, values)?;
+    backward_node(weight, weight_gradient, values)?;
+    backward_node(bias, bias_gradient, values)
 }
 
 fn backward_matmul(
