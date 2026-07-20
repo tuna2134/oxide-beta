@@ -1,3 +1,8 @@
+// Kernel launch methods are unsafe because cuda-oxide cannot prove device
+// buffer lengths and aliasing. This module validates those invariants at each
+// call site and documents them with a SAFETY comment.
+#![allow(unsafe_code)]
+
 use crate::nn::Parameter;
 use crate::tensor::{BatchNormState, Op, Tensor};
 use crate::{Device, Error, Result};
@@ -499,10 +504,10 @@ mod kernels {
             }
             let variance = squared_sum / samples as f32;
             *mean_value = channel_mean;
-            if let Some(value) = inverse_std.get_mut(channel_index) {
+            if let Some(value) = inverse_std.get_mut(thread::index_1d()) {
                 *value = (variance + epsilon).sqrt().recip();
             }
-            if let Some(value) = unbiased_variance.get_mut(channel_index) {
+            if let Some(value) = unbiased_variance.get_mut(thread::index_1d()) {
                 *value = squared_sum / (samples - 1) as f32;
             }
         }
@@ -591,7 +596,7 @@ mod kernels {
                 batch_index += 1;
             }
             *weight_value = weight_sum;
-            if let Some(bias_value) = bias_gradient.get_mut(channel_index) {
+            if let Some(bias_value) = bias_gradient.get_mut(thread::index_1d()) {
                 *bias_value = bias_sum;
             }
         }
@@ -606,8 +611,9 @@ mod kernels {
         mut output: DisjointSlice<f32>,
     ) {
         let index = thread::index_1d();
+        let raw = index.get();
         if let Some(value) = output.get_mut(index) {
-            if index.get() != 0 {
+            if raw != 0 {
                 return;
             }
             let mut loss = 0.0;
@@ -712,7 +718,7 @@ mod kernels {
         let raw = index.get();
         if let Some(mean) = new_mean.get_mut(index) {
             *mean = (1.0 - momentum) * old_mean[raw] + momentum * batch_mean[raw];
-            if let Some(variance) = new_variance.get_mut(index) {
+            if let Some(variance) = new_variance.get_mut(thread::index_1d()) {
                 *variance = (1.0 - momentum) * old_variance[raw] + momentum * batch_variance[raw];
             }
         }
@@ -744,10 +750,10 @@ mod kernels {
             let normalized =
                 (first / first_correction) / ((second / second_correction).sqrt() + epsilon);
             *value = parameter[raw] - learning_rate * (normalized + weight_decay * parameter[raw]);
-            if let Some(moment) = new_first_moment.get_mut(index) {
+            if let Some(moment) = new_first_moment.get_mut(thread::index_1d()) {
                 *moment = first;
             }
-            if let Some(moment) = new_second_moment.get_mut(index) {
+            if let Some(moment) = new_second_moment.get_mut(thread::index_1d()) {
                 *moment = second;
             }
         }
