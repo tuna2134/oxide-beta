@@ -1,7 +1,7 @@
 use crate::{Error, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::{Add, Mul};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -25,6 +25,7 @@ pub(crate) struct Node {
     pub(crate) shape: Vec<usize>,
     pub(crate) device: Device,
     pub(crate) op: Op,
+    grad: Mutex<Option<Vec<f32>>>,
 }
 
 #[derive(Debug)]
@@ -49,6 +50,7 @@ pub(crate) enum Op {
         stride: [usize; 2],
     },
     Reshape(Tensor),
+    CrossEntropy { logits: Tensor, targets: Tensor },
 }
 
 impl Tensor {
@@ -313,6 +315,93 @@ impl Tensor {
         Ok(Self::new(shape, self.device(), Op::Reshape(self.clone())))
     }
 
+    /// Computes mean sparse cross-entropy from `[batch, classes]` logits.
+    ///
+    /// Targets are represented by a rank-1 tensor containing integer class
+    /// indices as `f32` values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid shapes, devices, or target values.
+    pub fn cross_entropy(&self, targets: &Self) -> Result<Self> {
+        if self.device() != targets.device() {
+            return Err(Error::DeviceMismatch);
+        }
+        if self.shape().len() != 2
+            || targets.shape().len() != 1
+            || self.shape()[0] != targets.shape()[0]
+        {
+            return Err(Error::InvalidShape(
+                "cross_entropy expects [batch, classes] logits and [batch] targets".into(),
+            ));
+        }
+        Ok(Self::new(
+            vec![1],
+            self.device(),
+            Op::CrossEntropy {
+                logits: self.clone(),
+                targets: targets.clone(),
+            },
+        ))
+    }
+
+    /// Runs reverse-mode automatic differentiation from a scalar tensor.
+    ///
+    /// CUDA graphs currently use a correct CPU fallback for backward while
+    /// retaining CUDA forward execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless this tensor has one element or graph evaluation fails.
+    pub fn backward(&self) -> Result<()> {
+        if self.numel() != 1 {
+            return Err(Error::Execution(
+                "backward requires a scalar loss tensor".into(),
+            ));
+        }
+        clear_graph_grads(self, &mut HashSet::new())?;
+        backward_node(self, vec![1.0], &mut HashMap::new())
+    }
+
+    /// Returns the accumulated gradient, if this tensor participated in backward.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gradient lock was poisoned.
+    pub fn grad(&self) -> Result<Option<Vec<f32>>> {
+        self.node
+            .grad
+            .lock()
+            .map(|gradient| gradient.clone())
+            .map_err(|_| Error::Execution("gradient lock was poisoned".into()))
+    }
+
+    /// Clears this tensor's accumulated gradient.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gradient lock was poisoned.
+    pub fn zero_grad(&self) -> Result<()> {
+        *self
+            .node
+            .grad
+            .lock()
+            .map_err(|_| Error::Execution("gradient lock was poisoned".into()))? = None;
+        Ok(())
+    }
+
+    /// Returns the single materialized value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for non-scalar tensors or backend evaluation failure.
+    pub fn item(&self) -> Result<f32> {
+        if self.numel() != 1 {
+            return Err(Error::InvalidShape("item requires one element".into()));
+        }
+        self.to_vec().map(|values| values[0])
+    }
+
     /// Materializes this lazy tensor on the host.
     ///
     /// # Errors
@@ -347,6 +436,7 @@ impl Tensor {
                 shape,
                 device,
                 op,
+                grad: Mutex::new(None),
             }),
         }
     }
@@ -448,6 +538,9 @@ pub(crate) fn eval_cpu(
             stride,
         } => eval_avg_pool2d(input, *kernel, *stride, cache, inputs)?,
         Op::Reshape(input) => eval_cpu(input, cache, inputs)?,
+        Op::CrossEntropy { logits, targets } => {
+            eval_cross_entropy(logits, targets, cache, inputs)?
+        }
     };
     cache.insert(tensor.node.id, value.clone());
     Ok(value)
@@ -498,6 +591,10 @@ fn clone_to_device(tensor: &Tensor, device: Device, cache: &mut HashMap<u64, Ten
             stride: *stride,
         },
         Op::Reshape(input) => Op::Reshape(clone_to_device(input, device, cache)),
+        Op::CrossEntropy { logits, targets } => Op::CrossEntropy {
+            logits: clone_to_device(logits, device, cache),
+            targets: clone_to_device(targets, device, cache),
+        },
     };
     let result = Tensor::new(tensor.node.shape.clone(), device, op);
     cache.insert(tensor.node.id, result.clone());
