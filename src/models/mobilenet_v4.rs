@@ -1,7 +1,8 @@
 //! `MobileNetV4` models described by tables 11-15 of `mobilenet.pdf`.
 
 use crate::nn::{
-    ConvNormAct, FusedInvertedBottleneck, Module, Parameter, Trainable, UniversalInvertedBottleneck,
+    ConvNormAct, FusedInvertedBottleneck, Module, ModuleMode, Parameter, Trainable,
+    UniversalInvertedBottleneck,
 };
 use crate::{Device, Error, Result, Tensor};
 use std::fs::File;
@@ -42,6 +43,26 @@ impl Trainable for Block {
             Self::Conv(layer) => layer.visit_parameters_mut(visitor),
             Self::Fused(layer) => layer.visit_parameters_mut(visitor),
             Self::Uib(layer) => layer.visit_parameters_mut(visitor),
+            Self::GlobalAverage => {}
+        }
+    }
+
+    fn visit_buffers(&self, visitor: &mut dyn FnMut(&[usize], &[f32])) -> Result<()> {
+        match self {
+            Self::Conv(layer) => layer.visit_buffers(visitor),
+            Self::Fused(layer) => layer.visit_buffers(visitor),
+            Self::Uib(layer) => layer.visit_buffers(visitor),
+            Self::GlobalAverage => Ok(()),
+        }
+    }
+}
+
+impl ModuleMode for Block {
+    fn set_training(&mut self, training: bool) {
+        match self {
+            Self::Conv(layer) => layer.set_training(training),
+            Self::Fused(layer) => layer.set_training(training),
+            Self::Uib(layer) => layer.set_training(training),
             Self::GlobalAverage => {}
         }
     }
@@ -163,7 +184,17 @@ impl MobileNetV4ConvSmall {
         self.device
     }
 
-    /// Saves parameters in oxide-torch's simple little-endian checkpoint format.
+    /// Enables batch-statistics behavior for every BatchNorm layer.
+    pub fn train(&mut self) {
+        self.set_training(true);
+    }
+
+    /// Enables running-statistics behavior for every BatchNorm layer.
+    pub fn eval(&mut self) {
+        self.set_training(false);
+    }
+
+    /// Saves parameters and persistent buffers in the little-endian checkpoint format.
     ///
     /// # Errors
     ///
@@ -182,6 +213,9 @@ impl MobileNetV4ConvSmall {
         if let Some(error) = materialize_error {
             return Err(error);
         }
+        self.visit_buffers(&mut |shape, data| {
+            parameters.push((shape.to_vec(), data.to_vec()));
+        })?;
         let file = File::create(path.as_ref()).map_err(|error| {
             Error::Execution(format!(
                 "failed to create checkpoint {}: {error}",
@@ -256,6 +290,21 @@ impl Trainable for MobileNetV4ConvSmall {
     fn visit_parameters_mut(&mut self, visitor: &mut dyn FnMut(&mut Parameter)) {
         for block in &mut self.blocks {
             block.visit_parameters_mut(visitor);
+        }
+    }
+
+    fn visit_buffers(&self, visitor: &mut dyn FnMut(&[usize], &[f32])) -> Result<()> {
+        for block in &self.blocks {
+            block.visit_buffers(visitor)?;
+        }
+        Ok(())
+    }
+}
+
+impl ModuleMode for MobileNetV4ConvSmall {
+    fn set_training(&mut self, training: bool) {
+        for block in &mut self.blocks {
+            block.set_training(training);
         }
     }
 }

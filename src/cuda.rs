@@ -333,7 +333,7 @@ fn eval_node(
             output
         }
         Op::Reshape(input) => return eval_node(input, stream, module, cache),
-        Op::CrossEntropy { .. } => {
+        Op::CrossEntropy { .. } | Op::BatchNorm2d { .. } => {
             let host_value = crate::tensor::eval_cpu(tensor, &mut HashMap::new(), None)?;
             DeviceBuffer::from_host(stream, &host_value).map_err(cuda_error)?
         }

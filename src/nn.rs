@@ -485,6 +485,30 @@ impl Trainable for UniversalInvertedBottleneck {
         }
         self.project.visit_parameters_mut(visitor);
     }
+
+    fn visit_buffers(&self, visitor: &mut dyn FnMut(&[usize], &[f32])) -> Result<()> {
+        if let Some(layer) = &self.start_depthwise {
+            layer.visit_buffers(visitor)?;
+        }
+        self.expand.visit_buffers(visitor)?;
+        if let Some(layer) = &self.middle_depthwise {
+            layer.visit_buffers(visitor)?;
+        }
+        self.project.visit_buffers(visitor)
+    }
+}
+
+impl ModuleMode for UniversalInvertedBottleneck {
+    fn set_training(&mut self, training: bool) {
+        if let Some(layer) = &mut self.start_depthwise {
+            layer.set_training(training);
+        }
+        self.expand.set_training(training);
+        if let Some(layer) = &mut self.middle_depthwise {
+            layer.set_training(training);
+        }
+        self.project.set_training(training);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -545,6 +569,18 @@ impl Trainable for FusedInvertedBottleneck {
         self.expand.visit_parameters_mut(visitor);
         self.project.visit_parameters_mut(visitor);
     }
+
+    fn visit_buffers(&self, visitor: &mut dyn FnMut(&[usize], &[f32])) -> Result<()> {
+        self.expand.visit_buffers(visitor)?;
+        self.project.visit_buffers(visitor)
+    }
+}
+
+impl ModuleMode for FusedInvertedBottleneck {
+    fn set_training(&mut self, training: bool) {
+        self.expand.set_training(training);
+        self.project.set_training(training);
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -564,4 +600,40 @@ fn initialized_weights(shape: &[usize], input_channels_per_group: usize) -> Vec<
             (unit * 2.0 - 1.0) * scale
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_norm_updates_running_statistics_and_switches_to_eval() {
+        let mut layer = BatchNorm2d::new(2, Device::Cpu).unwrap();
+        let input = Tensor::from_vec(
+            vec![1.0, 3.0, 2.0, 4.0, 5.0, 7.0, 6.0, 8.0],
+            vec![2, 2, 1, 2],
+        )
+        .unwrap();
+        let output = layer.forward(&input).unwrap().to_vec().unwrap();
+        for channel in 0..2 {
+            let start = channel * 2;
+            let values = [
+                output[start],
+                output[start + 1],
+                output[4 + start],
+                output[5 + start],
+            ];
+            let mean = values.into_iter().sum::<f32>() / 4.0;
+            assert!(mean.abs() < 1e-5);
+        }
+        let running_mean = layer.running_mean().unwrap();
+        assert!((running_mean[0] - 0.4).abs() < 1e-5);
+        assert!((running_mean[1] - 0.5).abs() < 1e-5);
+        assert!(layer.running_variance().unwrap()[0] > 1.0);
+
+        layer.eval();
+        assert!(!layer.is_training());
+        let eval_output = layer.forward(&input).unwrap().to_vec().unwrap();
+        assert_ne!(output, eval_output);
+    }
 }

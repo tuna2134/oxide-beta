@@ -35,7 +35,7 @@ pub(crate) struct BatchNormState {
 }
 
 #[derive(Clone, Debug)]
-struct BatchNormStatistics {
+pub(crate) struct BatchNormStatistics {
     mean: Vec<f32>,
     inverse_standard_deviation: Vec<f32>,
 }
@@ -1503,5 +1503,62 @@ mod tests {
         loss.backward().unwrap();
         let gradient = logits.grad().unwrap().unwrap();
         assert_eq!(gradient, vec![-0.25, 0.25, 0.25, -0.25]);
+    }
+
+    #[test]
+    fn batch_norm_input_gradient_matches_finite_difference() {
+        fn loss(input_data: Vec<f32>) -> f32 {
+            let input = Tensor::from_vec(input_data, vec![3, 2, 1, 1]).unwrap();
+            let weight = Tensor::from_vec(vec![1.2, 0.7], vec![2]).unwrap();
+            let bias = Tensor::from_vec(vec![0.1, -0.2], vec![2]).unwrap();
+            let state = Arc::new(Mutex::new(BatchNormState {
+                running_mean: vec![0.0; 2],
+                running_variance: vec![1.0; 2],
+            }));
+            let targets = Tensor::from_vec(vec![0.0, 1.0, 0.0], vec![3]).unwrap();
+            input
+                .batch_norm2d(&weight, &bias, state, true, 0.1, 1e-5)
+                .unwrap()
+                .reshape(vec![3, 2])
+                .unwrap()
+                .cross_entropy(&targets)
+                .unwrap()
+                .item()
+                .unwrap()
+        }
+
+        let data = vec![1.0, 4.0, 2.0, 0.0, -1.0, 3.0];
+        let input = Tensor::from_vec(data.clone(), vec![3, 2, 1, 1]).unwrap();
+        let weight = Tensor::from_vec(vec![1.2, 0.7], vec![2]).unwrap();
+        let bias = Tensor::from_vec(vec![0.1, -0.2], vec![2]).unwrap();
+        let state = Arc::new(Mutex::new(BatchNormState {
+            running_mean: vec![0.0; 2],
+            running_variance: vec![1.0; 2],
+        }));
+        let targets = Tensor::from_vec(vec![0.0, 1.0, 0.0], vec![3]).unwrap();
+        let loss_tensor = input
+            .batch_norm2d(&weight, &bias, state, true, 0.1, 1e-5)
+            .unwrap()
+            .reshape(vec![3, 2])
+            .unwrap()
+            .cross_entropy(&targets)
+            .unwrap();
+        loss_tensor.backward().unwrap();
+        let analytic = input.grad().unwrap().unwrap();
+        let step = 1e-3;
+        for index in 0..data.len() {
+            let mut positive = data.clone();
+            positive[index] += step;
+            let mut negative = data.clone();
+            negative[index] -= step;
+            let numerical = (loss(positive) - loss(negative)) / (2.0 * step);
+            assert!(
+                (analytic[index] - numerical).abs() < 2e-3,
+                "gradient {index}: analytic={} numerical={numerical}",
+                analytic[index]
+            );
+        }
+        assert!(weight.grad().unwrap().is_some());
+        assert!(bias.grad().unwrap().is_some());
     }
 }

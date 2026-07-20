@@ -179,6 +179,23 @@ fn bind_placeholders(graph: &Tensor, inputs: &[Tensor]) -> Result<Tensor> {
             Op::CrossEntropy { logits, targets } => {
                 bind(logits, inputs, cache)?.cross_entropy(&bind(targets, inputs, cache)?)?
             }
+            Op::BatchNorm2d {
+                input,
+                weight,
+                bias,
+                state,
+                training,
+                momentum,
+                epsilon,
+                ..
+            } => bind(input, inputs, cache)?.batch_norm2d(
+                &bind(weight, inputs, cache)?,
+                &bind(bias, inputs, cache)?,
+                state.clone(),
+                *training,
+                *momentum,
+                *epsilon,
+            )?,
         };
         cache.insert(tensor.node.id, result.clone());
         Ok(result)
