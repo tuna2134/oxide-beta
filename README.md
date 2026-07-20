@@ -96,7 +96,22 @@ Hybrid-M/LのMobile-MQAとcheckpointローダーはまだ含まれません。
 ## MNISTでMobileNetV4を学習
 
 `MobileNetV4ConvSmall::mnist` は入力をgrayscale `1x28x28`、分類headを10クラスに
-した学習用variantです。MNISTの展開済みIDXファイル4個を同じディレクトリへ置きます。
+した学習用variantです。次のscriptがMNISTのダウンロード、SHA-256検証、展開、学習を
+まとめて実行します。
+
+```bash
+./scripts/train_mnist.sh
+```
+
+データだけ準備する場合やCUDAで学習する場合も指定できます。
+
+```bash
+./scripts/train_mnist.sh --download-only
+./scripts/train_mnist.sh --cuda
+./scripts/train_mnist.sh --data-dir /path/to/mnist
+```
+
+展開後はIDXファイル4個が同じディレクトリに置かれます。
 
 ```text
 data/mnist/
@@ -106,7 +121,8 @@ data/mnist/
 └── t10k-labels-idx1-ubyte
 ```
 
-まず小さなCPU実行を試せます。第1引数を省略すると `data/mnist` を使います。
+scriptを使わず、準備済みデータから直接exampleを起動することもできます。第1引数を
+省略すると `data/mnist` を使います。
 
 ```bash
 cargo +stable run --release --example mnist_training -- data/mnist

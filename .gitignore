@@ -2,3 +2,5 @@
 *.ptx
 *.cubin
 *.ltoir
+/data/
+/*.oxtr
