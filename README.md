@@ -147,6 +147,10 @@ MNIST_TEST_LIMIT=10000 \
 cargo +stable run --release --example mnist_training -- data/mnist
 ```
 
+CUDAではGPU streamを毎batch停止しないよう、既定では50 batchごとにlossとaccuracyを
+hostへ読み戻します。`MNIST_LOG_INTERVAL`で表示間隔を変更できます。小さい値ほど
+表示は増えますが、GPU同期も増えて学習は遅くなります。
+
 CUDA環境ではscriptへ `--cuda` を付けます。直接起動する場合は、cuda-oxideの`run`が
 アプリ引数を転送しないため環境変数を使います。
 

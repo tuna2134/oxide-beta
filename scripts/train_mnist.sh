@@ -20,7 +20,7 @@ Options:
   -h, --help           Show this help
 
 Training settings are controlled with MNIST_EPOCHS, MNIST_BATCH_SIZE,
-MNIST_TRAIN_LIMIT, and MNIST_TEST_LIMIT.
+MNIST_TRAIN_LIMIT, MNIST_TEST_LIMIT, and MNIST_LOG_INTERVAL.
 EOF
 }
 

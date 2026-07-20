@@ -27,6 +27,7 @@ fn main() -> Result<()> {
     let batch_size = environment_usize("MNIST_BATCH_SIZE", 2);
     let train_limit = environment_usize("MNIST_TRAIN_LIMIT", 4);
     let test_limit = environment_usize("MNIST_TEST_LIMIT", 8);
+    let log_interval = environment_usize("MNIST_LOG_INTERVAL", if use_cuda { 50 } else { 1 });
 
     let mnist = Mnist::load(&data_directory)?;
     let mut model = MobileNetV4ConvSmall::mnist(device)?;
@@ -42,10 +43,16 @@ fn main() -> Result<()> {
     for epoch in 1..=epochs {
         let mut total_loss = 0.0;
         let mut correct = 0;
+        let mut measured = 0;
+        let mut measurements = 0;
         let mut seen = 0;
         let maximum_batches = train_limit.div_ceil(batch_size);
 
-        for batch in mnist.train_batches(batch_size, true)?.take(maximum_batches) {
+        for (batch_index, batch) in mnist
+            .train_batches(batch_size, true)?
+            .take(maximum_batches)
+            .enumerate()
+        {
             let (images, labels) = batch?;
             let images = images.to(device);
             let labels = labels.to(device);
@@ -53,25 +60,33 @@ fn main() -> Result<()> {
             optimizer.zero_grad(&model)?;
             let logits = model.forward(&images)?;
             let loss = cross_entropy(&logits, &labels)?;
-            total_loss += loss.item()?;
-            let batch_correct = count_correct(&logits, &labels)?;
             loss.backward()?;
             optimizer.step(&mut model)?;
 
-            correct += batch_correct;
             seen += labels.shape()[0];
-            println!(
-                "epoch={epoch} samples={seen}/{train_limit} loss={:.4}",
-                total_loss / as_f32(seen.div_ceil(batch_size))
-            );
+            let should_log = (batch_index + 1) % log_interval == 0 || seen >= train_limit;
+            if should_log {
+                // Reading metrics synchronizes the CUDA stream. Keeping this
+                // out of the hot path lets several training steps stay queued.
+                let batch_loss = loss.item()?;
+                let batch_correct = count_correct(&logits, &labels)?;
+                total_loss += batch_loss;
+                correct += batch_correct;
+                measured += labels.shape()[0];
+                measurements += 1;
+                println!(
+                    "epoch={epoch} samples={seen}/{train_limit} loss={batch_loss:.4} accuracy={:.2}%",
+                    100.0 * as_f32(batch_correct) / as_f32(labels.shape()[0])
+                );
+            }
             if seen >= train_limit {
                 break;
             }
         }
         println!(
-            "epoch={epoch} train_loss={:.4} train_accuracy={:.2}%",
-            total_loss / as_f32(seen.div_ceil(batch_size)),
-            100.0 * as_f32(correct) / as_f32(seen)
+            "epoch={epoch} sampled_loss={:.4} sampled_accuracy={:.2}% measured={measured}/{seen}",
+            total_loss / as_f32(measurements),
+            100.0 * as_f32(correct) / as_f32(measured)
         );
     }
 
