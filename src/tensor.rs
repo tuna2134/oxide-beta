@@ -518,6 +518,27 @@ impl Tensor {
         self.to_vec().map(|values| values[0])
     }
 
+    /// Evaluates pending work and waits for this tensor's device stream.
+    ///
+    /// This is intended for profiling and explicit synchronization; normal
+    /// execution should remain asynchronous.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when evaluation or device synchronization fails.
+    pub fn synchronize(&self) -> Result<()> {
+        match self.device() {
+            Device::Cpu => {
+                let _ = self.to_vec()?;
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            Device::Cuda(device) => crate::cuda::materialize(self, device),
+            #[cfg(not(feature = "cuda"))]
+            Device::Cuda(_) => Err(Error::CudaUnavailable),
+        }
+    }
+
     /// Materializes this lazy tensor on the host.
     ///
     /// # Errors

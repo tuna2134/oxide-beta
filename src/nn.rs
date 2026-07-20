@@ -90,6 +90,15 @@ pub trait Trainable {
     fn visit_buffers(&self, _visitor: &mut dyn FnMut(&[usize], &[f32])) -> Result<()> {
         Ok(())
     }
+
+    /// Mutably visits persistent non-optimizer state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when state cannot be synchronized or locked.
+    fn visit_buffers_mut(&mut self, _visitor: &mut dyn FnMut(&[usize], &mut [f32])) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// NCHW Batch Normalization with affine parameters and running statistics.
@@ -204,6 +213,17 @@ impl Trainable for BatchNorm2d {
         let shape = [state.running_mean.len()];
         visitor(&shape, &state.running_mean);
         visitor(&shape, &state.running_variance);
+        Ok(())
+    }
+
+    fn visit_buffers_mut(&mut self, visitor: &mut dyn FnMut(&[usize], &mut [f32])) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Execution("BatchNorm state lock was poisoned".into()))?;
+        let shape = [state.running_mean.len()];
+        visitor(&shape, &mut state.running_mean);
+        visitor(&shape, &mut state.running_variance);
         Ok(())
     }
 }
@@ -382,6 +402,10 @@ impl Trainable for ConvNormAct {
     fn visit_buffers(&self, visitor: &mut dyn FnMut(&[usize], &[f32])) -> Result<()> {
         self.norm.visit_buffers(visitor)
     }
+
+    fn visit_buffers_mut(&mut self, visitor: &mut dyn FnMut(&[usize], &mut [f32])) -> Result<()> {
+        self.norm.visit_buffers_mut(visitor)
+    }
 }
 
 impl ModuleMode for ConvNormAct {
@@ -515,6 +539,17 @@ impl Trainable for UniversalInvertedBottleneck {
         }
         self.project.visit_buffers(visitor)
     }
+
+    fn visit_buffers_mut(&mut self, visitor: &mut dyn FnMut(&[usize], &mut [f32])) -> Result<()> {
+        if let Some(layer) = &mut self.start_depthwise {
+            layer.visit_buffers_mut(visitor)?;
+        }
+        self.expand.visit_buffers_mut(visitor)?;
+        if let Some(layer) = &mut self.middle_depthwise {
+            layer.visit_buffers_mut(visitor)?;
+        }
+        self.project.visit_buffers_mut(visitor)
+    }
 }
 
 impl ModuleMode for UniversalInvertedBottleneck {
@@ -592,6 +627,11 @@ impl Trainable for FusedInvertedBottleneck {
     fn visit_buffers(&self, visitor: &mut dyn FnMut(&[usize], &[f32])) -> Result<()> {
         self.expand.visit_buffers(visitor)?;
         self.project.visit_buffers(visitor)
+    }
+
+    fn visit_buffers_mut(&mut self, visitor: &mut dyn FnMut(&[usize], &mut [f32])) -> Result<()> {
+        self.expand.visit_buffers_mut(visitor)?;
+        self.project.visit_buffers_mut(visitor)
     }
 }
 

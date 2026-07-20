@@ -34,3 +34,8 @@ required-features = []
 name = "mnist-training"
 path = "src/bin/mnist_training.rs"
 required-features = []
+
+[[bin]]
+name = "mnist-inference"
+path = "src/bin/mnist_inference.rs"
+required-features = []

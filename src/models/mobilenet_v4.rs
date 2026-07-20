@@ -6,7 +6,7 @@ use crate::nn::{
 };
 use crate::{Device, Error, Result, Tensor};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 #[derive(Clone, Debug)]
@@ -57,6 +57,15 @@ impl Trainable for Block {
             Self::Classifier(_) | Self::GlobalAverage => Ok(()),
             Self::Fused(layer) => layer.visit_buffers(visitor),
             Self::Uib(layer) => layer.visit_buffers(visitor),
+        }
+    }
+
+    fn visit_buffers_mut(&mut self, visitor: &mut dyn FnMut(&[usize], &mut [f32])) -> Result<()> {
+        match self {
+            Self::Conv(layer) => layer.visit_buffers_mut(visitor),
+            Self::Classifier(_) | Self::GlobalAverage => Ok(()),
+            Self::Fused(layer) => layer.visit_buffers_mut(visitor),
+            Self::Uib(layer) => layer.visit_buffers_mut(visitor),
         }
     }
 }
@@ -254,6 +263,64 @@ impl MobileNetV4ConvSmall {
         writer.flush().map_err(checkpoint_error)
     }
 
+    /// Loads an MNIST model checkpoint and switches it to inference mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, incompatible, or unreadable checkpoints.
+    pub fn load_mnist(path: impl AsRef<Path>, device: Device) -> Result<Self> {
+        let tensors = read_checkpoint(path.as_ref())?;
+        let mut model = Self::mnist(device)?;
+        let mut next = 0;
+        let mut load_error = None;
+        model.visit_parameters_mut(&mut |parameter| {
+            if load_error.is_some() {
+                return;
+            }
+            let Some((shape, data)) = tensors.get(next) else {
+                load_error = Some(Error::Execution("checkpoint has too few tensors".into()));
+                return;
+            };
+            if shape != parameter.value().shape() {
+                load_error = Some(Error::InvalidShape(format!(
+                    "checkpoint tensor {next} has shape {shape:?}, expected {:?}",
+                    parameter.value().shape()
+                )));
+                return;
+            }
+            load_error = parameter.replace_data(data.clone()).err();
+            next += 1;
+        });
+        if let Some(error) = load_error {
+            return Err(error);
+        }
+        model.visit_buffers_mut(&mut |shape, buffer| {
+            if load_error.is_some() {
+                return;
+            }
+            let Some((saved_shape, data)) = tensors.get(next) else {
+                load_error = Some(Error::Execution("checkpoint has too few buffers".into()));
+                return;
+            };
+            if saved_shape != shape || data.len() != buffer.len() {
+                load_error = Some(Error::InvalidShape(format!(
+                    "checkpoint buffer {next} shape mismatch"
+                )));
+                return;
+            }
+            buffer.copy_from_slice(data);
+            next += 1;
+        })?;
+        if let Some(error) = load_error {
+            return Err(error);
+        }
+        if next != tensors.len() {
+            return Err(Error::Execution("checkpoint has extra tensors".into()));
+        }
+        model.eval();
+        Ok(model)
+    }
+
     fn validate_input(&self, input: &Tensor) -> Result<()> {
         if input.device() != self.device {
             return Err(Error::DeviceMismatch);
@@ -305,6 +372,57 @@ impl Trainable for MobileNetV4ConvSmall {
         }
         Ok(())
     }
+
+    fn visit_buffers_mut(&mut self, visitor: &mut dyn FnMut(&[usize], &mut [f32])) -> Result<()> {
+        for block in &mut self.blocks {
+            block.visit_buffers_mut(visitor)?;
+        }
+        Ok(())
+    }
+}
+
+fn read_checkpoint(path: &Path) -> Result<Vec<(Vec<usize>, Vec<f32>)>> {
+    let file = File::open(path).map_err(|error| {
+        Error::Execution(format!(
+            "failed to open checkpoint {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut magic = [0; 5];
+    reader.read_exact(&mut magic).map_err(checkpoint_error)?;
+    if &magic != b"OXTR\x01" {
+        return Err(Error::Execution("invalid OXTR checkpoint header".into()));
+    }
+    let count = read_usize(&mut reader)?;
+    let mut tensors = Vec::with_capacity(count);
+    for _ in 0..count {
+        let rank = read_usize(&mut reader)?;
+        let mut shape = Vec::with_capacity(rank);
+        for _ in 0..rank {
+            shape.push(read_usize(&mut reader)?);
+        }
+        let len = read_usize(&mut reader)?;
+        let mut data = Vec::with_capacity(len);
+        for _ in 0..len {
+            let mut bytes = [0; 4];
+            reader.read_exact(&mut bytes).map_err(checkpoint_error)?;
+            data.push(f32::from_le_bytes(bytes));
+        }
+        tensors.push((shape, data));
+    }
+    Ok(tensors)
+}
+
+fn read_u64(reader: &mut impl Read) -> Result<u64> {
+    let mut bytes = [0; 8];
+    reader.read_exact(&mut bytes).map_err(checkpoint_error)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_usize(reader: &mut impl Read) -> Result<usize> {
+    usize::try_from(read_u64(reader)?)
+        .map_err(|_| Error::Execution("checkpoint integer exceeds usize".into()))
 }
 
 impl ModuleMode for MobileNetV4ConvSmall {

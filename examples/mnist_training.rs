@@ -5,7 +5,9 @@ use oxide_torch::nn::Module;
 use oxide_torch::optim::{AdamW, Optimizer};
 use oxide_torch::{Device, Result, Tensor};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let use_cuda = arguments.iter().any(|argument| argument == "--cuda")
@@ -28,6 +30,8 @@ fn main() -> Result<()> {
     let train_limit = environment_usize("MNIST_TRAIN_LIMIT", 4);
     let test_limit = environment_usize("MNIST_TEST_LIMIT", 8);
     let log_interval = environment_usize("MNIST_LOG_INTERVAL", if use_cuda { 50 } else { 1 });
+    let profile = environment_flag("MNIST_PROFILE");
+    let mut timings = Timings::default();
 
     let mnist = Mnist::load(&data_directory)?;
     let mut model = MobileNetV4ConvSmall::mnist(device)?;
@@ -48,24 +52,53 @@ fn main() -> Result<()> {
         let mut seen = 0;
         let maximum_batches = train_limit.div_ceil(batch_size);
 
-        for (batch_index, batch) in mnist
+        let mut batches = mnist
             .train_batches(batch_size, true)?
             .take(maximum_batches)
-            .enumerate()
-        {
+            .enumerate();
+        loop {
+            let started = Instant::now();
+            let Some((batch_index, batch)) = batches.next() else {
+                break;
+            };
             let (images, labels) = batch?;
+            timings.data += started.elapsed();
+            let started = Instant::now();
             let images = images.to(device);
             let labels = labels.to(device);
+            if profile {
+                images.synchronize()?;
+                labels.synchronize()?;
+            }
+            timings.transfer += started.elapsed();
 
             optimizer.zero_grad(&model)?;
+            let started = Instant::now();
             let logits = model.forward(&images)?;
             let loss = cross_entropy(&logits, &labels)?;
+            timings.graph += started.elapsed();
+            if profile {
+                let started = Instant::now();
+                loss.synchronize()?;
+                timings.forward += started.elapsed();
+            }
+            let started = Instant::now();
             loss.backward()?;
+            if profile {
+                loss.synchronize()?;
+            }
+            timings.backward += started.elapsed();
+            let started = Instant::now();
             optimizer.step(&mut model)?;
+            if profile {
+                loss.synchronize()?;
+            }
+            timings.optimizer += started.elapsed();
 
             seen += labels.shape()[0];
             let should_log = (batch_index + 1) % log_interval == 0 || seen >= train_limit;
             if should_log {
+                let started = Instant::now();
                 // Reading metrics synchronizes the CUDA stream. Keeping this
                 // out of the hot path lets several training steps stay queued.
                 let batch_loss = loss.item()?;
@@ -78,6 +111,7 @@ fn main() -> Result<()> {
                     "epoch={epoch} samples={seen}/{train_limit} loss={batch_loss:.4} accuracy={:.2}%",
                     100.0 * as_f32(batch_correct) / as_f32(labels.shape()[0])
                 );
+                timings.metrics += started.elapsed();
             }
             if seen >= train_limit {
                 break;
@@ -91,6 +125,7 @@ fn main() -> Result<()> {
     }
 
     model.eval();
+    let evaluation_started = Instant::now();
     let mut correct = 0;
     let mut seen = 0;
     let evaluation_batch_size = batch_size.max(16).min(test_limit);
@@ -110,9 +145,57 @@ fn main() -> Result<()> {
         "test_accuracy={:.2}%",
         100.0 * as_f32(correct) / as_f32(seen)
     );
+    timings.evaluation += evaluation_started.elapsed();
+    let started = Instant::now();
     model.save("mobilenetv4-mnist.oxtr")?;
+    timings.checkpoint += started.elapsed();
     println!("saved mobilenetv4-mnist.oxtr");
+    if profile {
+        timings.print();
+    }
     Ok(())
+}
+
+#[derive(Default)]
+struct Timings {
+    data: Duration,
+    transfer: Duration,
+    graph: Duration,
+    forward: Duration,
+    backward: Duration,
+    optimizer: Duration,
+    metrics: Duration,
+    evaluation: Duration,
+    checkpoint: Duration,
+}
+
+impl Timings {
+    fn print(&self) {
+        let phases = [
+            ("data", self.data),
+            ("h2d", self.transfer),
+            ("graph", self.graph),
+            ("forward", self.forward),
+            ("backward", self.backward),
+            ("optimizer", self.optimizer),
+            ("metrics/d2h/sync", self.metrics),
+            ("evaluation", self.evaluation),
+            ("checkpoint", self.checkpoint),
+        ];
+        let total: Duration = phases.iter().map(|(_, duration)| *duration).sum();
+        println!("profile_total={:.3}s", total.as_secs_f64());
+        for (name, duration) in phases {
+            let percent = if total.is_zero() {
+                0.0
+            } else {
+                100.0 * duration.as_secs_f64() / total.as_secs_f64()
+            };
+            println!(
+                "profile_phase={name} seconds={:.3} percent={percent:.1}%",
+                duration.as_secs_f64()
+            );
+        }
+    }
 }
 
 fn count_correct(logits: &Tensor, labels: &Tensor) -> Result<usize> {

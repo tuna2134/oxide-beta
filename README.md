@@ -73,6 +73,12 @@ Conv2dのCUDA forward/input backwardは256-threadの空間tileでweightを共有
 cacheします。weight backwardは32-threadのweight tileで同一out-channelのoutput
 gradientを共有し、通常畳み込みとgrouped/depthwise畳み込みの両方に適用します。
 
+`cudnn` featureでは`libcudnn.so.9`、`.so.8`、または非versioned sonameを実行時に
+検出します。利用可能ならConv2d forward、backward-data、backward-filter、
+backward-biasを同じcuda-oxide streamとdevice bufferでゼロコピー実行します。
+descriptorとworkspaceはshapeごとにcacheされます。ライブラリがない場合やoperationが
+非対応の場合は上記のcuda-oxide tiled kernelへ自動的にfallbackします。
+
 ## MobileNetV4テストモデル
 
 同梱された `mobilenet.pdf` はMobileNetV4論文の補足資料で、表11〜15に
@@ -166,3 +172,35 @@ cargo oxide run --features cuda,cudnn --bin mnist-training
 
 終了時に`mobilenetv4-mnist.oxtr`を保存します。checkpointには学習parameterに加えて
 BatchNormのrunning mean/varianceも含まれます。
+
+## MNIST推論
+
+保存済みcheckpointを読み込み、test setで推論します。
+
+```bash
+./scripts/infer_mnist.sh --cuda
+```
+
+対象数やbatch size、checkpointは環境変数で変更できます。
+
+```bash
+MNIST_CHECKPOINT=mobilenetv4-mnist.oxtr \
+MNIST_INFERENCE_BATCH_SIZE=256 \
+MNIST_INFERENCE_LIMIT=10000 \
+./scripts/infer_mnist.sh --cuda
+```
+
+## CUDAプロファイル
+
+ColabへNsight Systems (`nsys`) とNsight Compute (`ncu`)が入っている場合、学習phase、
+CUDA API、memory allocation/copy、kernel、occupancy、帯域、registerを収集できます。
+
+```bash
+MNIST_BATCH_SIZE=256 \
+MNIST_TRAIN_LIMIT=2500 \
+MNIST_TEST_LIMIT=256 \
+./scripts/profile_cuda.sh
+```
+
+結果は`profile-results/phase-timings.txt`、`nsys-summary.csv`、
+`mobilenet-mnist.nsys-rep`、`mobilenet-conv.ncu-rep`へ保存されます。

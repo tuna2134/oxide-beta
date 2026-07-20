@@ -1658,6 +1658,13 @@ pub(crate) fn eval(tensor: &Tensor, device: usize) -> Result<Vec<f32>> {
     })
 }
 
+pub(crate) fn materialize(tensor: &Tensor, device: usize) -> Result<()> {
+    with_executor(device, |executor| {
+        let _ = executor.eval_node(tensor)?;
+        executor.stream.synchronize().map_err(cuda_error)
+    })
+}
+
 pub(crate) fn backward(tensor: &Tensor, device: usize) -> Result<()> {
     with_executor(device, |executor| {
         let mut nodes = HashSet::new();
