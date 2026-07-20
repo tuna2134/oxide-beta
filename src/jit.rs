@@ -176,6 +176,9 @@ fn bind_placeholders(graph: &Tensor, inputs: &[Tensor]) -> Result<Tensor> {
                 stride,
             } => bind(input, inputs, cache)?.avg_pool2d(*kernel, *stride)?,
             Op::Reshape(input) => bind(input, inputs, cache)?.reshape(tensor.shape().to_vec())?,
+            Op::CrossEntropy { logits, targets } => {
+                bind(logits, inputs, cache)?.cross_entropy(&bind(targets, inputs, cache)?)?
+            }
         };
         cache.insert(tensor.node.id, result.clone());
         Ok(result)

@@ -333,6 +333,10 @@ fn eval_node(
             output
         }
         Op::Reshape(input) => return eval_node(input, stream, module, cache),
+        Op::CrossEntropy { .. } => {
+            let host_value = crate::tensor::eval_cpu(tensor, &mut HashMap::new(), None)?;
+            DeviceBuffer::from_host(stream, &host_value).map_err(cuda_error)?
+        }
     };
     let output = Arc::new(output);
     cache.insert(tensor.node.id, output.clone());
