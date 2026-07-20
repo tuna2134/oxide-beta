@@ -69,6 +69,10 @@ CUDA executor、JIT module、streamはdeviceごとに一度だけ作られます
 device buffer、勾配、AdamWの1次・2次moment、更新後parameterもGPU上に保持され、
 `item()`、`to_vec()`、checkpoint保存など明示的にhost値が必要な箇所だけ同期します。
 
+Conv2dのCUDA forward/input backwardは256-threadの空間tileでweightを共有メモリへ
+cacheします。weight backwardは32-threadのweight tileで同一out-channelのoutput
+gradientを共有し、通常畳み込みとgrouped/depthwise畳み込みの両方に適用します。
+
 ## MobileNetV4テストモデル
 
 同梱された `mobilenet.pdf` はMobileNetV4論文の補足資料で、表11〜15に

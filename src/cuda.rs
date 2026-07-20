@@ -1,13 +1,13 @@
 // Kernel launch methods are unsafe because cuda-oxide cannot prove device
 // buffer lengths and aliasing. This module validates those invariants at each
 // call site and documents them with a SAFETY comment.
-#![allow(unsafe_code)]
+#![allow(static_mut_refs, unsafe_code)]
 
 use crate::nn::Parameter;
 use crate::tensor::{BatchNormState, Op, Tensor};
 use crate::{Device, Error, Result};
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
-use cuda_device::{DisjointSlice, kernel, thread};
+use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 use cuda_host::cuda_module;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -89,54 +89,75 @@ mod kernels {
         bias: &[f32],
         mut output: DisjointSlice<f32>,
     ) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            let out_x = raw % out_width;
-            let position = raw / out_width;
-            let out_y = position % out_height;
-            let position = position / out_height;
-            let out_channel = position % out_channels;
-            let batch_index = position / out_channels;
-            if batch_index >= batch {
-                return;
+        static mut WEIGHT_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+
+        let thread_index = thread::threadIdx_x() as usize;
+        let block_index = thread::blockIdx_x() as usize;
+        let spatial = out_height * out_width;
+        let spatial_tiles = (spatial + 255) / 256;
+        let plane = block_index / spatial_tiles;
+        let output_position = (block_index % spatial_tiles) * 256 + thread_index;
+        let out_channel = plane % out_channels;
+        let batch_index = plane / out_channels;
+        let active = batch_index < batch && output_position < spatial;
+        let out_y = output_position / out_width;
+        let out_x = output_position % out_width;
+        let in_per_group = in_channels / groups;
+        let out_per_group = out_channels / groups;
+        let group = out_channel / out_per_group;
+        let reduction = in_per_group * kernel_size * kernel_size;
+        let mut sum = if active { bias[out_channel] } else { 0.0 };
+        let mut tile_start = 0;
+        while tile_start < reduction {
+            let reduction_index = tile_start + thread_index;
+            // SAFETY: threadIdx.x is unique in [0, 256), matching the fixed
+            // launch shape. Every slot is initialized before the barrier.
+            unsafe {
+                WEIGHT_TILE[thread_index] = if reduction_index < reduction {
+                    weight[out_channel * reduction + reduction_index]
+                } else {
+                    0.0
+                };
             }
-            let in_per_group = in_channels / groups;
-            let out_per_group = out_channels / groups;
-            let group = out_channel / out_per_group;
-            let mut sum = bias[out_channel];
-            let mut local_channel = 0;
-            while local_channel < in_per_group {
-                let in_channel = group * in_per_group + local_channel;
-                let mut kernel_y = 0;
-                while kernel_y < kernel_size {
+            thread::sync_threads();
+            if active {
+                let tile_len = (reduction - tile_start).min(256);
+                let mut tile_index = 0;
+                while tile_index < tile_len {
+                    let reduction_index = tile_start + tile_index;
+                    let kernel_x = reduction_index % kernel_size;
+                    let position = reduction_index / kernel_size;
+                    let kernel_y = position % kernel_size;
+                    let local_channel = position / kernel_size;
                     let padded_y = out_y * stride + kernel_y;
-                    if padded_y >= padding && padded_y - padding < height {
-                        let in_y = padded_y - padding;
-                        let mut kernel_x = 0;
-                        while kernel_x < kernel_size {
-                            let padded_x = out_x * stride + kernel_x;
-                            if padded_x >= padding && padded_x - padding < width {
-                                let in_x = padded_x - padding;
-                                let input_index =
-                                    ((batch_index * in_channels + in_channel) * height + in_y)
-                                        * width
-                                        + in_x;
-                                let weight_index = ((out_channel * in_per_group + local_channel)
-                                    * kernel_size
-                                    + kernel_y)
-                                    * kernel_size
-                                    + kernel_x;
-                                sum += input[input_index] * weight[weight_index];
-                            }
-                            kernel_x += 1;
-                        }
+                    let padded_x = out_x * stride + kernel_x;
+                    if padded_y >= padding
+                        && padded_y - padding < height
+                        && padded_x >= padding
+                        && padded_x - padding < width
+                    {
+                        let in_channel = group * in_per_group + local_channel;
+                        let input_index = ((batch_index * in_channels + in_channel) * height
+                            + padded_y
+                            - padding)
+                            * width
+                            + padded_x
+                            - padding;
+                        // SAFETY: the preceding barrier initialized the full
+                        // tile and tile_index is below its fixed capacity.
+                        sum += input[input_index] * unsafe { WEIGHT_TILE[tile_index] };
                     }
-                    kernel_y += 1;
+                    tile_index += 1;
                 }
-                local_channel += 1;
             }
-            *value = sum;
+            thread::sync_threads();
+            tile_start += 256;
+        }
+        if active {
+            let output_index = plane * spatial + output_position;
+            // SAFETY: each block owns one plane/tile and each thread owns one
+            // spatial position, so output_index is in-bounds and unique.
+            unsafe { *output.get_unchecked_mut(output_index) = sum };
         }
     }
 
@@ -266,61 +287,87 @@ mod kernels {
         weight: &[f32],
         mut output: DisjointSlice<f32>,
     ) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            let in_x = raw % width;
-            let position = raw / width;
-            let in_y = position % height;
-            let position = position / height;
-            let in_channel = position % in_channels;
-            let batch_index = position / in_channels;
-            let in_per_group = in_channels / groups;
-            let out_per_group = out_channels / groups;
-            let group = in_channel / in_per_group;
-            let local_channel = in_channel % in_per_group;
-            let mut sum = 0.0;
-            let mut local_out = 0;
-            while local_out < out_per_group && batch_index < batch {
-                let out_channel = group * out_per_group + local_out;
-                let mut out_y = 0;
-                while out_y < out_height {
-                    let kernel_y_signed = in_y + padding;
-                    let base_y = out_y * stride;
-                    if kernel_y_signed >= base_y {
-                        let kernel_y = kernel_y_signed - base_y;
-                        if kernel_y < kernel_size {
-                            let mut out_x = 0;
-                            while out_x < out_width {
-                                let kernel_x_signed = in_x + padding;
-                                let base_x = out_x * stride;
-                                if kernel_x_signed >= base_x {
-                                    let kernel_x = kernel_x_signed - base_x;
-                                    if kernel_x < kernel_size {
-                                        let grad_index = ((batch_index * out_channels
-                                            + out_channel)
-                                            * out_height
-                                            + out_y)
-                                            * out_width
-                                            + out_x;
-                                        let weight_index = ((out_channel * in_per_group
-                                            + local_channel)
-                                            * kernel_size
-                                            + kernel_y)
-                                            * kernel_size
-                                            + kernel_x;
-                                        sum += gradient[grad_index] * weight[weight_index];
-                                    }
-                                }
-                                out_x += 1;
+        static mut WEIGHT_TILE: SharedArray<f32, 256> = SharedArray::UNINIT;
+
+        let thread_index = thread::threadIdx_x() as usize;
+        let block_index = thread::blockIdx_x() as usize;
+        let spatial = height * width;
+        let spatial_tiles = (spatial + 255) / 256;
+        let plane = block_index / spatial_tiles;
+        let input_position = (block_index % spatial_tiles) * 256 + thread_index;
+        let in_channel = plane % in_channels;
+        let batch_index = plane / in_channels;
+        let active = batch_index < batch && input_position < spatial;
+        let in_y = input_position / width;
+        let in_x = input_position % width;
+        let in_per_group = in_channels / groups;
+        let out_per_group = out_channels / groups;
+        let group = in_channel / in_per_group;
+        let local_channel = in_channel % in_per_group;
+        let reduction = out_per_group * kernel_size * kernel_size;
+        let mut sum = 0.0;
+        let mut tile_start = 0;
+        while tile_start < reduction {
+            let reduction_index = tile_start + thread_index;
+            // SAFETY: the 256-thread launch gives each thread a unique shared
+            // slot, and all slots are initialized before synchronization.
+            unsafe {
+                WEIGHT_TILE[thread_index] = if reduction_index < reduction {
+                    let kernel_x = reduction_index % kernel_size;
+                    let position = reduction_index / kernel_size;
+                    let kernel_y = position % kernel_size;
+                    let local_out = position / kernel_size;
+                    let out_channel = group * out_per_group + local_out;
+                    weight[((out_channel * in_per_group + local_channel) * kernel_size + kernel_y)
+                        * kernel_size
+                        + kernel_x]
+                } else {
+                    0.0
+                };
+            }
+            thread::sync_threads();
+            if active {
+                let tile_len = (reduction - tile_start).min(256);
+                let mut tile_index = 0;
+                while tile_index < tile_len {
+                    let reduction_index = tile_start + tile_index;
+                    let kernel_x = reduction_index % kernel_size;
+                    let position = reduction_index / kernel_size;
+                    let kernel_y = position % kernel_size;
+                    let local_out = position / kernel_size;
+                    let padded_y = in_y + padding;
+                    let padded_x = in_x + padding;
+                    if padded_y >= kernel_y && padded_x >= kernel_x {
+                        let output_y_numerator = padded_y - kernel_y;
+                        let output_x_numerator = padded_x - kernel_x;
+                        if output_y_numerator % stride == 0 && output_x_numerator % stride == 0 {
+                            let out_y = output_y_numerator / stride;
+                            let out_x = output_x_numerator / stride;
+                            if out_y < out_height && out_x < out_width {
+                                let out_channel = group * out_per_group + local_out;
+                                let gradient_index = ((batch_index * out_channels + out_channel)
+                                    * out_height
+                                    + out_y)
+                                    * out_width
+                                    + out_x;
+                                // SAFETY: the tile was initialized before the
+                                // barrier and tile_index is below 256.
+                                sum +=
+                                    gradient[gradient_index] * unsafe { WEIGHT_TILE[tile_index] };
                             }
                         }
                     }
-                    out_y += 1;
+                    tile_index += 1;
                 }
-                local_out += 1;
             }
-            *value = sum;
+            thread::sync_threads();
+            tile_start += 256;
+        }
+        if active {
+            let output_index = plane * spatial + input_position;
+            // SAFETY: plane/tile/thread mapping is one-to-one and host shape
+            // validation guarantees output_index is within the input tensor.
+            unsafe { *output.get_unchecked_mut(output_index) = sum };
         }
     }
 
@@ -342,51 +389,79 @@ mod kernels {
         input: &[f32],
         mut output: DisjointSlice<f32>,
     ) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            let kernel_x = raw % kernel_size;
-            let position = raw / kernel_size;
-            let kernel_y = position % kernel_size;
-            let position = position / kernel_size;
-            let in_per_group = in_channels / groups;
-            let local_channel = position % in_per_group;
-            let out_channel = position / in_per_group;
-            let out_per_group = out_channels / groups;
-            let group = out_channel / out_per_group;
-            let in_channel = group * in_per_group + local_channel;
-            let mut sum = 0.0;
-            let mut batch_index = 0;
-            while batch_index < batch && out_channel < out_channels {
-                let mut out_y = 0;
-                while out_y < out_height {
-                    let padded_y = out_y * stride + kernel_y;
-                    if padded_y >= padding && padded_y - padding < height {
-                        let in_y = padded_y - padding;
-                        let mut out_x = 0;
-                        while out_x < out_width {
-                            let padded_x = out_x * stride + kernel_x;
-                            if padded_x >= padding && padded_x - padding < width {
-                                let in_x = padded_x - padding;
-                                let input_index =
-                                    ((batch_index * in_channels + in_channel) * height + in_y)
-                                        * width
-                                        + in_x;
-                                let grad_index = ((batch_index * out_channels + out_channel)
-                                    * out_height
-                                    + out_y)
-                                    * out_width
-                                    + out_x;
-                                sum += input[input_index] * gradient[grad_index];
-                            }
-                            out_x += 1;
-                        }
-                    }
-                    out_y += 1;
-                }
-                batch_index += 1;
+        static mut GRADIENT_TILE: SharedArray<f32, 32> = SharedArray::UNINIT;
+
+        let thread_index = thread::threadIdx_x() as usize;
+        let block_index = thread::blockIdx_x() as usize;
+        let in_per_group = in_channels / groups;
+        let weights_per_output = in_per_group * kernel_size * kernel_size;
+        let weight_tiles = (weights_per_output + 31) / 32;
+        let out_channel = block_index / weight_tiles;
+        let weight_position = (block_index % weight_tiles) * 32 + thread_index;
+        let active = out_channel < out_channels && weight_position < weights_per_output;
+        let kernel_x = weight_position % kernel_size;
+        let position = weight_position / kernel_size;
+        let kernel_y = position % kernel_size;
+        let local_channel = position / kernel_size;
+        let out_per_group = out_channels / groups;
+        let group = out_channel / out_per_group;
+        let in_channel = group * in_per_group + local_channel;
+        let output_spatial = out_height * out_width;
+        let reduction = batch * output_spatial;
+        let mut sum = 0.0;
+        let mut tile_start = 0;
+        while tile_start < reduction {
+            let reduction_index = tile_start + thread_index;
+            // SAFETY: each of the 32 threads initializes its unique slot;
+            // out-of-range reduction elements are explicitly zero-filled.
+            unsafe {
+                GRADIENT_TILE[thread_index] = if reduction_index < reduction {
+                    let batch_index = reduction_index / output_spatial;
+                    let output_position = reduction_index % output_spatial;
+                    gradient[(batch_index * out_channels + out_channel) * output_spatial
+                        + output_position]
+                } else {
+                    0.0
+                };
             }
-            *value = sum;
+            thread::sync_threads();
+            if active {
+                let tile_len = (reduction - tile_start).min(32);
+                let mut tile_index = 0;
+                while tile_index < tile_len {
+                    let reduction_index = tile_start + tile_index;
+                    let batch_index = reduction_index / output_spatial;
+                    let output_position = reduction_index % output_spatial;
+                    let out_y = output_position / out_width;
+                    let out_x = output_position % out_width;
+                    let padded_y = out_y * stride + kernel_y;
+                    let padded_x = out_x * stride + kernel_x;
+                    if padded_y >= padding
+                        && padded_y - padding < height
+                        && padded_x >= padding
+                        && padded_x - padding < width
+                    {
+                        let input_index = ((batch_index * in_channels + in_channel) * height
+                            + padded_y
+                            - padding)
+                            * width
+                            + padded_x
+                            - padding;
+                        // SAFETY: all gradient tile slots were initialized and
+                        // made visible by the preceding block-wide barrier.
+                        sum += input[input_index] * unsafe { GRADIENT_TILE[tile_index] };
+                    }
+                    tile_index += 1;
+                }
+            }
+            thread::sync_threads();
+            tile_start += 32;
+        }
+        if active {
+            let output_index = out_channel * weights_per_output + weight_position;
+            // SAFETY: each block owns one out_channel/tile and each thread one
+            // weight, making output_index unique and in bounds.
+            unsafe { *output.get_unchecked_mut(output_index) = sum };
         }
     }
 
@@ -892,7 +967,10 @@ impl Executor {
                 unsafe {
                     self.module.conv2d(
                         &self.stream,
-                        launch_config(tensor.numel())?,
+                        tiled_launch_config(
+                            input.shape()[0] * weight.shape()[0],
+                            tensor.shape()[2] * tensor.shape()[3],
+                        )?,
                         input.shape()[0],
                         input.shape()[1],
                         input.shape()[2],
@@ -1319,7 +1397,10 @@ impl Executor {
         unsafe {
             self.module.conv2d_input_backward(
                 &self.stream,
-                launch_config(input.numel())?,
+                tiled_launch_config(
+                    input.shape()[0] * input.shape()[1],
+                    input.shape()[2] * input.shape()[3],
+                )?,
                 input.shape()[0],
                 input.shape()[1],
                 input.shape()[2],
@@ -1342,7 +1423,11 @@ impl Executor {
         unsafe {
             self.module.conv2d_weight_backward(
                 &self.stream,
-                launch_config(weight.numel())?,
+                tiled_launch_config_with_tile(
+                    weight.shape()[0],
+                    weight.shape()[1] * weight.shape()[2] * weight.shape()[3],
+                    32,
+                )?,
                 input.shape()[0],
                 input.shape()[1],
                 input.shape()[2],
@@ -1726,6 +1811,36 @@ fn launch_config(numel: usize) -> Result<LaunchConfig> {
     Ok(LaunchConfig::for_num_elems(u32::try_from(numel).map_err(
         |_| Error::Execution("tensor is too large for a CUDA grid".into()),
     )?))
+}
+
+fn tiled_launch_config(planes: usize, elements_per_plane: usize) -> Result<LaunchConfig> {
+    tiled_launch_config_with_tile(planes, elements_per_plane, 256)
+}
+
+fn tiled_launch_config_with_tile(
+    planes: usize,
+    elements_per_plane: usize,
+    tile: usize,
+) -> Result<LaunchConfig> {
+    let tiles_per_plane = elements_per_plane / tile + usize::from(elements_per_plane % tile != 0);
+    let blocks = planes
+        .checked_mul(tiles_per_plane)
+        .ok_or_else(|| Error::Execution("CUDA tiled grid size overflow".into()))?;
+    Ok(LaunchConfig {
+        grid_dim: (
+            u32::try_from(blocks)
+                .map_err(|_| Error::Execution("CUDA tiled grid exceeds u32".into()))?,
+            1,
+            1,
+        ),
+        block_dim: (
+            u32::try_from(tile)
+                .map_err(|_| Error::Execution("CUDA tile size exceeds u32".into()))?,
+            1,
+            1,
+        ),
+        shared_mem_bytes: 0,
+    })
 }
 
 fn cuda_error(error: impl std::fmt::Display) -> Error {
