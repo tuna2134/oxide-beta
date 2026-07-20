@@ -156,6 +156,26 @@ fn bind_placeholders(graph: &Tensor, inputs: &[Tensor]) -> Result<Tensor> {
             Op::Mul(a, b) => bind(a, inputs, cache)?.mul(&bind(b, inputs, cache)?)?,
             Op::Relu(input) => bind(input, inputs, cache)?.relu(),
             Op::MatMul(a, b) => bind(a, inputs, cache)?.matmul(&bind(b, inputs, cache)?)?,
+            Op::Conv2d {
+                input,
+                weight,
+                bias,
+                stride,
+                padding,
+                groups,
+            } => bind(input, inputs, cache)?.conv2d(
+                &bind(weight, inputs, cache)?,
+                &bind(bias, inputs, cache)?,
+                *stride,
+                *padding,
+                *groups,
+            )?,
+            Op::AvgPool2d {
+                input,
+                kernel,
+                stride,
+            } => bind(input, inputs, cache)?.avg_pool2d(*kernel, *stride)?,
+            Op::Reshape(input) => bind(input, inputs, cache)?.reshape(tensor.shape().to_vec())?,
         };
         cache.insert(tensor.node.id, result.clone());
         Ok(result)

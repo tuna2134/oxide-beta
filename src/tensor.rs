@@ -35,6 +35,20 @@ pub(crate) enum Op {
     Mul(Tensor, Tensor),
     Relu(Tensor),
     MatMul(Tensor, Tensor),
+    Conv2d {
+        input: Tensor,
+        weight: Tensor,
+        bias: Tensor,
+        stride: usize,
+        padding: usize,
+        groups: usize,
+    },
+    AvgPool2d {
+        input: Tensor,
+        kernel: [usize; 2],
+        stride: [usize; 2],
+    },
+    Reshape(Tensor),
 }
 
 impl Tensor {
@@ -149,6 +163,154 @@ impl Tensor {
             self.device(),
             Op::MatMul(self.clone(), rhs.clone()),
         ))
+    }
+
+    /// Applies an NCHW grouped 2D cross-correlation.
+    ///
+    /// `weight` is `[out_channels, in_channels / groups, kernel_h, kernel_w]`
+    /// and `bias` is `[out_channels]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid ranks, groups, channels, shapes, or devices.
+    pub fn conv2d(
+        &self,
+        weight: &Self,
+        bias: &Self,
+        stride: usize,
+        padding: usize,
+        groups: usize,
+    ) -> Result<Self> {
+        if self.device() != weight.device() || self.device() != bias.device() {
+            return Err(Error::DeviceMismatch);
+        }
+        if self.shape().len() != 4 || weight.shape().len() != 4 || bias.shape().len() != 1 {
+            return Err(Error::InvalidShape(
+                "conv2d expects NCHW input, OIHW weight, and rank-1 bias".into(),
+            ));
+        }
+        if stride == 0 || groups == 0 {
+            return Err(Error::InvalidShape(
+                "conv2d stride and groups must be non-zero".into(),
+            ));
+        }
+        let [batch, in_channels, height, width] = [
+            self.shape()[0],
+            self.shape()[1],
+            self.shape()[2],
+            self.shape()[3],
+        ];
+        let [out_channels, weight_channels, kernel_h, kernel_w] = [
+            weight.shape()[0],
+            weight.shape()[1],
+            weight.shape()[2],
+            weight.shape()[3],
+        ];
+        if kernel_h == 0 || kernel_w == 0 || kernel_h != kernel_w {
+            return Err(Error::InvalidShape(
+                "conv2d currently requires a non-zero square kernel".into(),
+            ));
+        }
+        if in_channels % groups != 0
+            || out_channels % groups != 0
+            || weight_channels != in_channels / groups
+            || bias.shape()[0] != out_channels
+        {
+            return Err(Error::InvalidShape(
+                "conv2d group/channel dimensions are inconsistent".into(),
+            ));
+        }
+        let padded_h = height
+            .checked_add(padding.saturating_mul(2))
+            .ok_or_else(|| Error::InvalidShape("conv2d padded height overflow".into()))?;
+        let padded_w = width
+            .checked_add(padding.saturating_mul(2))
+            .ok_or_else(|| Error::InvalidShape("conv2d padded width overflow".into()))?;
+        if padded_h < kernel_h || padded_w < kernel_w {
+            return Err(Error::InvalidShape("conv2d kernel exceeds input".into()));
+        }
+        let out_h = (padded_h - kernel_h) / stride + 1;
+        let out_w = (padded_w - kernel_w) / stride + 1;
+        Ok(Self::new(
+            vec![batch, out_channels, out_h, out_w],
+            self.device(),
+            Op::Conv2d {
+                input: self.clone(),
+                weight: weight.clone(),
+                bias: bias.clone(),
+                stride,
+                padding,
+                groups,
+            },
+        ))
+    }
+
+    /// Applies a non-overlapping or strided NCHW average pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid rank, zero sizes, or an oversized kernel.
+    pub fn avg_pool2d(&self, kernel: [usize; 2], stride: [usize; 2]) -> Result<Self> {
+        if self.shape().len() != 4 {
+            return Err(Error::InvalidShape("avg_pool2d expects NCHW input".into()));
+        }
+        if kernel.contains(&0) || stride.contains(&0) {
+            return Err(Error::InvalidShape(
+                "avg_pool2d kernel and stride must be non-zero".into(),
+            ));
+        }
+        let [height, width] = [self.shape()[2], self.shape()[3]];
+        if kernel[0] > height || kernel[1] > width {
+            return Err(Error::InvalidShape(
+                "avg_pool2d kernel exceeds input".into(),
+            ));
+        }
+        Ok(Self::new(
+            vec![
+                self.shape()[0],
+                self.shape()[1],
+                (height - kernel[0]) / stride[0] + 1,
+                (width - kernel[1]) / stride[1] + 1,
+            ],
+            self.device(),
+            Op::AvgPool2d {
+                input: self.clone(),
+                kernel,
+                stride,
+            },
+        ))
+    }
+
+    /// Averages the complete spatial extent of an NCHW tensor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the input is rank 4.
+    pub fn global_avg_pool2d(&self) -> Result<Self> {
+        if self.shape().len() != 4 {
+            return Err(Error::InvalidShape(
+                "global_avg_pool2d expects NCHW input".into(),
+            ));
+        }
+        self.avg_pool2d(
+            [self.shape()[2], self.shape()[3]],
+            [self.shape()[2], self.shape()[3]],
+        )
+    }
+
+    /// Returns a lazy view with a different shape and identical element count.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shape has a different element count.
+    pub fn reshape(&self, shape: impl Into<Vec<usize>>) -> Result<Self> {
+        let shape = shape.into();
+        if checked_numel(&shape)? != self.numel() {
+            return Err(Error::InvalidShape(
+                "reshape must preserve the element count".into(),
+            ));
+        }
+        Ok(Self::new(shape, self.device(), Op::Reshape(self.clone())))
     }
 
     /// Materializes this lazy tensor on the host.
@@ -270,6 +432,22 @@ pub(crate) fn eval_cpu(
             }
             output
         }
+        Op::Conv2d {
+            input,
+            weight,
+            bias,
+            stride,
+            padding,
+            groups,
+        } => eval_conv2d(
+            input, weight, bias, *stride, *padding, *groups, cache, inputs,
+        )?,
+        Op::AvgPool2d {
+            input,
+            kernel,
+            stride,
+        } => eval_avg_pool2d(input, *kernel, *stride, cache, inputs)?,
+        Op::Reshape(input) => eval_cpu(input, cache, inputs)?,
     };
     cache.insert(tensor.node.id, value.clone());
     Ok(value)
@@ -295,10 +473,149 @@ fn clone_to_device(tensor: &Tensor, device: Device, cache: &mut HashMap<u64, Ten
             clone_to_device(a, device, cache),
             clone_to_device(b, device, cache),
         ),
+        Op::Conv2d {
+            input,
+            weight,
+            bias,
+            stride,
+            padding,
+            groups,
+        } => Op::Conv2d {
+            input: clone_to_device(input, device, cache),
+            weight: clone_to_device(weight, device, cache),
+            bias: clone_to_device(bias, device, cache),
+            stride: *stride,
+            padding: *padding,
+            groups: *groups,
+        },
+        Op::AvgPool2d {
+            input,
+            kernel,
+            stride,
+        } => Op::AvgPool2d {
+            input: clone_to_device(input, device, cache),
+            kernel: *kernel,
+            stride: *stride,
+        },
+        Op::Reshape(input) => Op::Reshape(clone_to_device(input, device, cache)),
     };
     let result = Tensor::new(tensor.node.shape.clone(), device, op);
     cache.insert(tensor.node.id, result.clone());
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_conv2d(
+    input: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    stride: usize,
+    padding: usize,
+    groups: usize,
+    cache: &mut HashMap<u64, Vec<f32>>,
+    inputs: Option<&[Vec<f32>]>,
+) -> Result<Vec<f32>> {
+    let input_data = eval_cpu(input, cache, inputs)?;
+    let weight_data = eval_cpu(weight, cache, inputs)?;
+    let bias_data = eval_cpu(bias, cache, inputs)?;
+    let [batch, in_channels, height, width] = [
+        input.shape()[0],
+        input.shape()[1],
+        input.shape()[2],
+        input.shape()[3],
+    ];
+    let [out_channels, kernel_h, kernel_w] =
+        [weight.shape()[0], weight.shape()[2], weight.shape()[3]];
+    let out_h = (height + 2 * padding - kernel_h) / stride + 1;
+    let out_w = (width + 2 * padding - kernel_w) / stride + 1;
+    let in_per_group = in_channels / groups;
+    let out_per_group = out_channels / groups;
+    let mut output = vec![0.0; batch * out_channels * out_h * out_w];
+    for batch_index in 0..batch {
+        for (out_channel, &channel_bias) in bias_data.iter().enumerate().take(out_channels) {
+            let group = out_channel / out_per_group;
+            for out_y in 0..out_h {
+                for out_x in 0..out_w {
+                    let mut sum = channel_bias;
+                    for local_channel in 0..in_per_group {
+                        let in_channel = group * in_per_group + local_channel;
+                        for kernel_y in 0..kernel_h {
+                            let padded_y = out_y * stride + kernel_y;
+                            if padded_y < padding || padded_y - padding >= height {
+                                continue;
+                            }
+                            let in_y = padded_y - padding;
+                            for kernel_x in 0..kernel_w {
+                                let padded_x = out_x * stride + kernel_x;
+                                if padded_x < padding || padded_x - padding >= width {
+                                    continue;
+                                }
+                                let in_x = padded_x - padding;
+                                let input_index =
+                                    ((batch_index * in_channels + in_channel) * height + in_y)
+                                        * width
+                                        + in_x;
+                                let weight_index = ((out_channel * in_per_group + local_channel)
+                                    * kernel_h
+                                    + kernel_y)
+                                    * kernel_w
+                                    + kernel_x;
+                                sum += input_data[input_index] * weight_data[weight_index];
+                            }
+                        }
+                    }
+                    let output_index = ((batch_index * out_channels + out_channel) * out_h + out_y)
+                        * out_w
+                        + out_x;
+                    output[output_index] = sum;
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn eval_avg_pool2d(
+    input: &Tensor,
+    kernel: [usize; 2],
+    stride: [usize; 2],
+    cache: &mut HashMap<u64, Vec<f32>>,
+    inputs: Option<&[Vec<f32>]>,
+) -> Result<Vec<f32>> {
+    let input_data = eval_cpu(input, cache, inputs)?;
+    let [batch, channels, height, width] = [
+        input.shape()[0],
+        input.shape()[1],
+        input.shape()[2],
+        input.shape()[3],
+    ];
+    let out_h = (height - kernel[0]) / stride[0] + 1;
+    let out_w = (width - kernel[1]) / stride[1] + 1;
+    let denominator = (kernel[0] * kernel[1]) as f32;
+    let mut output = vec![0.0; batch * channels * out_h * out_w];
+    for batch_index in 0..batch {
+        for channel in 0..channels {
+            for out_y in 0..out_h {
+                for out_x in 0..out_w {
+                    let mut sum = 0.0;
+                    for kernel_y in 0..kernel[0] {
+                        for kernel_x in 0..kernel[1] {
+                            let in_y = out_y * stride[0] + kernel_y;
+                            let in_x = out_x * stride[1] + kernel_x;
+                            let index =
+                                ((batch_index * channels + channel) * height + in_y) * width + in_x;
+                            sum += input_data[index];
+                        }
+                    }
+                    let index =
+                        ((batch_index * channels + channel) * out_h + out_y) * out_w + out_x;
+                    output[index] = sum / denominator;
+                }
+            }
+        }
+    }
+    Ok(output)
 }
 
 fn zip_map(lhs: Vec<f32>, rhs: Vec<f32>, op: impl Fn(f32, f32) -> f32) -> Vec<f32> {
@@ -347,6 +664,36 @@ mod tests {
         assert_eq!(
             a.matmul(&b).unwrap().to_vec().unwrap(),
             vec![19.0, 22.0, 43.0, 50.0]
+        );
+    }
+
+    #[test]
+    fn grouped_convolution_and_average_pool_evaluate() {
+        let input =
+            Tensor::from_vec((1_i16..=9).map(f32::from).collect(), vec![1, 1, 3, 3]).unwrap();
+        let weight = Tensor::from_vec(vec![1.0; 4], vec![1, 1, 2, 2]).unwrap();
+        let bias = Tensor::zeros(vec![1]).unwrap();
+        let convolved = input.conv2d(&weight, &bias, 1, 0, 1).unwrap();
+        assert_eq!(convolved.shape(), &[1, 1, 2, 2]);
+        assert_eq!(convolved.to_vec().unwrap(), vec![12.0, 16.0, 24.0, 28.0]);
+
+        let pooled = Tensor::from_vec((1_i16..=16).map(f32::from).collect(), vec![1, 1, 4, 4])
+            .unwrap()
+            .avg_pool2d([2, 2], [2, 2])
+            .unwrap();
+        assert_eq!(pooled.to_vec().unwrap(), vec![3.5, 5.5, 11.5, 13.5]);
+
+        let depthwise_input =
+            Tensor::from_vec(vec![1., 2., 3., 4., 5., 6., 7., 8.], vec![1, 2, 2, 2]).unwrap();
+        let depthwise_weight = Tensor::from_vec(vec![2., 3.], vec![2, 1, 1, 1]).unwrap();
+        let depthwise_bias = Tensor::zeros(vec![2]).unwrap();
+        assert_eq!(
+            depthwise_input
+                .conv2d(&depthwise_weight, &depthwise_bias, 1, 0, 2)
+                .unwrap()
+                .to_vec()
+                .unwrap(),
+            vec![2., 4., 6., 8., 15., 18., 21., 24.]
         );
     }
 }

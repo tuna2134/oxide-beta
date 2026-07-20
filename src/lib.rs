@@ -6,6 +6,8 @@
 
 mod error;
 pub mod jit;
+pub mod models;
+pub mod nn;
 mod tensor;
 
 #[cfg(feature = "cuda")]
