@@ -840,6 +840,159 @@ fn eval_avg_pool2d(
     Ok(output)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn eval_batch_norm2d(
+    input: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    state: &Arc<Mutex<BatchNormState>>,
+    saved_statistics: &Arc<Mutex<Option<BatchNormStatistics>>>,
+    training: bool,
+    momentum: f32,
+    epsilon: f32,
+    cache: &mut HashMap<u64, Vec<f32>>,
+    inputs: Option<&[Vec<f32>]>,
+) -> Result<Vec<f32>> {
+    let input_data = eval_cpu(input, cache, inputs)?;
+    let weight_data = eval_cpu(weight, cache, inputs)?;
+    let bias_data = eval_cpu(bias, cache, inputs)?;
+    let statistics = {
+        let mut saved = saved_statistics
+            .lock()
+            .map_err(|_| Error::Execution("BatchNorm statistics lock was poisoned".into()))?;
+        if let Some(statistics) = saved.as_ref() {
+            statistics.clone()
+        } else {
+            let statistics = if training {
+                let statistics = batch_statistics(input, &input_data, epsilon)?;
+                update_running_statistics(input, &input_data, state, momentum)?;
+                statistics
+            } else {
+                running_statistics(state, epsilon)?
+            };
+            *saved = Some(statistics.clone());
+            statistics
+        }
+    };
+    Ok(apply_batch_norm(
+        input,
+        &input_data,
+        &weight_data,
+        &bias_data,
+        &statistics,
+    ))
+}
+
+fn batch_statistics(
+    input: &Tensor,
+    input_data: &[f32],
+    epsilon: f32,
+) -> Result<BatchNormStatistics> {
+    let channels = input.shape()[1];
+    let spatial = input.shape()[2] * input.shape()[3];
+    let samples = input.shape()[0] * spatial;
+    if samples <= 1 {
+        return Err(Error::Execution(
+            "BatchNorm training requires more than one value per channel".into(),
+        ));
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let denominator = samples as f32;
+    let mut mean = vec![0.0; channels];
+    for batch in 0..input.shape()[0] {
+        for channel in 0..channels {
+            let start = (batch * channels + channel) * spatial;
+            mean[channel] += input_data[start..start + spatial].iter().sum::<f32>();
+        }
+    }
+    for value in &mut mean {
+        *value /= denominator;
+    }
+    let mut variance = vec![0.0; channels];
+    for batch in 0..input.shape()[0] {
+        for channel in 0..channels {
+            let start = (batch * channels + channel) * spatial;
+            variance[channel] += input_data[start..start + spatial]
+                .iter()
+                .map(|value| (value - mean[channel]).powi(2))
+                .sum::<f32>();
+        }
+    }
+    for value in &mut variance {
+        *value /= denominator;
+    }
+    Ok(BatchNormStatistics {
+        mean,
+        inverse_standard_deviation: variance
+            .into_iter()
+            .map(|value| (value + epsilon).sqrt().recip())
+            .collect(),
+    })
+}
+
+fn update_running_statistics(
+    input: &Tensor,
+    input_data: &[f32],
+    state: &Arc<Mutex<BatchNormState>>,
+    momentum: f32,
+) -> Result<()> {
+    let statistics = batch_statistics(input, input_data, 0.0)?;
+    let samples = input.shape()[0] * input.shape()[2] * input.shape()[3];
+    #[allow(clippy::cast_precision_loss)]
+    let unbiased_correction = samples as f32 / (samples - 1) as f32;
+    let mut buffers = state
+        .lock()
+        .map_err(|_| Error::Execution("BatchNorm state lock was poisoned".into()))?;
+    for channel in 0..input.shape()[1] {
+        let biased_variance = statistics.inverse_standard_deviation[channel].powi(-2);
+        buffers.running_mean[channel] =
+            (1.0 - momentum) * buffers.running_mean[channel] + momentum * statistics.mean[channel];
+        buffers.running_variance[channel] = (1.0 - momentum)
+            * buffers.running_variance[channel]
+            + momentum * biased_variance * unbiased_correction;
+    }
+    Ok(())
+}
+
+fn running_statistics(
+    state: &Arc<Mutex<BatchNormState>>,
+    epsilon: f32,
+) -> Result<BatchNormStatistics> {
+    let buffers = state
+        .lock()
+        .map_err(|_| Error::Execution("BatchNorm state lock was poisoned".into()))?;
+    Ok(BatchNormStatistics {
+        mean: buffers.running_mean.clone(),
+        inverse_standard_deviation: buffers
+            .running_variance
+            .iter()
+            .map(|value| (value + epsilon).sqrt().recip())
+            .collect(),
+    })
+}
+
+fn apply_batch_norm(
+    input: &Tensor,
+    input_data: &[f32],
+    weight: &[f32],
+    bias: &[f32],
+    statistics: &BatchNormStatistics,
+) -> Vec<f32> {
+    let channels = input.shape()[1];
+    let spatial = input.shape()[2] * input.shape()[3];
+    input_data
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let channel = (index / spatial) % channels;
+            (value - statistics.mean[channel])
+                * statistics.inverse_standard_deviation[channel]
+                * weight[channel]
+                + bias[channel]
+        })
+        .collect()
+}
+
 fn eval_cross_entropy(
     logits: &Tensor,
     targets: &Tensor,
