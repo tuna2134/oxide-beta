@@ -2,7 +2,7 @@
 //!
 //! The layout follows `transformers.models.gemma4.Gemma4TextModel`: scaled
 //! token embeddings, 5:1 local/global decoder layers, GQA, PLE, gated MLP,
-//! final RMSNorm, and a tied or independent LM head.
+//! final `RMSNorm`, and a tied or independent LM head.
 
 use crate::safetensors::{LoadedTensor, SafeTensorLoader};
 use crate::{Device, Error, Result, Tensor};
@@ -55,6 +55,7 @@ fn default_true() -> bool {
 
 /// Hugging Face compatible `Gemma4TextConfig` subset used by the Rust model.
 #[derive(Clone, Debug, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Gemma4TextConfig {
     #[serde(default = "default_vocab_size")]
     pub vocab_size: usize,
@@ -140,7 +141,7 @@ impl Gemma4TextConfig {
 
 /// A lazily loaded Gemma 4 causal-language-model checkpoint.
 ///
-/// SafeTensors shards remain on disk and individual weights are decoded only
+/// `SafeTensors` shards remain on disk and individual weights are decoded only
 /// when requested. This avoids converting an entire BF16 checkpoint to an
 /// additional f32 copy during model construction.
 #[derive(Clone, Debug)]
@@ -152,7 +153,11 @@ pub struct Gemma4ForCausalLM {
 }
 
 impl Gemma4ForCausalLM {
-    /// Loads `config.json` plus a single or sharded SafeTensors checkpoint.
+    /// Loads `config.json` plus a single or sharded `SafeTensors` checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid config or incomplete checkpoint.
     pub fn from_pretrained(directory: impl AsRef<Path>, device: Device) -> Result<Self> {
         let root = directory.as_ref().to_owned();
         let config_path = root.join("config.json");
@@ -195,6 +200,10 @@ impl Gemma4ForCausalLM {
     }
 
     /// Loads a Hugging Face parameter, accepting common multimodal prefixes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parameter is missing or cannot be decoded.
     pub fn weight(&self, suffix: &str) -> Result<LoadedTensor> {
         let model = format!("model.{suffix}");
         let model_language = format!("model.language_model.{suffix}");
@@ -208,12 +217,20 @@ impl Gemma4ForCausalLM {
         ])
     }
 
-    /// Converts a named SafeTensors parameter into an oxide-torch Tensor.
+    /// Converts a named `SafeTensors` parameter into an oxide-torch `Tensor`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if loading, conversion, or device transfer fails.
     pub fn weight_tensor(&self, suffix: &str) -> Result<Tensor> {
         self.weight(suffix)?.into_tensor(self.device)
     }
 
     /// Performs the scaled token-embedding lookup used at the model input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid token, embedding shape, or device.
     pub fn embed(&self, input_ids: &[u32]) -> Result<Tensor> {
         let embedding = self.weight("embed_tokens.weight")?;
         expect_shape(
@@ -222,6 +239,7 @@ impl Gemma4ForCausalLM {
             "embed_tokens.weight",
         )?;
         let mut output = Vec::with_capacity(input_ids.len() * self.config.hidden_size);
+        #[allow(clippy::cast_precision_loss)]
         let scale = (self.config.hidden_size as f32).sqrt();
         for &token in input_ids {
             let token =

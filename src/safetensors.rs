@@ -1,4 +1,4 @@
-//! Hugging Face SafeTensors loading with transparent dtype conversion.
+//! Hugging Face `SafeTensors` loading with transparent dtype conversion.
 
 use crate::{Device, Error, Result, Tensor};
 use half::{bf16, f16};
@@ -13,7 +13,7 @@ struct ShardIndex {
     weight_map: HashMap<String, String>,
 }
 
-/// A decoded row-major tensor from a SafeTensors checkpoint.
+/// A decoded row-major tensor from a `SafeTensors` checkpoint.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoadedTensor {
     pub shape: Vec<usize>,
@@ -22,12 +22,16 @@ pub struct LoadedTensor {
 
 impl LoadedTensor {
     /// Converts the loaded tensor into an oxide-torch tensor on `device`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the shape is invalid or the device is unavailable.
     pub fn into_tensor(self, device: Device) -> Result<Tensor> {
         Ok(Tensor::from_vec(self.data, self.shape)?.to(device))
     }
 }
 
-/// Loader for one SafeTensors file or a Hugging Face sharded checkpoint.
+/// Loader for one `SafeTensors` file or a Hugging Face sharded checkpoint.
 ///
 /// Files are opened only when a tensor is requested, so a large Gemma model is
 /// not duplicated in host memory during construction.
@@ -39,6 +43,10 @@ pub struct SafeTensorLoader {
 
 impl SafeTensorLoader {
     /// Opens a `.safetensors` file, an index JSON, or a model directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing, unreadable, or malformed checkpoint files.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if path.is_dir() {
@@ -119,6 +127,10 @@ impl SafeTensorLoader {
     }
 
     /// Loads one tensor and converts F32/F16/BF16 to f32.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tensor is missing, malformed, or has an unsupported dtype.
     pub fn load(&self, name: &str) -> Result<LoadedTensor> {
         let shard = self
             .weight_map
@@ -146,6 +158,10 @@ impl SafeTensorLoader {
 
     /// Tries aliases in order. This handles `model.*`, `language_model.*`, and
     /// base-model checkpoints without forcing a physical conversion step.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no alias exists or the selected tensor cannot be decoded.
     pub fn load_any<'a>(&self, names: impl IntoIterator<Item = &'a str>) -> Result<LoadedTensor> {
         let names: Vec<_> = names.into_iter().collect();
         for name in &names {
@@ -190,10 +206,36 @@ fn decode_f32(dtype: Dtype, bytes: &[u8]) -> Result<Vec<f32>> {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn safetensor_error(error: safetensors::SafeTensorError) -> Error {
     load_error(format!("invalid SafeTensors data: {error}"))
 }
 
 fn load_error(message: impl Into<String>) -> Error {
     Error::Execution(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_common_hugging_face_float_types() {
+        let f32_bytes = [1.5_f32.to_le_bytes(), (-2.0_f32).to_le_bytes()].concat();
+        assert_eq!(decode_f32(Dtype::F32, &f32_bytes).unwrap(), [1.5, -2.0]);
+
+        let f16_bytes = [
+            f16::from_f32(1.5).to_bits().to_le_bytes(),
+            f16::from_f32(-2.0).to_bits().to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(decode_f32(Dtype::F16, &f16_bytes).unwrap(), [1.5, -2.0]);
+
+        let bf16_bytes = [
+            bf16::from_f32(1.5).to_bits().to_le_bytes(),
+            bf16::from_f32(-2.0).to_bits().to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(decode_f32(Dtype::BF16, &bf16_bytes).unwrap(), [1.5, -2.0]);
+    }
 }
