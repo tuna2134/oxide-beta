@@ -465,6 +465,22 @@ impl Gemma4Tokenizer {
 }
 
 impl Gemma4ForCausalLM {
+    /// Uploads every BF16 language-model weight to a persistent CUDA store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when CUDA/cuBLAS initialization or a weight upload
+    /// fails. The model must have been created for the same CUDA device.
+    #[cfg(feature = "cuda")]
+    pub fn prepare_cuda(&self) -> Result<crate::gemma4_cuda::Gemma4CudaState> {
+        let Device::Cuda(device) = self.device else {
+            return Err(Error::Execution(
+                "prepare_cuda requires a model on Device::Cuda".into(),
+            ));
+        };
+        crate::gemma4_cuda::Gemma4CudaState::load(self, device)
+    }
+
     /// Loads `config.json` plus a single or sharded `SafeTensors` checkpoint.
     ///
     /// # Errors

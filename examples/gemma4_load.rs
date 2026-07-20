@@ -17,6 +17,12 @@ fn main() -> oxide_torch::Result<()> {
     let token_ids =
         tokenizer.encode_user_turn(if prompt.is_empty() { "Hello" } else { &prompt })?;
     let model = Gemma4ForCausalLM::from_pretrained(&directory, device)?;
+    #[cfg(feature = "cuda")]
+    let cuda = if matches!(device, Device::Cuda(_)) {
+        Some(model.prepare_cuda()?)
+    } else {
+        None
+    };
     let embeddings = model.embed(&token_ids)?;
     println!(
         "Gemma4 loaded: layers={} hidden={} vocab={}/{} tokens={} embeddings={:?} device={device:?}",
@@ -27,5 +33,13 @@ fn main() -> oxide_torch::Result<()> {
         token_ids.len(),
         embeddings.shape(),
     );
+    #[cfg(feature = "cuda")]
+    if let Some(cuda) = cuda {
+        println!(
+            "CUDA persistent weights: tensors={} bytes={} MiB",
+            cuda.weight_count(),
+            cuda.weight_bytes() / (1024 * 1024),
+        );
+    }
     Ok(())
 }

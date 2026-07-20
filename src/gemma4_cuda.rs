@@ -9,7 +9,11 @@ use safetensors::Dtype;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub(crate) struct Gemma4CudaState {
+/// Persistent CUDA resources for Gemma 4 inference.
+///
+/// All BF16 language-model weights are uploaded once during construction and
+/// remain resident until this value is dropped.
+pub struct Gemma4CudaState {
     pub(crate) _context: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) cublas: Cublas,
@@ -55,12 +59,28 @@ impl Gemma4CudaState {
             })?;
             weights.insert(name, buffer);
         }
+        stream.synchronize().map_err(cuda_error)?;
         Ok(Self {
             _context: context,
             stream,
             cublas,
             weights,
         })
+    }
+
+    /// Number of persistent checkpoint tensors stored on the GPU.
+    #[must_use]
+    pub fn weight_count(&self) -> usize {
+        self.weights.len()
+    }
+
+    /// Total bytes occupied by persistent BF16 checkpoint tensors.
+    #[must_use]
+    pub fn weight_bytes(&self) -> usize {
+        self.weights
+            .values()
+            .map(|weight| weight.len() * std::mem::size_of::<u16>())
+            .sum()
     }
 }
 

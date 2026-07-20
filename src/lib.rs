@@ -24,7 +24,7 @@ mod cuda;
 #[cfg(feature = "cudnn")]
 mod cudnn;
 #[cfg(feature = "cuda")]
-mod gemma4_cuda;
+pub mod gemma4_cuda;
 
 pub use error::{Error, Result};
 pub use tensor::{Device, Tensor};
