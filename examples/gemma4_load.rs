@@ -201,7 +201,7 @@ fn main() -> oxide_torch::Result<()> {
             let mut random = generation.seed;
             let mut generated = Vec::with_capacity(generation.max_new_tokens);
             let mut streamed = String::new();
-            let mut topk_candidates = None;
+            let mut topk_candidates: Option<Vec<(u32, f32)>> = None;
             let generation_started = std::time::Instant::now();
             let mut decode_seconds = 0.0_f64;
             let mut sampling_seconds = 0.0_f64;
