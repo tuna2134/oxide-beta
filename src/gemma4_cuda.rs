@@ -251,6 +251,29 @@ impl Gemma4CudaState {
         weight_name: &str,
         epsilon: f32,
     ) -> Result<DeviceBuffer<f32>> {
+        self.rms_norm_with_offset(input, weight_name, epsilon, 0.0)
+    }
+
+    /// Gemma 3-style RMSNorm stores a zero-centered scale and applies
+    /// `normalized * (1 + weight)`. Gemma 4 inherits this implementation for
+    /// the decoder and final norms, while its q/k and PLE norms use the direct
+    /// scale handled by `rms_norm` above.
+    fn rms_norm_gemma3(
+        &self,
+        input: &DeviceBuffer<f32>,
+        weight_name: &str,
+        epsilon: f32,
+    ) -> Result<DeviceBuffer<f32>> {
+        self.rms_norm_with_offset(input, weight_name, epsilon, 1.0)
+    }
+
+    fn rms_norm_with_offset(
+        &self,
+        input: &DeviceBuffer<f32>,
+        weight_name: &str,
+        epsilon: f32,
+        weight_offset: f32,
+    ) -> Result<DeviceBuffer<f32>> {
         let weight = self.weight(weight_name)?;
         let hidden = *weight
             .shape
@@ -271,6 +294,7 @@ impl Gemma4CudaState {
                 Self::launch_config(input.len())?,
                 hidden,
                 epsilon,
+                weight_offset,
                 input,
                 &weight.buffer,
                 &mut output,
@@ -792,7 +816,7 @@ impl Gemma4CudaState {
     ) -> Result<Vec<f32>> {
         let hidden = self.embedding(token, hidden_size)?;
         let prefix = format!("layers.{layer}");
-        let normalized = self.rms_norm(
+        let normalized = self.rms_norm_gemma3(
             &hidden,
             &format!("{prefix}.pre_feedforward_layernorm.weight"),
             epsilon,
@@ -801,7 +825,7 @@ impl Gemma4CudaState {
         let up = self.linear(&normalized, 1, &format!("{prefix}.mlp.up_proj.weight"))?;
         let activated = self.gelu_mul(&gate, &up)?;
         let down = self.linear(&activated, 1, &format!("{prefix}.mlp.down_proj.weight"))?;
-        let down = self.rms_norm(
+        let down = self.rms_norm_gemma3(
             &down,
             &format!("{prefix}.post_feedforward_layernorm.weight"),
             epsilon,
@@ -825,7 +849,7 @@ impl Gemma4CudaState {
     ) -> Result<Vec<f32>> {
         let hidden = self.embedding(token, hidden_size)?;
         let prefix = format!("layers.{layer}");
-        let normalized = self.rms_norm(
+        let normalized = self.rms_norm_gemma3(
             &hidden,
             &format!("{prefix}.input_layernorm.weight"),
             epsilon,
@@ -851,7 +875,7 @@ impl Gemma4CudaState {
             &query, &key, &value, heads, kv_heads, head_dim, 1, window, 0, 1,
         )?;
         let projected = self.linear(&attended, 1, &format!("{prefix}.self_attn.o_proj.weight"))?;
-        let projected = self.rms_norm(
+        let projected = self.rms_norm_gemma3(
             &projected,
             &format!("{prefix}.post_attention_layernorm.weight"),
             epsilon,
@@ -873,7 +897,7 @@ impl Gemma4CudaState {
     ) -> Result<Vec<f32>> {
         let hidden = self.embedding(token, hidden_size)?;
         let prefix = format!("layers.{layer}");
-        let normalized = self.rms_norm(
+        let normalized = self.rms_norm_gemma3(
             &hidden,
             &format!("{prefix}.input_layernorm.weight"),
             epsilon,
@@ -930,7 +954,7 @@ impl Gemma4CudaState {
         epsilon: f32,
     ) -> Result<DeviceBuffer<f32>> {
         let prefix = format!("layers.{layer}");
-        let normalized = self.rms_norm(
+        let normalized = self.rms_norm_gemma3(
             hidden,
             &format!("{prefix}.pre_feedforward_layernorm.weight"),
             epsilon,
@@ -939,7 +963,7 @@ impl Gemma4CudaState {
         let up = self.linear(&normalized, 1, &format!("{prefix}.mlp.up_proj.weight"))?;
         let activated = self.gelu_mul(&gate, &up)?;
         let down = self.linear(&activated, 1, &format!("{prefix}.mlp.down_proj.weight"))?;
-        let down = self.rms_norm(
+        let down = self.rms_norm_gemma3(
             &down,
             &format!("{prefix}.post_feedforward_layernorm.weight"),
             epsilon,
@@ -955,7 +979,7 @@ impl Gemma4CudaState {
         table: &mut Gemma4CudaCacheTable,
     ) -> Result<DeviceBuffer<f32>> {
         let prefix = format!("layers.{layer}");
-        let normalized = self.rms_norm(
+        let normalized = self.rms_norm_gemma3(
             hidden,
             &format!("{prefix}.input_layernorm.weight"),
             config.rms_norm_eps,
@@ -1033,7 +1057,7 @@ impl Gemma4CudaState {
             cache.capacity,
         )?;
         let projected = self.linear(&attended, 1, &format!("{prefix}.self_attn.o_proj.weight"))?;
-        let projected = self.rms_norm(
+        let projected = self.rms_norm_gemma3(
             &projected,
             &format!("{prefix}.post_attention_layernorm.weight"),
             config.rms_norm_eps,
@@ -1064,7 +1088,7 @@ impl Gemma4CudaState {
             }
             self.trace_fingerprint(&format!("layer.{layer}"), &hidden, trace)?;
         }
-        hidden = self.rms_norm(&hidden, "norm.weight", config.rms_norm_eps)?;
+        hidden = self.rms_norm_gemma3(&hidden, "norm.weight", config.rms_norm_eps)?;
         table.position += 1;
         let embedding = self.weight("embed_tokens.weight")?;
         let hidden_bf16 = self.to_bf16(&hidden)?;

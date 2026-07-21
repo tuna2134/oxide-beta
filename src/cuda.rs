@@ -844,6 +844,7 @@ pub(crate) mod kernels {
     pub fn gemma_rms_norm(
         hidden: usize,
         epsilon: f32,
+        weight_offset: f32,
         input: &[f32],
         weight_bf16: &[u16],
         mut output: DisjointSlice<f32>,
@@ -862,7 +863,7 @@ pub(crate) mod kernels {
             }
             let scale = 1.0 / core::intrinsics::sqrtf32(square_sum / hidden as f32 + epsilon);
             let weight = f32::from_bits((weight_bf16[column] as u32) << 16);
-            *value = input[raw] * scale * weight;
+            *value = input[raw] * scale * (weight + weight_offset);
         }
     }
 
