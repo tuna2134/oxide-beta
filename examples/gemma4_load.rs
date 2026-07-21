@@ -110,7 +110,14 @@ fn main() -> oxide_torch::Result<()> {
             }
             println!("CUDA persistent KV cache smoke: sequence={}", cache.len());
         }
-        let mut cache_table = cuda.new_cache_table(model.config(), token_ids.len() + 128)?;
+        let max_new_tokens = std::env::var("GEMMA4_MAX_NEW_TOKENS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(128);
+        let max_sequence = token_ids.len().checked_add(max_new_tokens).ok_or_else(|| {
+            oxide_torch::Error::Execution("Gemma4 maximum sequence length overflow".into())
+        })?;
+        let mut cache_table = cuda.new_cache_table(model.config(), max_sequence)?;
         println!(
             "CUDA 35-layer cache table: layers={} physical={} shared={} last_source={:?}",
             cache_table.layer_count(),
@@ -124,10 +131,6 @@ fn main() -> oxide_torch::Result<()> {
                 logits = cuda.decode_token(token, model.config(), &mut cache_table)?;
                 eprintln!("Gemma4 prefill: {}/{}", index + 1, token_ids.len());
             }
-            let max_new_tokens = std::env::var("GEMMA4_MAX_NEW_TOKENS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(32);
             let mut generation = GenerationConfig {
                 max_new_tokens,
                 ..GenerationConfig::default()
@@ -151,21 +154,54 @@ fn main() -> oxide_torch::Result<()> {
                 generation.seed = value
                     .parse()
                     .map_err(|_| oxide_torch::Error::Execution("invalid GEMMA4_SEED".into()))?;
+            } else {
+                generation.seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(generation.seed, |duration| {
+                        duration.as_secs() ^ u64::from(duration.subsec_nanos())
+                    });
+            }
+            let repetition_penalty = std::env::var("GEMMA4_REPETITION_PENALTY")
+                .ok()
+                .map_or(Ok(1.1), |value| value.parse::<f32>())
+                .map_err(|_| {
+                    oxide_torch::Error::Execution("invalid GEMMA4_REPETITION_PENALTY".into())
+                })?;
+            if repetition_penalty < 1.0 || !repetition_penalty.is_finite() {
+                return Err(oxide_torch::Error::Execution(
+                    "GEMMA4_REPETITION_PENALTY must be finite and at least 1".into(),
+                ));
             }
             let mut random = generation.seed;
             let mut generated = Vec::with_capacity(generation.max_new_tokens);
             for index in 0..generation.max_new_tokens {
-                let next = sample_token(&logits, &generation, &mut random)?;
+                let mut sampling_logits = logits.clone();
+                if repetition_penalty > 1.0 {
+                    let mut penalized = std::collections::HashSet::with_capacity(generated.len());
+                    for &token in &generated {
+                        if !penalized.insert(token) {
+                            continue;
+                        }
+                        if let Some(logit) = sampling_logits.get_mut(token as usize) {
+                            if *logit >= 0.0 {
+                                *logit /= repetition_penalty;
+                            } else {
+                                *logit *= repetition_penalty;
+                            }
+                        }
+                    }
+                }
+                let next = sample_token(&sampling_logits, &generation, &mut random)?;
                 if generation.eos_token_ids.contains(&next) {
                     break;
                 }
                 generated.push(next);
                 println!(
-                    "Gemma4 generate: {}/{} token={} {:?}",
+                    "Gemma4 generate: {}/{} token={} piece={:?}",
                     index + 1,
                     generation.max_new_tokens,
                     next,
-                    tokenizer.decode(&generated, true)?,
+                    tokenizer.decode(&[next], true)?,
                 );
                 logits = cuda.decode_token(next, model.config(), &mut cache_table)?;
             }
