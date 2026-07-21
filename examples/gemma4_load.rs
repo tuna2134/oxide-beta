@@ -1,5 +1,7 @@
 use oxide_torch::Device;
 use oxide_torch::models::gemma4::{Gemma4ForCausalLM, Gemma4Tokenizer};
+#[cfg(feature = "cuda")]
+use oxide_torch::models::gemma4::{GenerationConfig, sample_token};
 
 #[allow(clippy::too_many_lines)]
 fn main() -> oxide_torch::Result<()> {
@@ -106,7 +108,7 @@ fn main() -> oxide_torch::Result<()> {
             }
         }
         println!("CUDA persistent KV cache smoke: sequence={}", cache.len());
-        let cache_table = cuda.new_cache_table(model.config(), token_ids.len() + 128)?;
+        let mut cache_table = cuda.new_cache_table(model.config(), token_ids.len() + 128)?;
         println!(
             "CUDA 35-layer cache table: layers={} physical={} shared={} last_source={:?}",
             cache_table.layer_count(),
@@ -114,6 +116,21 @@ fn main() -> oxide_torch::Result<()> {
             cache_table.shared_layer_count(),
             cache_table.source_layer(model.config().num_hidden_layers - 1),
         );
+        if std::env::var_os("GEMMA4_DECODE").is_some() {
+            let mut logits = Vec::new();
+            for (index, &token) in token_ids.iter().enumerate() {
+                logits = cuda.decode_token(token, model.config(), &mut cache_table)?;
+                eprintln!("Gemma4 prefill: {}/{}", index + 1, token_ids.len());
+            }
+            let generation = GenerationConfig::default();
+            let mut random = generation.seed;
+            let next = sample_token(&logits, &generation, &mut random)?;
+            println!("CUDA 35-layer next_token={next}");
+            println!(
+                "CUDA 35-layer decoded={:?}",
+                tokenizer.decode(&[next], true)?
+            );
+        }
     }
     Ok(())
 }

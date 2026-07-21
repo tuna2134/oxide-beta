@@ -46,6 +46,7 @@ impl Gemma4CudaKvCache {
 pub struct Gemma4CudaCacheTable {
     layers: Vec<Option<Gemma4CudaKvCache>>,
     sources: Vec<usize>,
+    position: usize,
 }
 
 impl Gemma4CudaCacheTable {
@@ -447,7 +448,11 @@ impl Gemma4CudaState {
                 sources.push(source);
             }
         }
-        Ok(Gemma4CudaCacheTable { layers, sources })
+        Ok(Gemma4CudaCacheTable {
+            layers,
+            sources,
+            position: 0,
+        })
     }
 
     fn append_kv(
@@ -734,6 +739,145 @@ impl Gemma4CudaState {
             cache.capacity,
         )?;
         attended.to_host_vec(&self.stream).map_err(cuda_error)
+    }
+
+    fn decoder_mlp(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        layer: usize,
+        epsilon: f32,
+    ) -> Result<DeviceBuffer<f32>> {
+        let prefix = format!("layers.{layer}");
+        let normalized = self.rms_norm(
+            hidden,
+            &format!("{prefix}.pre_feedforward_layernorm.weight"),
+            epsilon,
+        )?;
+        let gate = self.linear(&normalized, 1, &format!("{prefix}.mlp.gate_proj.weight"))?;
+        let up = self.linear(&normalized, 1, &format!("{prefix}.mlp.up_proj.weight"))?;
+        let activated = self.gelu_mul(&gate, &up)?;
+        let down = self.linear(&activated, 1, &format!("{prefix}.mlp.down_proj.weight"))?;
+        let down = self.rms_norm(
+            &down,
+            &format!("{prefix}.post_feedforward_layernorm.weight"),
+            epsilon,
+        )?;
+        self.add(hidden, &down)
+    }
+
+    fn decoder_attention(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        layer: usize,
+        config: &Gemma4TextConfig,
+        table: &mut Gemma4CudaCacheTable,
+    ) -> Result<DeviceBuffer<f32>> {
+        let prefix = format!("layers.{layer}");
+        let normalized = self.rms_norm(
+            hidden,
+            &format!("{prefix}.input_layernorm.weight"),
+            config.rms_norm_eps,
+        )?;
+        let layer_type = &config
+            .layer_types
+            .as_ref()
+            .ok_or_else(|| Error::Execution("Gemma 4 layer_types are missing".into()))?[layer];
+        let sliding = layer_type == "sliding_attention";
+        let head_dim = if sliding {
+            config.head_dim
+        } else {
+            config.global_head_dim
+        };
+        let query = self.linear(&normalized, 1, &format!("{prefix}.self_attn.q_proj.weight"))?;
+        let query = self.rms_norm(
+            &query,
+            &format!("{prefix}.self_attn.q_norm.weight"),
+            config.rms_norm_eps,
+        )?;
+        let query = self.rope(
+            &query,
+            config.num_attention_heads,
+            head_dim,
+            table.position,
+            10_000.0,
+        )?;
+        let source = table.sources[layer];
+        if source == layer {
+            let key = self.linear(&normalized, 1, &format!("{prefix}.self_attn.k_proj.weight"))?;
+            let value =
+                self.linear(&normalized, 1, &format!("{prefix}.self_attn.v_proj.weight"))?;
+            let key = self.rms_norm(
+                &key,
+                &format!("{prefix}.self_attn.k_norm.weight"),
+                config.rms_norm_eps,
+            )?;
+            let cache = table.layers[layer]
+                .as_mut()
+                .ok_or_else(|| Error::Execution(format!("layer {layer} cache is missing")))?;
+            let key = self.rope(&key, cache.kv_heads, head_dim, table.position, 10_000.0)?;
+            let value = self.rms_norm_unit(&value, head_dim, config.rms_norm_eps)?;
+            self.append_kv(cache, &key, &value)?;
+        }
+        let cache = table.layers[source]
+            .as_ref()
+            .ok_or_else(|| Error::Execution(format!("source cache {source} is missing")))?;
+        let attended = self.gqa(
+            &query,
+            &cache.key,
+            &cache.value,
+            config.num_attention_heads,
+            cache.kv_heads,
+            head_dim,
+            cache.len,
+            if sliding { config.sliding_window } else { 0 },
+            cache.start,
+            cache.capacity,
+        )?;
+        let projected = self.linear(&attended, 1, &format!("{prefix}.self_attn.o_proj.weight"))?;
+        let projected = self.rms_norm(
+            &projected,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            config.rms_norm_eps,
+        )?;
+        self.add(hidden, &projected)
+    }
+
+    /// Runs one autoregressive token through all 35 decoder layers.
+    ///
+    /// The supplied cache table is updated in place and reused by subsequent
+    /// calls. Returned logits are copied once after the tied LM head.
+    pub fn decode_token(
+        &self,
+        token: u32,
+        config: &Gemma4TextConfig,
+        table: &mut Gemma4CudaCacheTable,
+    ) -> Result<Vec<f32>> {
+        let mut hidden = self.embedding(token, config.hidden_size)?;
+        for layer in 0..config.num_hidden_layers {
+            hidden = self.decoder_attention(&hidden, layer, config, table)?;
+            hidden = self.decoder_mlp(&hidden, layer, config.rms_norm_eps)?;
+        }
+        hidden = self.rms_norm(&hidden, "norm.weight", config.rms_norm_eps)?;
+        table.position += 1;
+        let embedding = self.weight("embed_tokens.weight")?;
+        let hidden_bf16 = self.to_bf16(&hidden)?;
+        let mut logits = self.output_f32(config.vocab_size)?;
+        self.cublas.linear_bf16_f32(
+            &self.stream,
+            1,
+            config.vocab_size,
+            config.hidden_size,
+            &hidden_bf16,
+            &embedding.buffer,
+            &mut logits,
+        )?;
+        let mut logits = logits.to_host_vec(&self.stream).map_err(cuda_error)?;
+        if let Some(cap) = config.final_logit_softcapping {
+            for logit in &mut logits {
+                *logit = (*logit / cap).tanh() * cap;
+            }
+        }
+        Ok(logits)
     }
 }
 
