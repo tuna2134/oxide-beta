@@ -1028,7 +1028,10 @@ pub(crate) mod kernels {
             } else {
                 dimension - half
             };
-            let exponent = -((2 * frequency_index) as f32) / rotary_dim as f32;
+            // Proportional RoPE may rotate only a prefix of the frequency
+            // lanes, but Transformers still divides the exponent by the full
+            // head dimension (e.g. 512, not the 128 rotated dimensions).
+            let exponent = -((2 * frequency_index) as f32) / head_dim as f32;
             let frequency = core::intrinsics::powf32(theta, exponent) / factor;
             let angle = (position_offset + token) as f32 * frequency;
             let rotated = if dimension < half {
