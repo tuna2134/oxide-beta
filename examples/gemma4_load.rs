@@ -51,6 +51,19 @@ fn main() -> oxide_torch::Result<()> {
             "CUDA BF16 cuBLAS smoke: logits={} max={maximum:.4}",
             logits.len()
         );
+        let mlp = cuda.decoder_mlp_smoke(
+            *token_ids
+                .last()
+                .ok_or_else(|| oxide_torch::Error::Execution("empty prompt".into()))?,
+            0,
+            model.config().hidden_size,
+            model.config().rms_norm_eps,
+        )?;
+        let maximum = mlp.iter().map(|value| value.abs()).fold(0.0_f32, f32::max);
+        println!(
+            "CUDA decoder layer 0 MLP smoke: hidden={} abs_max={maximum:.4}",
+            mlp.len()
+        );
     }
     Ok(())
 }

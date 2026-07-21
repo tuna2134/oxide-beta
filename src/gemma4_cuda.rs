@@ -126,11 +126,7 @@ impl Gemma4CudaState {
         Ok(LaunchConfig::for_num_elems(len as u32))
     }
 
-    /// Executes tied-embedding LM-head projection for one token.
-    ///
-    /// This is also a runtime validation of the persistent BF16 store and the
-    /// dynamically loaded cuBLAS BF16 GEMM ABI.
-    pub fn embedding_logits(&self, token: u32, hidden_size: usize) -> Result<Vec<f32>> {
+    fn embedding(&self, token: u32, hidden_size: usize) -> Result<DeviceBuffer<f32>> {
         let embedding = self.weight("embed_tokens.weight")?;
         if embedding.shape.len() != 2 || embedding.shape[1] != hidden_size {
             return Err(Error::InvalidShape(format!(
@@ -147,8 +143,7 @@ impl Gemma4CudaState {
         let mut hidden = self.output_f32(hidden_size)?;
         #[allow(clippy::cast_precision_loss)]
         let scale = (hidden_size as f32).sqrt();
-        // SAFETY: token bounds and `[vocab, hidden]` shape were checked and
-        // output has exactly `hidden_size` elements.
+        // SAFETY: bounds and output extent were validated above.
         unsafe {
             self.module.gemma_bf16_to_f32_scaled(
                 &self.stream,
@@ -160,17 +155,153 @@ impl Gemma4CudaState {
             )
         }
         .map_err(cuda_error)?;
-        let mut hidden_bf16 = self.output_bf16(hidden_size)?;
-        // SAFETY: input/output lengths are equal and allocations are disjoint.
+        Ok(hidden)
+    }
+
+    fn to_bf16(&self, input: &DeviceBuffer<f32>) -> Result<DeviceBuffer<u16>> {
+        let mut output = self.output_bf16(input.len())?;
+        // SAFETY: input/output have equal lengths and are disjoint.
         unsafe {
             self.module.gemma_f32_to_bf16(
                 &self.stream,
-                Self::launch_config(hidden_size)?,
-                &hidden,
-                &mut hidden_bf16,
+                Self::launch_config(input.len())?,
+                input,
+                &mut output,
             )
         }
         .map_err(cuda_error)?;
+        Ok(output)
+    }
+
+    fn rms_norm(
+        &self,
+        input: &DeviceBuffer<f32>,
+        weight_name: &str,
+        epsilon: f32,
+    ) -> Result<DeviceBuffer<f32>> {
+        let weight = self.weight(weight_name)?;
+        let hidden = *weight
+            .shape
+            .first()
+            .filter(|_| weight.shape.len() == 1)
+            .ok_or_else(|| Error::InvalidShape(format!("{weight_name} is not one-dimensional")))?;
+        if input.len() % hidden != 0 {
+            return Err(Error::InvalidShape(format!(
+                "{weight_name} does not match its RMSNorm input"
+            )));
+        }
+        let mut output = self.output_f32(input.len())?;
+        // SAFETY: the kernel indexes weight by column modulo `hidden`; input
+        // consists of complete rows and output has the same extent.
+        unsafe {
+            self.module.gemma_rms_norm(
+                &self.stream,
+                Self::launch_config(input.len())?,
+                hidden,
+                epsilon,
+                input,
+                &weight.buffer,
+                &mut output,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
+    fn linear(
+        &self,
+        input: &DeviceBuffer<f32>,
+        rows: usize,
+        weight_name: &str,
+    ) -> Result<DeviceBuffer<f32>> {
+        let weight = self.weight(weight_name)?;
+        if weight.shape.len() != 2 {
+            return Err(Error::InvalidShape(format!(
+                "{weight_name} is not a matrix"
+            )));
+        }
+        let (output_width, input_width) = (weight.shape[0], weight.shape[1]);
+        if input.len() != rows * input_width {
+            return Err(Error::InvalidShape(format!(
+                "{weight_name} input has {} elements, expected {}",
+                input.len(),
+                rows * input_width
+            )));
+        }
+        let input_bf16 = self.to_bf16(input)?;
+        let mut output = self.output_f32(rows * output_width)?;
+        self.cublas.linear_bf16_f32(
+            &self.stream,
+            rows,
+            output_width,
+            input_width,
+            &input_bf16,
+            &weight.buffer,
+            &mut output,
+        )?;
+        Ok(output)
+    }
+
+    fn gelu_mul(
+        &self,
+        gate: &DeviceBuffer<f32>,
+        up: &DeviceBuffer<f32>,
+    ) -> Result<DeviceBuffer<f32>> {
+        if gate.len() != up.len() {
+            return Err(Error::InvalidShape("GELU gate/up length mismatch".into()));
+        }
+        let mut output = self.output_f32(gate.len())?;
+        // SAFETY: both inputs and output have equal extents and are disjoint.
+        unsafe {
+            self.module.gemma_gelu_mul(
+                &self.stream,
+                Self::launch_config(gate.len())?,
+                gate,
+                up,
+                &mut output,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
+    fn add(
+        &self,
+        left: &DeviceBuffer<f32>,
+        right: &DeviceBuffer<f32>,
+    ) -> Result<DeviceBuffer<f32>> {
+        if left.len() != right.len() {
+            return Err(Error::InvalidShape("residual length mismatch".into()));
+        }
+        let mut output = self.output_f32(left.len())?;
+        // SAFETY: both inputs and output have equal extents and are disjoint.
+        unsafe {
+            self.module.gemma_add(
+                &self.stream,
+                Self::launch_config(left.len())?,
+                left,
+                right,
+                &mut output,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
+    /// Executes tied-embedding LM-head projection for one token.
+    ///
+    /// This is also a runtime validation of the persistent BF16 store and the
+    /// dynamically loaded cuBLAS BF16 GEMM ABI.
+    pub fn embedding_logits(&self, token: u32, hidden_size: usize) -> Result<Vec<f32>> {
+        let embedding = self.weight("embed_tokens.weight")?;
+        if embedding.shape.len() != 2 || embedding.shape[1] != hidden_size {
+            return Err(Error::InvalidShape(format!(
+                "embed_tokens.weight has unexpected shape {:?}",
+                embedding.shape
+            )));
+        }
+        let hidden = self.embedding(token, hidden_size)?;
+        let hidden_bf16 = self.to_bf16(&hidden)?;
         let mut logits = self.output_f32(embedding.shape[0])?;
         self.cublas.linear_bf16_f32(
             &self.stream,
@@ -182,6 +313,34 @@ impl Gemma4CudaState {
             &mut logits,
         )?;
         logits.to_host_vec(&self.stream).map_err(cuda_error)
+    }
+
+    /// Runs the complete dense MLP residual branch for one decoder layer.
+    pub fn decoder_mlp_smoke(
+        &self,
+        token: u32,
+        layer: usize,
+        hidden_size: usize,
+        epsilon: f32,
+    ) -> Result<Vec<f32>> {
+        let hidden = self.embedding(token, hidden_size)?;
+        let prefix = format!("layers.{layer}");
+        let normalized = self.rms_norm(
+            &hidden,
+            &format!("{prefix}.pre_feedforward_layernorm.weight"),
+            epsilon,
+        )?;
+        let gate = self.linear(&normalized, 1, &format!("{prefix}.mlp.gate_proj.weight"))?;
+        let up = self.linear(&normalized, 1, &format!("{prefix}.mlp.up_proj.weight"))?;
+        let activated = self.gelu_mul(&gate, &up)?;
+        let down = self.linear(&activated, 1, &format!("{prefix}.mlp.down_proj.weight"))?;
+        let down = self.rms_norm(
+            &down,
+            &format!("{prefix}.post_feedforward_layernorm.weight"),
+            epsilon,
+        )?;
+        let output = self.add(&hidden, &down)?;
+        output.to_host_vec(&self.stream).map_err(cuda_error)
     }
 }
 
