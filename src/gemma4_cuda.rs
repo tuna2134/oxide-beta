@@ -99,6 +99,27 @@ impl Gemma4CudaState {
         );
         Ok(())
     }
+
+    fn trace_weight_fingerprint(&self, label: &str, name: &str, enabled: bool) -> Result<()> {
+        if !enabled {
+            return Ok(());
+        }
+        let weight = self.weight(name)?;
+        let mut value = self.output_f32(weight.buffer.len())?;
+        // SAFETY: output has exactly the same extent as the BF16 weight.
+        unsafe {
+            self.module.gemma_bf16_to_f32_scaled(
+                &self.stream,
+                Self::launch_config(weight.buffer.len())?,
+                0,
+                1.0,
+                &weight.buffer,
+                &mut value,
+            )
+        }
+        .map_err(cuda_error)?;
+        self.trace_fingerprint(label, &value, true)
+    }
     pub(crate) fn load(model: &Gemma4ForCausalLM, device: usize) -> Result<Self> {
         let context = CudaContext::new(device).map_err(cuda_error)?;
         let stream = context.default_stream();
@@ -643,6 +664,33 @@ impl Gemma4CudaState {
         Ok(output)
     }
 
+    fn scale_by_weight(
+        &self,
+        input: &DeviceBuffer<f32>,
+        weight_name: &str,
+    ) -> Result<DeviceBuffer<f32>> {
+        let weight = self.weight(weight_name)?;
+        if weight.buffer.len() != 1 {
+            return Err(Error::InvalidShape(format!(
+                "{weight_name} must contain one scalar"
+            )));
+        }
+        let mut output = self.output_f32(input.len())?;
+        // SAFETY: the scalar weight contains one element and output has the
+        // same extent as input.
+        unsafe {
+            self.module.gemma_mul_bf16_scalar(
+                &self.stream,
+                Self::launch_config(input.len())?,
+                input,
+                &weight.buffer,
+                &mut output,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
     fn slice(
         &self,
         input: &DeviceBuffer<f32>,
@@ -955,11 +1003,19 @@ impl Gemma4CudaState {
         table: &mut Gemma4CudaCacheTable,
     ) -> Result<DeviceBuffer<f32>> {
         let prefix = format!("layers.{layer}");
+        let trace =
+            std::env::var_os("GEMMA4_TRACE_LAYERS").is_some() && table.position == 0 && layer == 0;
         let normalized = self.rms_norm(
             hidden,
             &format!("{prefix}.input_layernorm.weight"),
             config.rms_norm_eps,
         )?;
+        self.trace_weight_fingerprint(
+            "layer.0.input_norm.weight",
+            &format!("{prefix}.input_layernorm.weight"),
+            trace,
+        )?;
+        self.trace_fingerprint("layer.0.input_norm", &normalized, trace)?;
         let layer_type = &config
             .layer_types
             .as_ref()
@@ -983,6 +1039,7 @@ impl Gemma4CudaState {
             &format!("{prefix}.self_attn.q_norm.weight"),
             config.rms_norm_eps,
         )?;
+        self.trace_fingerprint("layer.0.query_norm", &query, trace)?;
         let query = self.rope(
             &query,
             config.num_attention_heads,
@@ -1015,6 +1072,7 @@ impl Gemma4CudaState {
                 rope.factor,
             )?;
             let value = self.rms_norm_unit(&value, head_dim, config.rms_norm_eps)?;
+            self.trace_fingerprint("layer.0.value_norm", &value, trace)?;
             self.append_kv(cache, &key, &value)?;
         }
         let cache = table.layers[source]
@@ -1032,13 +1090,23 @@ impl Gemma4CudaState {
             cache.start,
             cache.capacity,
         )?;
+        self.trace_fingerprint("layer.0.attended", &attended, trace)?;
         let projected = self.linear(&attended, 1, &format!("{prefix}.self_attn.o_proj.weight"))?;
+        self.trace_fingerprint("layer.0.attention_raw", &projected, trace)?;
         let projected = self.rms_norm(
             &projected,
             &format!("{prefix}.post_attention_layernorm.weight"),
             config.rms_norm_eps,
         )?;
-        self.add(hidden, &projected)
+        self.trace_weight_fingerprint(
+            "layer.0.attention_norm.weight",
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            trace,
+        )?;
+        self.trace_fingerprint("layer.0.attention_norm", &projected, trace)?;
+        let output = self.add(hidden, &projected)?;
+        self.trace_fingerprint("layer.0.attention_residual", &output, trace)?;
+        Ok(output)
     }
 
     /// Runs one autoregressive token through all 35 decoder layers.
@@ -1065,6 +1133,8 @@ impl Gemma4CudaState {
                 hidden = self.apply_ple(&hidden, ple, layer, config)?;
                 self.trace_fingerprint(&format!("layer.{layer}.ple"), &hidden, trace)?;
             }
+            hidden = self.scale_by_weight(&hidden, &format!("layers.{layer}.layer_scalar"))?;
+            self.trace_fingerprint(&format!("layer.{layer}.scaled"), &hidden, trace)?;
             self.trace_fingerprint(&format!("layer.{layer}"), &hidden, trace)?;
         }
         hidden = self.rms_norm(&hidden, "norm.weight", config.rms_norm_eps)?;

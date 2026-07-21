@@ -890,6 +890,20 @@ pub(crate) mod kernels {
     }
 
     #[kernel]
+    pub fn gemma_mul_bf16_scalar(
+        input: &[f32],
+        scalar_bf16: &[u16],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            let scalar = f32::from_bits((scalar_bf16[0] as u32) << 16);
+            *value = input[raw] * scalar;
+        }
+    }
+
+    #[kernel]
     pub fn gemma_bf16_to_f32_scaled(
         offset: usize,
         scale: f32,

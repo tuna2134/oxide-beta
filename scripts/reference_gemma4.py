@@ -33,7 +33,7 @@ def main():
     text = f"<start_of_turn>user\n{args.prompt}<end_of_turn>\n<start_of_turn>model\n"
     encoded = tokenizer(text, return_tensors="pt", add_special_tokens=True)
     model = AutoModelForImageTextToText.from_pretrained(
-        args.model_dir, torch_dtype=torch.bfloat16, device_map="cuda"
+        args.model_dir, dtype=torch.bfloat16, device_map="cuda"
     ).eval()
     language = model.model.language_model
     handles = []
