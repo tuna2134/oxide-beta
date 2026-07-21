@@ -64,6 +64,26 @@ fn main() -> oxide_torch::Result<()> {
             "CUDA decoder layer 0 MLP smoke: hidden={} abs_max={maximum:.4}",
             mlp.len()
         );
+        let attention = cuda.decoder_attention_smoke(
+            *token_ids
+                .last()
+                .ok_or_else(|| oxide_torch::Error::Execution("empty prompt".into()))?,
+            0,
+            model.config().hidden_size,
+            model.config().num_attention_heads,
+            model.config().num_key_value_heads,
+            model.config().head_dim,
+            model.config().rms_norm_eps,
+            model.config().sliding_window,
+        )?;
+        let maximum = attention
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f32, f32::max);
+        println!(
+            "CUDA decoder layer 0 attention smoke: hidden={} abs_max={maximum:.4}",
+            attention.len()
+        );
     }
     Ok(())
 }

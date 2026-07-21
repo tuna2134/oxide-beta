@@ -867,6 +867,29 @@ pub(crate) mod kernels {
     }
 
     #[kernel]
+    pub fn gemma_rms_norm_unit(
+        hidden: usize,
+        epsilon: f32,
+        input: &[f32],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            let row = raw / hidden;
+            let mut square_sum = 0.0;
+            let mut offset = 0;
+            while offset < hidden {
+                let x = input[row * hidden + offset];
+                square_sum += x * x;
+                offset += 1;
+            }
+            let scale = 1.0 / core::intrinsics::sqrtf32(square_sum / hidden as f32 + epsilon);
+            *value = input[raw] * scale;
+        }
+    }
+
+    #[kernel]
     pub fn gemma_bf16_to_f32_scaled(
         offset: usize,
         scale: f32,

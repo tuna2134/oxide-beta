@@ -208,6 +208,103 @@ impl Gemma4CudaState {
         Ok(output)
     }
 
+    fn rms_norm_unit(
+        &self,
+        input: &DeviceBuffer<f32>,
+        hidden: usize,
+        epsilon: f32,
+    ) -> Result<DeviceBuffer<f32>> {
+        if hidden == 0 || input.len() % hidden != 0 {
+            return Err(Error::InvalidShape("unit RMSNorm shape mismatch".into()));
+        }
+        let mut output = self.output_f32(input.len())?;
+        // SAFETY: input consists of complete rows of width `hidden` and
+        // output has the same extent.
+        unsafe {
+            self.module.gemma_rms_norm_unit(
+                &self.stream,
+                Self::launch_config(input.len())?,
+                hidden,
+                epsilon,
+                input,
+                &mut output,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
+    fn rope(
+        &self,
+        input: &DeviceBuffer<f32>,
+        heads: usize,
+        head_dim: usize,
+        position: usize,
+        theta: f32,
+    ) -> Result<DeviceBuffer<f32>> {
+        if heads == 0 || input.len() != heads * head_dim {
+            return Err(Error::InvalidShape("RoPE shape mismatch".into()));
+        }
+        let mut output = self.output_f32(input.len())?;
+        // SAFETY: the input is one complete `[heads, head_dim]` token and
+        // rotary_dim equals head_dim. Output has an identical extent.
+        unsafe {
+            self.module.gemma_rope(
+                &self.stream,
+                Self::launch_config(input.len())?,
+                heads,
+                head_dim,
+                head_dim,
+                position,
+                theta,
+                input,
+                &mut output,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gqa(
+        &self,
+        query: &DeviceBuffer<f32>,
+        key: &DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        sequence: usize,
+        window: usize,
+    ) -> Result<DeviceBuffer<f32>> {
+        if query.len() != heads * head_dim
+            || key.len() != sequence * kv_heads * head_dim
+            || value.len() != key.len()
+            || heads % kv_heads != 0
+        {
+            return Err(Error::InvalidShape("GQA shape mismatch".into()));
+        }
+        let mut output = self.output_f32(query.len())?;
+        // SAFETY: all GQA layouts and divisibility constraints were checked.
+        unsafe {
+            self.module.gemma_gqa_decode(
+                &self.stream,
+                Self::launch_config(query.len())?,
+                heads,
+                kv_heads,
+                head_dim,
+                sequence,
+                window,
+                query,
+                key,
+                value,
+                &mut output,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
     fn linear(
         &self,
         input: &DeviceBuffer<f32>,
@@ -340,6 +437,54 @@ impl Gemma4CudaState {
             epsilon,
         )?;
         let output = self.add(&hidden, &down)?;
+        output.to_host_vec(&self.stream).map_err(cuda_error)
+    }
+
+    /// Runs a one-token attention residual branch for a decoder layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decoder_attention_smoke(
+        &self,
+        token: u32,
+        layer: usize,
+        hidden_size: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        epsilon: f32,
+        window: usize,
+    ) -> Result<Vec<f32>> {
+        let hidden = self.embedding(token, hidden_size)?;
+        let prefix = format!("layers.{layer}");
+        let normalized = self.rms_norm(
+            &hidden,
+            &format!("{prefix}.input_layernorm.weight"),
+            epsilon,
+        )?;
+        let query = self.linear(&normalized, 1, &format!("{prefix}.self_attn.q_proj.weight"))?;
+        let key = self.linear(&normalized, 1, &format!("{prefix}.self_attn.k_proj.weight"))?;
+        let value = self.linear(&normalized, 1, &format!("{prefix}.self_attn.v_proj.weight"))?;
+        if query.len() != heads * head_dim || key.len() != kv_heads * head_dim {
+            return Err(Error::InvalidShape(format!(
+                "layer {layer} attention projection shape mismatch"
+            )));
+        }
+        let query = self.rms_norm(
+            &query,
+            &format!("{prefix}.self_attn.q_norm.weight"),
+            epsilon,
+        )?;
+        let key = self.rms_norm(&key, &format!("{prefix}.self_attn.k_norm.weight"), epsilon)?;
+        let value = self.rms_norm_unit(&value, head_dim, epsilon)?;
+        let query = self.rope(&query, heads, head_dim, 0, 10_000.0)?;
+        let key = self.rope(&key, kv_heads, head_dim, 0, 10_000.0)?;
+        let attended = self.gqa(&query, &key, &value, heads, kv_heads, head_dim, 1, window)?;
+        let projected = self.linear(&attended, 1, &format!("{prefix}.self_attn.o_proj.weight"))?;
+        let projected = self.rms_norm(
+            &projected,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            epsilon,
+        )?;
+        let output = self.add(&hidden, &projected)?;
         output.to_host_vec(&self.stream).map_err(cuda_error)
     }
 }
