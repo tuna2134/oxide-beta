@@ -925,6 +925,17 @@ pub(crate) mod kernels {
     }
 
     #[kernel]
+    pub fn gemma_cache_write(offset: usize, input: &[f32], mut cache: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if raw < input.len() {
+            // SAFETY: the host checks the destination extent and every
+            // thread writes one unique cache element.
+            unsafe { *cache.get_unchecked_mut(offset + raw) = input[raw] };
+        }
+    }
+
+    #[kernel]
     pub fn gemma_gelu_mul(gate: &[f32], up: &[f32], mut output: DisjointSlice<f32>) {
         let index = thread::index_1d();
         let raw = index.get();
@@ -992,6 +1003,8 @@ pub(crate) mod kernels {
         head_dim: usize,
         sequence: usize,
         window: usize,
+        cache_start: usize,
+        cache_capacity: usize,
         query: &[f32],
         key_cache: &[f32],
         value_cache: &[f32],
@@ -1014,8 +1027,9 @@ pub(crate) mod kernels {
                 let mut score = 0.0;
                 let mut inner = 0;
                 while inner < head_dim {
+                    let physical = (cache_start + position) % cache_capacity;
                     score += query[head * head_dim + inner]
-                        * key_cache[(position * kv_heads + kv_head) * head_dim + inner];
+                        * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
                     inner += 1;
                 }
                 if score > maximum {
@@ -1030,14 +1044,16 @@ pub(crate) mod kernels {
                 let mut score = 0.0;
                 let mut inner = 0;
                 while inner < head_dim {
+                    let physical = (cache_start + position) % cache_capacity;
                     score += query[head * head_dim + inner]
-                        * key_cache[(position * kv_heads + kv_head) * head_dim + inner];
+                        * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
                     inner += 1;
                 }
                 let probability = core::intrinsics::expf32(score - maximum);
                 normalizer += probability;
+                let physical = (cache_start + position) % cache_capacity;
                 weighted += probability
-                    * value_cache[(position * kv_heads + kv_head) * head_dim + dimension];
+                    * value_cache[(physical * kv_heads + kv_head) * head_dim + dimension];
                 position += 1;
             }
             *value = weighted / normalizer;

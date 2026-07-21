@@ -1,6 +1,7 @@
 use oxide_torch::Device;
 use oxide_torch::models::gemma4::{Gemma4ForCausalLM, Gemma4Tokenizer};
 
+#[allow(clippy::too_many_lines)]
 fn main() -> oxide_torch::Result<()> {
     let directory = std::env::args_os().nth(1).ok_or_else(|| {
         oxide_torch::Error::Execution(
@@ -84,6 +85,27 @@ fn main() -> oxide_torch::Result<()> {
             "CUDA decoder layer 0 attention smoke: hidden={} abs_max={maximum:.4}",
             attention.len()
         );
+        let mut cache = cuda.new_kv_cache(
+            model.config().num_key_value_heads,
+            model.config().head_dim,
+            model.config().sliding_window,
+        )?;
+        for &token in token_ids.iter().rev().take(2).rev() {
+            let output = cuda.cached_attention_smoke(
+                token,
+                0,
+                model.config().hidden_size,
+                model.config().num_attention_heads,
+                model.config().rms_norm_eps,
+                &mut cache,
+            )?;
+            if output.iter().any(|value| !value.is_finite()) {
+                return Err(oxide_torch::Error::Execution(
+                    "cached attention produced a non-finite value".into(),
+                ));
+            }
+        }
+        println!("CUDA persistent KV cache smoke: sequence={}", cache.len());
     }
     Ok(())
 }

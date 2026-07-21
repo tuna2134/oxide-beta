@@ -18,6 +18,30 @@ struct CudaWeight {
     buffer: DeviceBuffer<u16>,
 }
 
+/// Persistent fixed-allocation ring buffer for autoregressive K/V state.
+pub struct Gemma4CudaKvCache {
+    key: DeviceBuffer<f32>,
+    value: DeviceBuffer<f32>,
+    kv_heads: usize,
+    head_dim: usize,
+    capacity: usize,
+    start: usize,
+    len: usize,
+    total_seen: usize,
+}
+
+impl Gemma4CudaKvCache {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 pub struct Gemma4CudaState {
     pub(crate) _context: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
@@ -276,11 +300,15 @@ impl Gemma4CudaState {
         head_dim: usize,
         sequence: usize,
         window: usize,
+        cache_start: usize,
+        cache_capacity: usize,
     ) -> Result<DeviceBuffer<f32>> {
         if query.len() != heads * head_dim
-            || key.len() != sequence * kv_heads * head_dim
+            || key.len() != cache_capacity * kv_heads * head_dim
             || value.len() != key.len()
             || heads % kv_heads != 0
+            || cache_capacity == 0
+            || cache_start >= cache_capacity
         {
             return Err(Error::InvalidShape("GQA shape mismatch".into()));
         }
@@ -295,6 +323,8 @@ impl Gemma4CudaState {
                 head_dim,
                 sequence,
                 window,
+                cache_start,
+                cache_capacity,
                 query,
                 key,
                 value,
@@ -303,6 +333,80 @@ impl Gemma4CudaState {
         }
         .map_err(cuda_error)?;
         Ok(output)
+    }
+
+    /// Allocates a reusable ring-buffer KV cache.
+    pub fn new_kv_cache(
+        &self,
+        kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+    ) -> Result<Gemma4CudaKvCache> {
+        let elements = capacity
+            .checked_mul(kv_heads)
+            .and_then(|value| value.checked_mul(head_dim))
+            .ok_or_else(|| Error::InvalidShape("KV cache size overflow".into()))?;
+        if elements == 0 {
+            return Err(Error::InvalidShape("zero-sized KV cache".into()));
+        }
+        Ok(Gemma4CudaKvCache {
+            key: DeviceBuffer::zeroed(&self.stream, elements).map_err(cuda_error)?,
+            value: DeviceBuffer::zeroed(&self.stream, elements).map_err(cuda_error)?,
+            kv_heads,
+            head_dim,
+            capacity,
+            start: 0,
+            len: 0,
+            total_seen: 0,
+        })
+    }
+
+    fn append_kv(
+        &self,
+        cache: &mut Gemma4CudaKvCache,
+        key: &DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let width = cache.kv_heads * cache.head_dim;
+        if key.len() != width || value.len() != width {
+            return Err(Error::InvalidShape("KV cache append shape mismatch".into()));
+        }
+        let position = if cache.len < cache.capacity {
+            (cache.start + cache.len) % cache.capacity
+        } else {
+            cache.start
+        };
+        let offset = position * width;
+        // SAFETY: one complete cache position is in bounds and allocations
+        // are disjoint.
+        unsafe {
+            self.module.gemma_cache_write(
+                &self.stream,
+                Self::launch_config(width)?,
+                offset,
+                key,
+                &mut cache.key,
+            )
+        }
+        .map_err(cuda_error)?;
+        // SAFETY: same invariant for the separate value allocation.
+        unsafe {
+            self.module.gemma_cache_write(
+                &self.stream,
+                Self::launch_config(width)?,
+                offset,
+                value,
+                &mut cache.value,
+            )
+        }
+        .map_err(cuda_error)?;
+        if cache.len < cache.capacity {
+            cache.len += 1;
+        } else {
+            cache.start = (cache.start + 1) % cache.capacity;
+        }
+        cache.total_seen += 1;
+        Ok(())
     }
 
     fn linear(
@@ -477,7 +581,9 @@ impl Gemma4CudaState {
         let value = self.rms_norm_unit(&value, head_dim, epsilon)?;
         let query = self.rope(&query, heads, head_dim, 0, 10_000.0)?;
         let key = self.rope(&key, kv_heads, head_dim, 0, 10_000.0)?;
-        let attended = self.gqa(&query, &key, &value, heads, kv_heads, head_dim, 1, window)?;
+        let attended = self.gqa(
+            &query, &key, &value, heads, kv_heads, head_dim, 1, window, 0, 1,
+        )?;
         let projected = self.linear(&attended, 1, &format!("{prefix}.self_attn.o_proj.weight"))?;
         let projected = self.rms_norm(
             &projected,
@@ -486,6 +592,59 @@ impl Gemma4CudaState {
         )?;
         let output = self.add(&hidden, &projected)?;
         output.to_host_vec(&self.stream).map_err(cuda_error)
+    }
+
+    /// Appends one token and evaluates attention against the persistent cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cached_attention_smoke(
+        &self,
+        token: u32,
+        layer: usize,
+        hidden_size: usize,
+        heads: usize,
+        epsilon: f32,
+        cache: &mut Gemma4CudaKvCache,
+    ) -> Result<Vec<f32>> {
+        let hidden = self.embedding(token, hidden_size)?;
+        let prefix = format!("layers.{layer}");
+        let normalized = self.rms_norm(
+            &hidden,
+            &format!("{prefix}.input_layernorm.weight"),
+            epsilon,
+        )?;
+        let query = self.linear(&normalized, 1, &format!("{prefix}.self_attn.q_proj.weight"))?;
+        let key = self.linear(&normalized, 1, &format!("{prefix}.self_attn.k_proj.weight"))?;
+        let value = self.linear(&normalized, 1, &format!("{prefix}.self_attn.v_proj.weight"))?;
+        let query = self.rms_norm(
+            &query,
+            &format!("{prefix}.self_attn.q_norm.weight"),
+            epsilon,
+        )?;
+        let key = self.rms_norm(&key, &format!("{prefix}.self_attn.k_norm.weight"), epsilon)?;
+        let value = self.rms_norm_unit(&value, cache.head_dim, epsilon)?;
+        let absolute_position = cache.total_seen;
+        let query = self.rope(&query, heads, cache.head_dim, absolute_position, 10_000.0)?;
+        let key = self.rope(
+            &key,
+            cache.kv_heads,
+            cache.head_dim,
+            absolute_position,
+            10_000.0,
+        )?;
+        self.append_kv(cache, &key, &value)?;
+        let attended = self.gqa(
+            &query,
+            &cache.key,
+            &cache.value,
+            heads,
+            cache.kv_heads,
+            cache.head_dim,
+            cache.len,
+            cache.capacity,
+            cache.start,
+            cache.capacity,
+        )?;
+        attended.to_host_vec(&self.stream).map_err(cuda_error)
     }
 }
 
