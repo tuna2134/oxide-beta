@@ -488,7 +488,7 @@ impl Gemma4Tokenizer {
     /// Returns an error when tokenization fails.
     pub fn encode_user_turn(&self, prompt: &str) -> Result<Vec<u32>> {
         self.encode(
-            &format!("<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"),
+            &format!("<|turn>user\n{}<turn|>\n<|turn>model\n", prompt.trim()),
             true,
         )
     }

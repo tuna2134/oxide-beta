@@ -175,7 +175,8 @@ fn main() -> oxide_torch::Result<()> {
             let mut random = generation.seed;
             let mut generated = Vec::with_capacity(generation.max_new_tokens);
             let mut streamed = String::new();
-            const TEXT_STOP_MARKERS: [&str; 2] = ["<end_of_turn>", "<start_of_turn>"];
+            const TEXT_STOP_MARKERS: [&str; 4] =
+                ["<turn|>", "<|turn>", "<end_of_turn>", "<start_of_turn>"];
             for index in 0..generation.max_new_tokens {
                 let mut sampling_logits = logits.clone();
                 if repetition_penalty > 1.0 {

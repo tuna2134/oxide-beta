@@ -30,8 +30,16 @@ def main():
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
-    text = f"<start_of_turn>user\n{args.prompt}<end_of_turn>\n<start_of_turn>model\n"
-    encoded = tokenizer(text, return_tensors="pt", add_special_tokens=True)
+    input_ids = tokenizer.apply_chat_template(
+        [{"role": "user", "content": args.prompt}],
+        add_generation_prompt=True,
+        tokenize=True,
+        return_tensors="pt",
+    )
+    encoded = {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+    }
     model = AutoModelForImageTextToText.from_pretrained(
         args.model_dir, dtype=torch.bfloat16, device_map="cuda"
     ).eval()
