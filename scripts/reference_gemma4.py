@@ -18,6 +18,11 @@ def fingerprint(label, tensor):
     )
 
 
+def hidden_output(output):
+    """Extract the hidden-state tensor from module outputs such as attention."""
+    return output[0] if isinstance(output, tuple) else output
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("model_dir")
@@ -36,10 +41,27 @@ def main():
 
     for index, layer in enumerate(language.layers):
         def hook(_module, _inputs, output, layer_index=index):
-            hidden = output[0] if isinstance(output, tuple) else output
-            fingerprint(f"layer.{layer_index}", hidden)
+            fingerprint(f"layer.{layer_index}", hidden_output(output))
 
         handles.append(layer.register_forward_hook(hook))
+
+    layer_zero = language.layers[0]
+    for label, module in (
+        ("layer.0.input_norm", layer_zero.input_layernorm),
+        ("layer.0.attention_raw", layer_zero.self_attn),
+        ("layer.0.attention_norm", layer_zero.post_attention_layernorm),
+        ("layer.0.pre_mlp_norm", layer_zero.pre_feedforward_layernorm),
+        ("layer.0.mlp_raw", layer_zero.mlp),
+        ("layer.0.mlp_norm", layer_zero.post_feedforward_layernorm),
+        ("layer.0.ple_norm", layer_zero.post_per_layer_input_norm),
+    ):
+        handles.append(
+            module.register_forward_hook(
+                lambda _module, _inputs, output, name=label: fingerprint(
+                    name, hidden_output(output)
+                )
+            )
+        )
 
     with torch.inference_mode():
         output = model(**{key: value.to("cuda") for key, value in encoded.items()})
