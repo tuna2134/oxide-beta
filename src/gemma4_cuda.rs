@@ -123,6 +123,7 @@ pub struct Gemma4CudaCacheTable {
     position: usize,
     decode_state: DeviceBuffer<usize>,
     decode_graph: Option<Gemma4CudaDecodeGraph>,
+    decode_graph_attempted: bool,
 }
 
 struct Gemma4CudaDecodeGraph {
@@ -1166,6 +1167,7 @@ impl Gemma4CudaState {
             position: 0,
             decode_state: DeviceBuffer::zeroed(&self.stream, 2).map_err(cuda_error)?,
             decode_graph: None,
+            decode_graph_attempted: false,
         })
     }
 
@@ -2329,6 +2331,11 @@ impl Gemma4CudaState {
         config: &Gemma4TextConfig,
         table: &mut Gemma4CudaCacheTable,
     ) -> Result<WorkspaceF32> {
+        if token as usize >= config.vocab_size {
+            return Err(Error::Execution(
+                "token id exceeds CUDA embedding vocabulary".into(),
+            ));
+        }
         self.set_decode_state(token, table)?;
         self.forward_token_state(config, table, true)
     }
@@ -2588,13 +2595,13 @@ impl Gemma4CudaState {
             .f32_pool
             .borrow_mut()
             .values_mut()
-            .flat_map(Vec::drain)
+            .flat_map(|buffers| buffers.drain(..))
             .collect();
         let fixed_bf16 = self
             .bf16_pool
             .borrow_mut()
             .values_mut()
-            .flat_map(Vec::drain)
+            .flat_map(|buffers| buffers.drain(..))
             .collect();
         Ok(Gemma4CudaDecodeGraph {
             executable,
@@ -2664,6 +2671,11 @@ impl Gemma4CudaState {
         repetition_penalty: f32,
         mark_seen: bool,
     ) -> Result<Vec<(u32, f32)>> {
+        if token as usize >= config.vocab_size {
+            return Err(Error::Execution(
+                "token id exceeds CUDA decode vocabulary".into(),
+            ));
+        }
         let top_k = top_k.clamp(1, 64).min(config.vocab_size);
         if self.seen_tokens.borrow().is_none() {
             *self.seen_tokens.borrow_mut() =
@@ -2682,6 +2694,7 @@ impl Gemma4CudaState {
         }
         if table.decode_graph.is_some() {
             table.decode_graph = None;
+            table.decode_graph_attempted = false;
         }
         if mark_seen {
             unsafe {
@@ -2738,14 +2751,24 @@ impl Gemma4CudaState {
             .zip(scores)
             .map(|(id, score)| (id as u32, score))
             .collect();
+        // Return the complete warm-up allocation set before capture. This
+        // prevents `cuMemAllocAsync` graph nodes and gives every captured
+        // operation a stable, already allocated pointer.
+        drop(final_ids);
+        drop(final_scores);
+        drop(stage_ids);
+        drop(stage_scores);
+        drop(logits);
         if std::env::var_os("GEMMA4_DISABLE_CUDA_GRAPH").is_none()
             && table.decode_graph.is_none()
+            && !table.decode_graph_attempted
             && table
                 .layers
                 .iter()
                 .flatten()
                 .all(|cache| cache.capacity <= 4096)
         {
+            table.decode_graph_attempted = true;
             match self.build_decode_graph(config, table, top_k, repetition_penalty, seen) {
                 Ok(graph) => {
                     table.decode_graph = Some(graph);

@@ -2,10 +2,11 @@
 #![allow(unsafe_code)]
 
 use crate::{Error, Result};
-use cuda_core::CudaStream;
+use cuda_core::{CudaContext, CudaStream};
 use libloading::Library;
 use std::ffi::{c_int, c_uint, c_ulonglong, c_void};
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 type CuResult = c_int;
 type CuGraph = *mut c_void;
@@ -32,6 +33,7 @@ pub(crate) struct CudaGraphExec {
     graph_destroy: GraphDestroy,
     executable_destroy: GraphExecDestroy,
     launch: GraphLaunch,
+    context: Arc<CudaContext>,
     _library: Library,
 }
 
@@ -132,11 +134,13 @@ impl CudaGraphExec {
             graph_destroy,
             executable_destroy,
             launch,
+            context: Arc::clone(stream.context()),
             _library: library,
         })
     }
 
     pub(crate) fn launch(&self, stream: &CudaStream) -> Result<()> {
+        self.context.bind_to_thread().map_err(cuda_error)?;
         // SAFETY: both handles remain live for `self` and `stream` lifetimes.
         check(
             unsafe { (self.launch)(self.executable.as_ptr(), stream.cu_stream().cast()) },
@@ -147,6 +151,9 @@ impl CudaGraphExec {
 
 impl Drop for CudaGraphExec {
     fn drop(&mut self) {
+        if self.context.bind_to_thread().is_err() {
+            return;
+        }
         // Destroy executable before its source graph. CUDA permits destroying
         // the source earlier, but this order keeps ownership straightforward.
         // SAFETY: both handles are uniquely owned and destroyed exactly once.

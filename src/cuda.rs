@@ -1347,7 +1347,11 @@ pub(crate) mod kernels {
         let raw = index.get();
         if let Some(value) = output.get_mut(index) {
             let total_seen = state[1] + 1;
-            let sequence = total_seen.min(cache_capacity);
+            let sequence = if total_seen < cache_capacity {
+                total_seen
+            } else {
+                cache_capacity
+            };
             let cache_start = if total_seen > cache_capacity {
                 total_seen % cache_capacity
             } else {
@@ -1372,7 +1376,9 @@ pub(crate) mod kernels {
                         * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
                     inner += 1;
                 }
-                maximum = maximum.max(score);
+                if score > maximum {
+                    maximum = score;
+                }
                 position += 1;
             }
             let mut normalizer = 0.0;
@@ -1498,7 +1504,11 @@ pub(crate) mod kernels {
             return;
         }
         let total_seen = state[1] + 1;
-        let sequence = total_seen.min(cache_capacity);
+        let sequence = if total_seen < cache_capacity {
+            total_seen
+        } else {
+            cache_capacity
+        };
         let cache_start = if total_seen > cache_capacity {
             total_seen % cache_capacity
         } else {
