@@ -128,13 +128,30 @@ fn main() -> oxide_torch::Result<()> {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(32);
-            let generation = GenerationConfig {
+            let mut generation = GenerationConfig {
                 max_new_tokens,
-                temperature: 1.0,
-                top_k: 1,
-                top_p: 1.0,
                 ..GenerationConfig::default()
             };
+            if let Ok(value) = std::env::var("GEMMA4_TEMPERATURE") {
+                generation.temperature = value.parse().map_err(|_| {
+                    oxide_torch::Error::Execution("invalid GEMMA4_TEMPERATURE".into())
+                })?;
+            }
+            if let Ok(value) = std::env::var("GEMMA4_TOP_K") {
+                generation.top_k = value
+                    .parse()
+                    .map_err(|_| oxide_torch::Error::Execution("invalid GEMMA4_TOP_K".into()))?;
+            }
+            if let Ok(value) = std::env::var("GEMMA4_TOP_P") {
+                generation.top_p = value
+                    .parse()
+                    .map_err(|_| oxide_torch::Error::Execution("invalid GEMMA4_TOP_P".into()))?;
+            }
+            if let Ok(value) = std::env::var("GEMMA4_SEED") {
+                generation.seed = value
+                    .parse()
+                    .map_err(|_| oxide_torch::Error::Execution("invalid GEMMA4_SEED".into()))?;
+            }
             let mut random = generation.seed;
             let mut generated = Vec::with_capacity(generation.max_new_tokens);
             for index in 0..generation.max_new_tokens {
