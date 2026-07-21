@@ -1006,10 +1006,14 @@ pub(crate) mod kernels {
         mut seen: DisjointSlice<u8>,
     ) {
         if thread::index_1d().get() == 0 {
-            state[0] = token;
-            state[1] = position;
-            if mark_seen {
-                seen[token] = 1;
+            // SAFETY: host launches one thread, state has two elements, and
+            // validated token ids are within the seen-token bitmap.
+            unsafe {
+                *state.get_unchecked_mut(0) = token;
+                *state.get_unchecked_mut(1) = position;
+                if mark_seen {
+                    *seen.get_unchecked_mut(token) = 1;
+                }
             }
         }
     }
@@ -1017,8 +1021,11 @@ pub(crate) mod kernels {
     #[kernel]
     pub fn gemma_decode_state_set(token: usize, position: usize, mut state: DisjointSlice<usize>) {
         if thread::index_1d().get() == 0 {
-            state[0] = token;
-            state[1] = position;
+            // SAFETY: host always supplies a two-element state allocation.
+            unsafe {
+                *state.get_unchecked_mut(0) = token;
+                *state.get_unchecked_mut(1) = position;
+            }
         }
     }
 
@@ -1154,7 +1161,10 @@ pub(crate) mod kernels {
         let index = thread::index_1d();
         let raw = index.get();
         if raw < width {
-            cache[(state[1] % cache_capacity) * width + raw] = input[raw];
+            let destination = (state[1] % cache_capacity) * width + raw;
+            // SAFETY: cache has `cache_capacity * width` elements and each
+            // launched thread writes one distinct `raw` destination.
+            unsafe { *cache.get_unchecked_mut(destination) = input[raw] };
         }
     }
 
