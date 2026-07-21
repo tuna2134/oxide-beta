@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cuda_module]
-mod kernels {
+pub(crate) mod kernels {
     use super::*;
 
     #[kernel]
@@ -863,6 +863,53 @@ mod kernels {
             let scale = 1.0 / core::intrinsics::sqrtf32(square_sum / hidden as f32 + epsilon);
             let weight = f32::from_bits((weight_bf16[column] as u32) << 16);
             *value = input[raw] * scale * weight;
+        }
+    }
+
+    #[kernel]
+    pub fn gemma_bf16_to_f32_scaled(
+        offset: usize,
+        scale: f32,
+        input: &[u16],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            *value = f32::from_bits((input[offset + raw] as u32) << 16) * scale;
+        }
+    }
+
+    #[kernel]
+    pub fn gemma_f32_to_bf16(input: &[f32], mut output: DisjointSlice<u16>) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            // Round-to-nearest-even before discarding the low 16 bits.
+            let bits = input[raw].to_bits();
+            let rounding_bias = 0x7fff + ((bits >> 16) & 1);
+            *value = bits.wrapping_add(rounding_bias).wrapping_shr(16) as u16;
+        }
+    }
+
+    #[kernel]
+    pub fn gemma_add(left: &[f32], right: &[f32], mut output: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            *value = left[raw] + right[raw];
+        }
+    }
+
+    #[kernel]
+    pub fn gemma_gelu_mul(gate: &[f32], up: &[f32], mut output: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            let x = gate[raw];
+            let inner = 0.797_884_6 * (x + 0.044_715 * x * x * x);
+            let gelu = 0.5 * x * (1.0 + core::intrinsics::tanhf32(inner));
+            *value = gelu * up[raw];
         }
     }
 

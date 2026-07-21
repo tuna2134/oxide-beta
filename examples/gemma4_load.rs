@@ -40,6 +40,17 @@ fn main() -> oxide_torch::Result<()> {
             cuda.weight_count(),
             cuda.weight_bytes() / (1024 * 1024),
         );
+        let logits = cuda.embedding_logits(
+            *token_ids
+                .last()
+                .ok_or_else(|| oxide_torch::Error::Execution("empty prompt".into()))?,
+            model.config().hidden_size,
+        )?;
+        let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        println!(
+            "CUDA BF16 cuBLAS smoke: logits={} max={maximum:.4}",
+            logits.len()
+        );
     }
     Ok(())
 }

@@ -32,6 +32,13 @@ unsafe_code = "warn"
 all = "warn"
 pedantic = "warn"
 
+# cuda-oxide currently lowers device code through legacy LLVM 7 NVVM IR,
+# which cannot export Rust debug metadata. Keeping debug info disabled also
+# makes an accidental non-release `cargo oxide build` usable instead of
+# failing late during PTX generation.
+[profile.dev]
+debug = 0
+
 [[example]]
 name = "mlp"
 required-features = []
