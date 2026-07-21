@@ -908,7 +908,14 @@ pub(crate) mod kernels {
         if let Some(value) = output.get_mut(index) {
             let x = gate[raw];
             let inner = 0.797_884_6 * (x + 0.044_715 * x * x * x);
-            let gelu = 0.5 * x * (1.0 + core::intrinsics::tanhf32(inner));
+            let tanh = if inner >= 0.0 {
+                let exponential = core::intrinsics::expf32(-2.0 * inner);
+                (1.0 - exponential) / (1.0 + exponential)
+            } else {
+                let exponential = core::intrinsics::expf32(2.0 * inner);
+                (exponential - 1.0) / (exponential + 1.0)
+            };
+            let gelu = 0.5 * x * (1.0 + tanh);
             *value = gelu * up[raw];
         }
     }

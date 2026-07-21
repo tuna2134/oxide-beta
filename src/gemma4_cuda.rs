@@ -159,6 +159,7 @@ impl Gemma4CudaState {
                 &mut hidden,
             )
         }
+        .map_err(cuda_error)?;
         let mut hidden_bf16 = self.output_bf16(hidden_size)?;
         // SAFETY: input/output lengths are equal and allocations are disjoint.
         unsafe {
@@ -169,6 +170,7 @@ impl Gemma4CudaState {
                 &mut hidden_bf16,
             )
         }
+        .map_err(cuda_error)?;
         let mut logits = self.output_f32(embedding.shape[0])?;
         self.cublas.linear_bf16_f32(
             &self.stream,
