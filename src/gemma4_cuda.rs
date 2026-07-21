@@ -2,7 +2,7 @@
 #![allow(unsafe_code)]
 
 use crate::cublas::Cublas;
-use crate::models::gemma4::Gemma4ForCausalLM;
+use crate::models::gemma4::{Gemma4ForCausalLM, Gemma4TextConfig};
 use crate::{Error, Result};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 use safetensors::Dtype;
@@ -39,6 +39,35 @@ impl Gemma4CudaKvCache {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+}
+
+/// Physical cache layout for all decoder layers, including Gemma 4 KV sharing.
+pub struct Gemma4CudaCacheTable {
+    layers: Vec<Option<Gemma4CudaKvCache>>,
+    sources: Vec<usize>,
+}
+
+impl Gemma4CudaCacheTable {
+    #[must_use]
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
+    #[must_use]
+    pub fn physical_cache_count(&self) -> usize {
+        self.layers.iter().filter(|cache| cache.is_some()).count()
+    }
+
+    #[must_use]
+    pub fn shared_layer_count(&self) -> usize {
+        self.layers.len() - self.physical_cache_count()
+    }
+
+    /// Returns the physical source layer used by `layer`.
+    #[must_use]
+    pub fn source_layer(&self, layer: usize) -> Option<usize> {
+        self.sources.get(layer).copied()
     }
 }
 
@@ -359,6 +388,66 @@ impl Gemma4CudaState {
             len: 0,
             total_seen: 0,
         })
+    }
+
+    /// Allocates the complete 35-layer cache table with KV sharing.
+    pub fn new_cache_table(
+        &self,
+        config: &Gemma4TextConfig,
+        max_sequence: usize,
+    ) -> Result<Gemma4CudaCacheTable> {
+        if max_sequence == 0 {
+            return Err(Error::InvalidShape("zero max_sequence".into()));
+        }
+        let layer_types = config
+            .layer_types
+            .as_ref()
+            .ok_or_else(|| Error::Execution("Gemma 4 layer_types are missing".into()))?;
+        let first_shared = config
+            .num_hidden_layers
+            .saturating_sub(config.num_kv_shared_layers);
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        let mut sources = Vec::with_capacity(config.num_hidden_layers);
+        let mut last_sliding = None;
+        let mut last_full = None;
+        for (layer, layer_type) in layer_types.iter().enumerate() {
+            let sliding = layer_type == "sliding_attention";
+            if layer < first_shared {
+                let head_dim = if sliding {
+                    config.head_dim
+                } else {
+                    config.global_head_dim
+                };
+                let capacity = if sliding {
+                    config.sliding_window.min(max_sequence)
+                } else {
+                    max_sequence
+                };
+                let kv_heads = if !sliding && config.attention_k_eq_v {
+                    config
+                        .num_global_key_value_heads
+                        .unwrap_or(config.num_key_value_heads)
+                } else {
+                    config.num_key_value_heads
+                };
+                layers.push(Some(self.new_kv_cache(kv_heads, head_dim, capacity)?));
+                sources.push(layer);
+                if sliding {
+                    last_sliding = Some(layer);
+                } else {
+                    last_full = Some(layer);
+                }
+            } else {
+                let source = if sliding { last_sliding } else { last_full }.ok_or_else(|| {
+                    Error::Execution(format!(
+                        "shared layer {layer} has no preceding {layer_type} KV source"
+                    ))
+                })?;
+                layers.push(None);
+                sources.push(source);
+            }
+        }
+        Ok(Gemma4CudaCacheTable { layers, sources })
     }
 
     fn append_kv(

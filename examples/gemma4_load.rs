@@ -106,6 +106,14 @@ fn main() -> oxide_torch::Result<()> {
             }
         }
         println!("CUDA persistent KV cache smoke: sequence={}", cache.len());
+        let cache_table = cuda.new_cache_table(model.config(), token_ids.len() + 128)?;
+        println!(
+            "CUDA 35-layer cache table: layers={} physical={} shared={} last_source={:?}",
+            cache_table.layer_count(),
+            cache_table.physical_cache_count(),
+            cache_table.shared_layer_count(),
+            cache_table.source_layer(model.config().num_hidden_layers - 1),
+        );
     }
     Ok(())
 }
