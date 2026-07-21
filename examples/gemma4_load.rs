@@ -128,7 +128,11 @@ fn main() -> oxide_torch::Result<()> {
         if std::env::var_os("GEMMA4_SKIP_DECODE").is_none() {
             let mut logits = Vec::new();
             for (index, &token) in token_ids.iter().enumerate() {
-                logits = cuda.decode_token(token, model.config(), &mut cache_table)?;
+                if index + 1 == token_ids.len() {
+                    logits = cuda.decode_token(token, model.config(), &mut cache_table)?;
+                } else {
+                    cuda.prefill_token(token, model.config(), &mut cache_table)?;
+                }
                 eprintln!("Gemma4 prefill: {}/{}", index + 1, token_ids.len());
             }
             let mut generation = GenerationConfig {
@@ -178,14 +182,13 @@ fn main() -> oxide_torch::Result<()> {
             const TEXT_STOP_MARKERS: [&str; 4] =
                 ["<turn|>", "<|turn>", "<end_of_turn>", "<start_of_turn>"];
             for index in 0..generation.max_new_tokens {
-                let mut sampling_logits = logits.clone();
                 if repetition_penalty > 1.0 {
                     let mut penalized = std::collections::HashSet::with_capacity(generated.len());
                     for &token in &generated {
                         if !penalized.insert(token) {
                             continue;
                         }
-                        if let Some(logit) = sampling_logits.get_mut(token as usize) {
+                        if let Some(logit) = logits.get_mut(token as usize) {
                             if *logit >= 0.0 {
                                 *logit /= repetition_penalty;
                             } else {
@@ -194,7 +197,7 @@ fn main() -> oxide_torch::Result<()> {
                         }
                     }
                 }
-                let next = sample_token(&sampling_logits, &generation, &mut random)?;
+                let next = sample_token(&logits, &generation, &mut random)?;
                 if generation.eos_token_ids.contains(&next) {
                     break;
                 }

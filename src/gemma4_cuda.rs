@@ -1109,16 +1109,12 @@ impl Gemma4CudaState {
         Ok(output)
     }
 
-    /// Runs one autoregressive token through all 35 decoder layers.
-    ///
-    /// The supplied cache table is updated in place and reused by subsequent
-    /// calls. Returned logits are copied once after the tied LM head.
-    pub fn decode_token(
+    fn forward_token(
         &self,
         token: u32,
         config: &Gemma4TextConfig,
         table: &mut Gemma4CudaCacheTable,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<DeviceBuffer<f32>> {
         let embedding = self.embedding(token, config.hidden_size)?;
         let packed_ple = self.packed_ple(token, &embedding, config)?;
         let mut hidden = embedding;
@@ -1137,8 +1133,33 @@ impl Gemma4CudaState {
             self.trace_fingerprint(&format!("layer.{layer}.scaled"), &hidden, trace)?;
             self.trace_fingerprint(&format!("layer.{layer}"), &hidden, trace)?;
         }
-        hidden = self.rms_norm(&hidden, "norm.weight", config.rms_norm_eps)?;
         table.position += 1;
+        Ok(hidden)
+    }
+
+    /// Prefills one token into the persistent KV cache without evaluating the
+    /// vocabulary-sized LM head. Intermediate prompt tokens do not need
+    /// logits, so this avoids a 262,144-way GEMM and D2H copy per token.
+    pub fn prefill_token(
+        &self,
+        token: u32,
+        config: &Gemma4TextConfig,
+        table: &mut Gemma4CudaCacheTable,
+    ) -> Result<()> {
+        let _hidden = self.forward_token(token, config, table)?;
+        Ok(())
+    }
+
+    /// Runs one autoregressive token through all decoder layers and evaluates
+    /// the tied LM head. Returned logits are copied to the host once.
+    pub fn decode_token(
+        &self,
+        token: u32,
+        config: &Gemma4TextConfig,
+        table: &mut Gemma4CudaCacheTable,
+    ) -> Result<Vec<f32>> {
+        let hidden = self.forward_token(token, config, table)?;
+        let hidden = self.rms_norm(&hidden, "norm.weight", config.rms_norm_eps)?;
         let embedding = self.weight("embed_tokens.weight")?;
         let hidden_bf16 = self.to_bf16(&hidden)?;
         let mut logits = self.output_f32(config.vocab_size)?;

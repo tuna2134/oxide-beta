@@ -125,8 +125,12 @@ pub fn sample_token(logits: &[f32], config: &GenerationConfig, random: &mut u64)
     if candidates.is_empty() {
         return Err(Error::Execution("all logits are non-finite".into()));
     }
+    let keep = config.top_k.max(1).min(candidates.len());
+    if keep < candidates.len() {
+        candidates.select_nth_unstable_by(keep - 1, |left, right| right.1.total_cmp(&left.1));
+        candidates.truncate(keep);
+    }
     candidates.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
-    candidates.truncate(config.top_k.max(1).min(candidates.len()));
     let maximum = candidates[0].1;
     let mut total = 0.0;
     for (_, score) in &mut candidates {
