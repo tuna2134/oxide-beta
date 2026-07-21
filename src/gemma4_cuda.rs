@@ -708,7 +708,7 @@ impl Gemma4CudaState {
                 "{weight_name} is not a matrix"
             )));
         }
-        let (output_width, input_width) = (weight.shape[0], weight.shape[1]);
+        let input_width = weight.shape[1];
         if input.len() != rows * input_width {
             return Err(Error::InvalidShape(format!(
                 "{weight_name} input has {} elements, expected {}",
@@ -746,7 +746,7 @@ impl Gemma4CudaState {
             rows,
             output_width,
             input_width,
-            &input_bf16,
+            input,
             &weight.buffer,
             &mut output,
         )?;
@@ -892,7 +892,7 @@ impl Gemma4CudaState {
         token: u32,
         embedding: &DeviceBuffer<f32>,
         config: &Gemma4TextConfig,
-    ) -> Result<Option<DeviceBuffer<f32>>> {
+    ) -> Result<Option<WorkspaceF32>> {
         let dimension = config.hidden_size_per_layer_input;
         if dimension == 0 {
             return Ok(None);

@@ -90,7 +90,7 @@ impl Cublas {
     /// Computes row-major `output[m,n] = input[m,k] * weight[n,k]^T`.
     pub(crate) fn linear_bf16_f32(
         &self,
-        stream: &CudaStream,
+        _stream: &CudaStream,
         m: usize,
         n: usize,
         k: usize,
