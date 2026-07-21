@@ -1013,6 +1013,15 @@ pub(crate) mod kernels {
     }
 
     #[kernel]
+    pub fn gemma_copy_bf16(output_offset: usize, input: &[u16], mut output: DisjointSlice<u16>) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if raw < input.len() {
+            unsafe { *output.get_unchecked_mut(output_offset + raw) = input[raw] };
+        }
+    }
+
+    #[kernel]
     pub fn gemma_add(left: &[f32], right: &[f32], mut output: DisjointSlice<f32>) {
         let index = thread::index_1d();
         let raw = index.get();

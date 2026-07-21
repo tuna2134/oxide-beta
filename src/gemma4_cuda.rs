@@ -209,6 +209,77 @@ impl Gemma4CudaState {
             })?;
             weights.insert(name, weight);
         }
+        // Qwen/tinygrad-style fused QKV projection. Gemma's first physical
+        // cache layers produce Q, K and V together; later KV-sharing layers
+        // only produce Q and therefore keep the separate projection.
+        let physical_layers = model
+            .config()
+            .num_hidden_layers
+            .saturating_sub(model.config().num_kv_shared_layers);
+        for layer in 0..physical_layers {
+            let prefix = format!("layers.{layer}.self_attn");
+            let q_name = format!("{prefix}.q_proj.weight");
+            let k_name = format!("{prefix}.k_proj.weight");
+            let v_name = format!("{prefix}.v_proj.weight");
+            let (input_width, q_width, k_width, v_width, total_elements) = {
+                let q = weights
+                    .get(&q_name)
+                    .ok_or_else(|| Error::Execution(format!("missing CUDA weight `{q_name}`")))?;
+                let k = weights
+                    .get(&k_name)
+                    .ok_or_else(|| Error::Execution(format!("missing CUDA weight `{k_name}`")))?;
+                let v = weights
+                    .get(&v_name)
+                    .ok_or_else(|| Error::Execution(format!("missing CUDA weight `{v_name}`")))?;
+                if q.shape.len() != 2
+                    || k.shape.len() != 2
+                    || v.shape.len() != 2
+                    || q.shape[1] != k.shape[1]
+                    || q.shape[1] != v.shape[1]
+                {
+                    return Err(Error::InvalidShape(format!(
+                        "layer {layer} QKV projection shapes do not match"
+                    )));
+                }
+                (
+                    q.shape[1],
+                    q.shape[0],
+                    k.shape[0],
+                    v.shape[0],
+                    q.buffer.len() + k.buffer.len() + v.buffer.len(),
+                )
+            };
+            let mut fused = unsafe {
+                DeviceBuffer::uninitialized_async(&stream, total_elements).map_err(cuda_error)?
+            };
+            let mut offset = 0;
+            for name in [&q_name, &k_name, &v_name] {
+                let weight = weights
+                    .get(name)
+                    .ok_or_else(|| Error::Execution(format!("missing CUDA weight `{name}`")))?;
+                unsafe {
+                    module.gemma_copy_bf16(
+                        &stream,
+                        Self::launch_config(weight.buffer.len())?,
+                        offset,
+                        &weight.buffer,
+                        &mut fused,
+                    )
+                }
+                .map_err(cuda_error)?;
+                offset += weight.buffer.len();
+            }
+            weights.remove(&q_name);
+            weights.remove(&k_name);
+            weights.remove(&v_name);
+            weights.insert(
+                format!("{prefix}.qkv_proj.weight"),
+                CudaWeight {
+                    shape: vec![q_width + k_width + v_width, input_width],
+                    buffer: fused,
+                },
+            );
+        }
         stream.synchronize().map_err(cuda_error)?;
         Ok(Self {
             _context: context,
@@ -836,6 +907,35 @@ impl Gemma4CudaState {
         Ok(output)
     }
 
+    fn linear_qkv_bf16(
+        &self,
+        input: &DeviceBuffer<u16>,
+        rows: usize,
+        prefix: &str,
+        query_width: usize,
+        key_width: usize,
+        value_width: usize,
+    ) -> Result<(WorkspaceF32, WorkspaceF32, WorkspaceF32)> {
+        let fused_name = format!("{prefix}.self_attn.qkv_proj.weight");
+        let fused = self.linear_bf16(input, rows, &fused_name)?;
+        let row_width = query_width + key_width + value_width;
+        if fused.len() != rows * row_width {
+            return Err(Error::InvalidShape(format!(
+                "{fused_name} output has an unexpected extent"
+            )));
+        }
+        let query = self.slice_rows(&fused, rows, row_width, 0, query_width)?;
+        let key = self.slice_rows(&fused, rows, row_width, query_width, key_width)?;
+        let value = self.slice_rows(
+            &fused,
+            rows,
+            row_width,
+            query_width + key_width,
+            value_width,
+        )?;
+        Ok((query, key, value))
+    }
+
     fn gelu_mul(&self, gate: &DeviceBuffer<f32>, up: &DeviceBuffer<f32>) -> Result<WorkspaceF32> {
         if gate.len() != up.len() {
             return Err(Error::InvalidShape("GELU gate/up length mismatch".into()));
@@ -1234,9 +1334,26 @@ impl Gemma4CudaState {
             &format!("{prefix}.input_layernorm.weight"),
             epsilon,
         )?;
-        let query = self.linear(&normalized, 1, &format!("{prefix}.self_attn.q_proj.weight"))?;
-        let key = self.linear(&normalized, 1, &format!("{prefix}.self_attn.k_proj.weight"))?;
-        let value = self.linear(&normalized, 1, &format!("{prefix}.self_attn.v_proj.weight"))?;
+        let (query, key, value) = if self
+            .weights
+            .contains_key(&format!("{prefix}.self_attn.qkv_proj.weight"))
+        {
+            let normalized = self.to_bf16(&normalized)?;
+            self.linear_qkv_bf16(
+                &normalized,
+                1,
+                &prefix,
+                heads * head_dim,
+                kv_heads * head_dim,
+                kv_heads * head_dim,
+            )?
+        } else {
+            (
+                self.linear(&normalized, 1, &format!("{prefix}.self_attn.q_proj.weight"))?,
+                self.linear(&normalized, 1, &format!("{prefix}.self_attn.k_proj.weight"))?,
+                self.linear(&normalized, 1, &format!("{prefix}.self_attn.v_proj.weight"))?,
+            )
+        };
         if query.len() != heads * head_dim || key.len() != kv_heads * head_dim {
             return Err(Error::InvalidShape(format!(
                 "layer {layer} attention projection shape mismatch"
@@ -1282,9 +1399,26 @@ impl Gemma4CudaState {
             &format!("{prefix}.input_layernorm.weight"),
             epsilon,
         )?;
-        let query = self.linear(&normalized, 1, &format!("{prefix}.self_attn.q_proj.weight"))?;
-        let key = self.linear(&normalized, 1, &format!("{prefix}.self_attn.k_proj.weight"))?;
-        let value = self.linear(&normalized, 1, &format!("{prefix}.self_attn.v_proj.weight"))?;
+        let (query, key, value) = if self
+            .weights
+            .contains_key(&format!("{prefix}.self_attn.qkv_proj.weight"))
+        {
+            let normalized = self.to_bf16(&normalized)?;
+            self.linear_qkv_bf16(
+                &normalized,
+                1,
+                &prefix,
+                heads * cache.head_dim,
+                cache.kv_heads * cache.head_dim,
+                cache.kv_heads * cache.head_dim,
+            )?
+        } else {
+            (
+                self.linear(&normalized, 1, &format!("{prefix}.self_attn.q_proj.weight"))?,
+                self.linear(&normalized, 1, &format!("{prefix}.self_attn.k_proj.weight"))?,
+                self.linear(&normalized, 1, &format!("{prefix}.self_attn.v_proj.weight"))?,
+            )
+        };
         let query = self.rms_norm(
             &query,
             &format!("{prefix}.self_attn.q_norm.weight"),
@@ -1430,8 +1564,28 @@ impl Gemma4CudaState {
             .ok_or_else(|| Error::Execution(format!("RoPE parameters for {layer_type} missing")))?;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let rotary_dim = (rope.partial_rotary_factor * head_dim as f32) as usize;
-        let query =
-            self.linear_bf16(&normalized, 1, &format!("{prefix}.self_attn.q_proj.weight"))?;
+        let source = table.sources[layer];
+        let cache_kv_heads = table.layers[source]
+            .as_ref()
+            .ok_or_else(|| Error::Execution(format!("source cache {source} is missing")))?
+            .kv_heads;
+        let (query, physical_key, physical_value) = if source == layer {
+            let (query, key, value) = self.linear_qkv_bf16(
+                &normalized,
+                1,
+                &prefix,
+                config.num_attention_heads * head_dim,
+                cache_kv_heads * head_dim,
+                cache_kv_heads * head_dim,
+            )?;
+            (query, Some(key), Some(value))
+        } else {
+            (
+                self.linear_bf16(&normalized, 1, &format!("{prefix}.self_attn.q_proj.weight"))?,
+                None,
+                None,
+            )
+        };
         let query = self.rms_norm(
             &query,
             &format!("{prefix}.self_attn.q_norm.weight"),
@@ -1447,12 +1601,13 @@ impl Gemma4CudaState {
             rope.rope_theta,
             rope.factor,
         )?;
-        let source = table.sources[layer];
         if source == layer {
-            let key =
-                self.linear_bf16(&normalized, 1, &format!("{prefix}.self_attn.k_proj.weight"))?;
-            let value =
-                self.linear_bf16(&normalized, 1, &format!("{prefix}.self_attn.v_proj.weight"))?;
+            let key = physical_key.ok_or_else(|| {
+                Error::Execution(format!("layer {layer} fused key projection is missing"))
+            })?;
+            let value = physical_value.ok_or_else(|| {
+                Error::Execution(format!("layer {layer} fused value projection is missing"))
+            })?;
             let key = self.rms_norm(
                 &key,
                 &format!("{prefix}.self_attn.k_norm.weight"),
@@ -1539,11 +1694,32 @@ impl Gemma4CudaState {
             .ok_or_else(|| Error::Execution(format!("RoPE parameters for {layer_type} missing")))?;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let rotary_dim = (rope.partial_rotary_factor * head_dim as f32) as usize;
-        let query = self.linear_bf16(
-            &normalized,
-            rows,
-            &format!("{prefix}.self_attn.q_proj.weight"),
-        )?;
+        let source = table.sources[layer];
+        let cache_kv_heads = table.layers[source]
+            .as_ref()
+            .ok_or_else(|| Error::Execution(format!("source cache {source} is missing")))?
+            .kv_heads;
+        let (query, physical_key, physical_value) = if source == layer {
+            let (query, key, value) = self.linear_qkv_bf16(
+                &normalized,
+                rows,
+                &prefix,
+                config.num_attention_heads * head_dim,
+                cache_kv_heads * head_dim,
+                cache_kv_heads * head_dim,
+            )?;
+            (query, Some(key), Some(value))
+        } else {
+            (
+                self.linear_bf16(
+                    &normalized,
+                    rows,
+                    &format!("{prefix}.self_attn.q_proj.weight"),
+                )?,
+                None,
+                None,
+            )
+        };
         let query = self.rms_norm(
             &query,
             &format!("{prefix}.self_attn.q_norm.weight"),
@@ -1558,18 +1734,13 @@ impl Gemma4CudaState {
             rope.rope_theta,
             rope.factor,
         )?;
-        let source = table.sources[layer];
         if source == layer {
-            let key = self.linear_bf16(
-                &normalized,
-                rows,
-                &format!("{prefix}.self_attn.k_proj.weight"),
-            )?;
-            let value = self.linear_bf16(
-                &normalized,
-                rows,
-                &format!("{prefix}.self_attn.v_proj.weight"),
-            )?;
+            let key = physical_key.ok_or_else(|| {
+                Error::Execution(format!("layer {layer} fused key projection is missing"))
+            })?;
+            let value = physical_value.ok_or_else(|| {
+                Error::Execution(format!("layer {layer} fused value projection is missing"))
+            })?;
             let key = self.rms_norm(
                 &key,
                 &format!("{prefix}.self_attn.k_norm.weight"),
