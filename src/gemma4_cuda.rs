@@ -2,6 +2,7 @@
 #![allow(unsafe_code)]
 
 use crate::cublas::Cublas;
+use crate::cuda_graph::CudaGraphExec;
 use crate::models::gemma4::{Gemma4ForCausalLM, Gemma4TextConfig};
 use crate::{Error, Result};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
@@ -20,6 +21,12 @@ type BufferPool<T> = Rc<RefCell<HashMap<usize, Vec<DeviceBuffer<T>>>>>;
 struct WorkspaceBuffer<T> {
     buffer: Option<DeviceBuffer<T>>,
     pool: BufferPool<T>,
+}
+
+impl<T> WorkspaceBuffer<T> {
+    fn into_inner(mut self) -> DeviceBuffer<T> {
+        self.buffer.take().expect("workspace buffer is present")
+    }
 }
 
 impl<T> Deref for WorkspaceBuffer<T> {
@@ -114,6 +121,18 @@ pub struct Gemma4CudaCacheTable {
     layers: Vec<Option<Gemma4CudaKvCache>>,
     sources: Vec<usize>,
     position: usize,
+    decode_state: DeviceBuffer<usize>,
+    decode_graph: Option<Gemma4CudaDecodeGraph>,
+}
+
+struct Gemma4CudaDecodeGraph {
+    executable: CudaGraphExec,
+    scores: DeviceBuffer<f32>,
+    ids: DeviceBuffer<f32>,
+    _fixed_f32: Vec<DeviceBuffer<f32>>,
+    _fixed_bf16: Vec<DeviceBuffer<u16>>,
+    top_k: usize,
+    repetition_penalty: f32,
 }
 
 impl Gemma4CudaCacheTable {
@@ -556,6 +575,48 @@ impl Gemma4CudaState {
         Ok(hidden)
     }
 
+    fn set_decode_state(&self, token: u32, table: &mut Gemma4CudaCacheTable) -> Result<()> {
+        unsafe {
+            self.module.gemma_decode_state_set(
+                &self.stream,
+                Self::launch_config(1)?,
+                token as usize,
+                table.position,
+                &mut table.decode_state,
+            )
+        }
+        .map_err(cuda_error)
+    }
+
+    fn embedding_state(
+        &self,
+        state: &DeviceBuffer<usize>,
+        hidden_size: usize,
+    ) -> Result<WorkspaceF32> {
+        let embedding = self.weight("embed_tokens.weight")?;
+        if embedding.shape.len() != 2 || embedding.shape[1] != hidden_size {
+            return Err(Error::InvalidShape(
+                "decode-state embedding shape mismatch".into(),
+            ));
+        }
+        let mut hidden = self.output_f32(hidden_size)?;
+        #[allow(clippy::cast_precision_loss)]
+        let scale = (hidden_size as f32).sqrt();
+        unsafe {
+            self.module.gemma_bf16_row_scaled_state(
+                &self.stream,
+                Self::launch_config(hidden_size)?,
+                hidden_size,
+                scale,
+                state,
+                &embedding.buffer,
+                &mut hidden,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(hidden)
+    }
+
     fn embedding_rows(&self, tokens: &[u32], hidden_size: usize) -> Result<WorkspaceF32> {
         let embedding = self.weight("embed_tokens.weight")?;
         if tokens.is_empty()
@@ -798,6 +859,39 @@ impl Gemma4CudaState {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn rope_state(
+        &self,
+        input: &DeviceBuffer<f32>,
+        heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        theta: f32,
+        factor: f32,
+        state: &DeviceBuffer<usize>,
+    ) -> Result<WorkspaceF32> {
+        if heads == 0 || head_dim == 0 || input.len() % (heads * head_dim) != 0 {
+            return Err(Error::InvalidShape("state RoPE shape mismatch".into()));
+        }
+        let mut output = self.output_f32(input.len())?;
+        unsafe {
+            self.module.gemma_rope_state(
+                &self.stream,
+                Self::launch_config(input.len())?,
+                heads,
+                head_dim,
+                rotary_dim,
+                theta,
+                factor,
+                state,
+                input,
+                &mut output,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn gqa(
         &self,
         query: &DeviceBuffer<f32>,
@@ -859,6 +953,70 @@ impl Gemma4CudaState {
                     window,
                     cache_start,
                     cache_capacity,
+                    query,
+                    key,
+                    value,
+                    &mut output,
+                )
+            }
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gqa_state(
+        &self,
+        query: &DeviceBuffer<f32>,
+        key: &DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        window: usize,
+        cache_capacity: usize,
+        use_block: bool,
+        state: &DeviceBuffer<usize>,
+    ) -> Result<WorkspaceF32> {
+        if query.len() != heads * head_dim
+            || key.len() != cache_capacity * kv_heads * head_dim
+            || value.len() != key.len()
+            || heads % kv_heads != 0
+            || cache_capacity == 0
+        {
+            return Err(Error::InvalidShape("state GQA shape mismatch".into()));
+        }
+        let mut output = self.output_f32(query.len())?;
+        unsafe {
+            if use_block {
+                self.module.gemma_gqa_decode_block_state(
+                    &self.stream,
+                    LaunchConfig {
+                        grid_dim: (heads as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    window,
+                    cache_capacity,
+                    state,
+                    query,
+                    key,
+                    value,
+                    &mut output,
+                )
+            } else {
+                self.module.gemma_gqa_decode_state(
+                    &self.stream,
+                    Self::launch_config(query.len())?,
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    window,
+                    cache_capacity,
+                    state,
                     query,
                     key,
                     value,
@@ -1006,6 +1164,8 @@ impl Gemma4CudaState {
             layers,
             sources,
             position: 0,
+            decode_state: DeviceBuffer::zeroed(&self.stream, 2).map_err(cuda_error)?,
+            decode_graph: None,
         })
     }
 
@@ -1055,6 +1215,45 @@ impl Gemma4CudaState {
         }
         cache.total_seen += 1;
         Ok(())
+    }
+
+    fn append_kv_state(
+        &self,
+        cache: &mut Gemma4CudaKvCache,
+        key: &DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+        state: &DeviceBuffer<usize>,
+    ) -> Result<()> {
+        let width = cache.kv_heads * cache.head_dim;
+        if key.len() != width || value.len() != width {
+            return Err(Error::InvalidShape(
+                "state KV cache append shape mismatch".into(),
+            ));
+        }
+        unsafe {
+            self.module.gemma_cache_write_state(
+                &self.stream,
+                Self::launch_config(width)?,
+                width,
+                cache.capacity,
+                state,
+                key,
+                &mut cache.key,
+            )
+        }
+        .map_err(cuda_error)?;
+        unsafe {
+            self.module.gemma_cache_write_state(
+                &self.stream,
+                Self::launch_config(width)?,
+                width,
+                cache.capacity,
+                state,
+                value,
+                &mut cache.value,
+            )
+        }
+        .map_err(cuda_error)
     }
 
     fn linear(
@@ -1410,6 +1609,52 @@ impl Gemma4CudaState {
                 Self::launch_config(packed)?,
                 token * packed,
                 token_scale,
+                &token_weight.buffer,
+                &mut token_ple,
+            )
+        }
+        .map_err(cuda_error)?;
+        let context = self.linear(embedding, 1, "per_layer_model_projection.weight")?;
+        #[allow(clippy::cast_precision_loss)]
+        let context = self.scale(&context, 1.0 / (config.hidden_size as f32).sqrt())?;
+        let context = self.rms_norm(
+            &context,
+            "per_layer_projection_norm.weight",
+            config.rms_norm_eps,
+        )?;
+        let combined = self.add(&context, &token_ple)?;
+        Ok(Some(
+            self.scale(&combined, core::f32::consts::FRAC_1_SQRT_2)?,
+        ))
+    }
+
+    fn packed_ple_state(
+        &self,
+        state: &DeviceBuffer<usize>,
+        embedding: &DeviceBuffer<f32>,
+        config: &Gemma4TextConfig,
+    ) -> Result<Option<WorkspaceF32>> {
+        let dimension = config.hidden_size_per_layer_input;
+        if dimension == 0 {
+            return Ok(None);
+        }
+        let packed = config.num_hidden_layers * dimension;
+        let token_weight = self.weight("embed_tokens_per_layer.weight")?;
+        if token_weight.shape.as_slice() != [config.vocab_size_per_layer_input, packed] {
+            return Err(Error::InvalidShape(
+                "decode-state PLE embedding shape mismatch".into(),
+            ));
+        }
+        let mut token_ple = self.output_f32(packed)?;
+        #[allow(clippy::cast_precision_loss)]
+        let token_scale = (dimension as f32).sqrt();
+        unsafe {
+            self.module.gemma_bf16_row_scaled_state(
+                &self.stream,
+                Self::launch_config(packed)?,
+                packed,
+                token_scale,
+                state,
                 &token_weight.buffer,
                 &mut token_ple,
             )
@@ -1852,14 +2097,14 @@ impl Gemma4CudaState {
         };
         let query = self.rms_norm_at(&query, plan.query_norm, config.rms_norm_eps)?;
         self.trace_fingerprint("layer.0.query_norm", &query, trace)?;
-        let query = self.rope(
+        let query = self.rope_state(
             &query,
             config.num_attention_heads,
             plan.head_dim,
             plan.rotary_dim,
-            table.position,
             plan.rope_theta,
             plan.rope_factor,
+            &table.decode_state,
         )?;
         if plan.fused_qkv {
             let key = physical_key.ok_or_else(|| {
@@ -1877,37 +2122,37 @@ impl Gemma4CudaState {
             let cache = table.layers[layer]
                 .as_mut()
                 .ok_or_else(|| Error::Execution(format!("layer {layer} cache is missing")))?;
-            let key = self.rope(
+            let key = self.rope_state(
                 &key,
                 cache.kv_heads,
                 plan.head_dim,
                 plan.rotary_dim,
-                table.position,
                 plan.rope_theta,
                 plan.rope_factor,
+                &table.decode_state,
             )?;
             let value = self.rms_norm_unit(&value, plan.head_dim, config.rms_norm_eps)?;
             self.trace_fingerprint("layer.0.value_norm", &value, trace)?;
-            self.append_kv(cache, &key, &value)?;
+            self.append_kv_state(cache, &key, &value, &table.decode_state)?;
         }
         let cache = table.layers[source]
             .as_ref()
             .ok_or_else(|| Error::Execution(format!("source cache {source} is missing")))?;
-        let attended = self.gqa(
+        let attended = self.gqa_state(
             &query,
             &cache.key,
             &cache.value,
             config.num_attention_heads,
             cache.kv_heads,
             plan.head_dim,
-            cache.len,
             if plan.sliding {
                 config.sliding_window
             } else {
                 0
             },
-            cache.start,
             cache.capacity,
+            cache.capacity <= 4096,
+            &table.decode_state,
         )?;
         self.trace_fingerprint("layer.0.attended", &attended, trace)?;
         let projected = self.linear_at(&attended, 1, plan.output_projection)?;
@@ -2084,8 +2329,18 @@ impl Gemma4CudaState {
         config: &Gemma4TextConfig,
         table: &mut Gemma4CudaCacheTable,
     ) -> Result<WorkspaceF32> {
-        let embedding = self.embedding(token, config.hidden_size)?;
-        let packed_ple = self.packed_ple(token, &embedding, config)?;
+        self.set_decode_state(token, table)?;
+        self.forward_token_state(config, table, true)
+    }
+
+    fn forward_token_state(
+        &self,
+        config: &Gemma4TextConfig,
+        table: &mut Gemma4CudaCacheTable,
+        advance_host_state: bool,
+    ) -> Result<WorkspaceF32> {
+        let embedding = self.embedding_state(&table.decode_state, config.hidden_size)?;
+        let packed_ple = self.packed_ple_state(&table.decode_state, &embedding, config)?;
         let mut hidden = embedding;
         let trace = std::env::var_os("GEMMA4_TRACE_LAYERS").is_some() && table.position == 0;
         self.trace_fingerprint("embedding", &hidden, trace)?;
@@ -2107,7 +2362,18 @@ impl Gemma4CudaState {
             self.trace_fingerprint(&format!("layer.{layer}.scaled"), &hidden, trace)?;
             self.trace_fingerprint(&format!("layer.{layer}"), &hidden, trace)?;
         }
-        table.position += 1;
+        if advance_host_state {
+            table.position += 1;
+            for cache in table.layers.iter_mut().flatten() {
+                cache.total_seen += 1;
+                cache.len = cache.total_seen.min(cache.capacity);
+                cache.start = if cache.total_seen > cache.capacity {
+                    cache.total_seen % cache.capacity
+                } else {
+                    0
+                };
+            }
+        }
         Ok(hidden)
     }
 
@@ -2236,6 +2502,156 @@ impl Gemma4CudaState {
         Ok(logits)
     }
 
+    fn decode_logits_state(
+        &self,
+        config: &Gemma4TextConfig,
+        table: &mut Gemma4CudaCacheTable,
+    ) -> Result<WorkspaceF32> {
+        let hidden = self.forward_token_state(config, table, false)?;
+        let hidden = self.rms_norm(&hidden, "norm.weight", config.rms_norm_eps)?;
+        let embedding = self.weight("embed_tokens.weight")?;
+        let hidden_bf16 = self.to_bf16(&hidden)?;
+        let mut logits = self.output_f32(config.vocab_size)?;
+        self.cublas.linear_bf16_f32(
+            &self.stream,
+            1,
+            config.vocab_size,
+            config.hidden_size,
+            &hidden_bf16,
+            &embedding.buffer,
+            &mut logits,
+        )?;
+        Ok(logits)
+    }
+
+    fn build_decode_graph(
+        &self,
+        config: &Gemma4TextConfig,
+        table: &mut Gemma4CudaCacheTable,
+        top_k: usize,
+        repetition_penalty: f32,
+        seen: &DeviceBuffer<u8>,
+    ) -> Result<Gemma4CudaDecodeGraph> {
+        if table
+            .layers
+            .iter()
+            .flatten()
+            .any(|cache| cache.capacity > 4096)
+        {
+            return Err(Error::Execution(
+                "CUDA Graph decode currently requires KV capacities <= 4096".into(),
+            ));
+        }
+        let blocks = config.vocab_size.div_ceil(256);
+        let mut scores = self.output_f32(top_k)?.into_inner();
+        let mut ids = self.output_f32(top_k)?.into_inner();
+        let executable = CudaGraphExec::capture(&self.stream, || {
+            let logits = self.decode_logits_state(config, table)?;
+            let candidates = blocks * top_k;
+            let mut stage_scores = self.output_f32(candidates)?;
+            let mut stage_ids = self.output_f32(candidates)?;
+            unsafe {
+                self.module.gemma_topk_stage1(
+                    &self.stream,
+                    LaunchConfig {
+                        grid_dim: (blocks as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    top_k,
+                    repetition_penalty,
+                    &logits,
+                    seen,
+                    &mut stage_scores,
+                    &mut stage_ids,
+                )
+            }
+            .map_err(cuda_error)?;
+            unsafe {
+                self.module.gemma_topk_stage2(
+                    &self.stream,
+                    Self::launch_config(1)?,
+                    top_k,
+                    &stage_scores,
+                    &stage_ids,
+                    &mut scores,
+                    &mut ids,
+                )
+            }
+            .map_err(cuda_error)
+        })?;
+
+        // Every temporary pointer referenced by the graph is now back in its
+        // pool. Drain the pools so regular workspace allocation cannot reuse
+        // or overwrite graph-owned storage between replays.
+        let fixed_f32 = self
+            .f32_pool
+            .borrow_mut()
+            .values_mut()
+            .flat_map(Vec::drain)
+            .collect();
+        let fixed_bf16 = self
+            .bf16_pool
+            .borrow_mut()
+            .values_mut()
+            .flat_map(Vec::drain)
+            .collect();
+        Ok(Gemma4CudaDecodeGraph {
+            executable,
+            scores,
+            ids,
+            _fixed_f32: fixed_f32,
+            _fixed_bf16: fixed_bf16,
+            top_k,
+            repetition_penalty,
+        })
+    }
+
+    fn replay_decode_graph(
+        &self,
+        token: u32,
+        config: &Gemma4TextConfig,
+        table: &mut Gemma4CudaCacheTable,
+        mark_seen: bool,
+        seen: &mut DeviceBuffer<u8>,
+    ) -> Result<Vec<(u32, f32)>> {
+        let graph = table
+            .decode_graph
+            .as_ref()
+            .ok_or_else(|| Error::Execution("CUDA decode graph is missing".into()))?;
+        unsafe {
+            self.module.gemma_decode_state_update(
+                &self.stream,
+                Self::launch_config(1)?,
+                token as usize,
+                table.position,
+                mark_seen,
+                &mut table.decode_state,
+                seen,
+            )
+        }
+        .map_err(cuda_error)?;
+        graph.executable.launch(&self.stream)?;
+        let mut scores = graph.scores.to_host_vec(&self.stream).map_err(cuda_error)?;
+        let ids = graph.ids.to_host_vec(&self.stream).map_err(cuda_error)?;
+        apply_logit_softcap(&mut scores, config.final_logit_softcapping);
+        table.position += 1;
+        for cache in table.layers.iter_mut().flatten() {
+            cache.total_seen += 1;
+            cache.len = cache.total_seen.min(cache.capacity);
+            cache.start = if cache.total_seen > cache.capacity {
+                cache.total_seen % cache.capacity
+            } else {
+                0
+            };
+        }
+        Ok(ids
+            .into_iter()
+            .zip(scores)
+            .map(|(id, score)| (id as u32, score))
+            .collect())
+    }
+
     /// Runs decode and transfers only the global top-k candidates to the
     /// host. Repetition penalty is applied before selection using a persistent
     /// device-side seen-token bitmap.
@@ -2257,6 +2673,16 @@ impl Gemma4CudaState {
         let seen = seen
             .as_mut()
             .ok_or_else(|| Error::Execution("CUDA seen-token state is missing".into()))?;
+        let graph_compatible = table.decode_graph.as_ref().is_some_and(|graph| {
+            graph.top_k == top_k
+                && graph.repetition_penalty.to_bits() == repetition_penalty.to_bits()
+        });
+        if graph_compatible {
+            return self.replay_decode_graph(token, config, table, mark_seen, seen);
+        }
+        if table.decode_graph.is_some() {
+            table.decode_graph = None;
+        }
         if mark_seen {
             unsafe {
                 self.module.gemma_mark_seen(
@@ -2307,11 +2733,32 @@ impl Gemma4CudaState {
         let mut scores = final_scores.to_host_vec(&self.stream).map_err(cuda_error)?;
         let ids = final_ids.to_host_vec(&self.stream).map_err(cuda_error)?;
         apply_logit_softcap(&mut scores, config.final_logit_softcapping);
-        Ok(ids
+        let candidates: Vec<_> = ids
             .into_iter()
             .zip(scores)
             .map(|(id, score)| (id as u32, score))
-            .collect())
+            .collect();
+        if std::env::var_os("GEMMA4_DISABLE_CUDA_GRAPH").is_none()
+            && table.decode_graph.is_none()
+            && table
+                .layers
+                .iter()
+                .flatten()
+                .all(|cache| cache.capacity <= 4096)
+        {
+            match self.build_decode_graph(config, table, top_k, repetition_penalty, seen) {
+                Ok(graph) => {
+                    table.decode_graph = Some(graph);
+                    if std::env::var_os("GEMMA4_PROFILE").is_some() {
+                        eprintln!("Gemma4 CUDA Graph: captured decode+top-k");
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Gemma4 CUDA Graph disabled: {error}");
+                }
+            }
+        }
+        Ok(candidates)
     }
 }
 

@@ -983,6 +983,46 @@ pub(crate) mod kernels {
     }
 
     #[kernel]
+    pub fn gemma_bf16_row_scaled_state(
+        row_width: usize,
+        scale: f32,
+        state: &[usize],
+        input: &[u16],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            *value = f32::from_bits((input[state[0] * row_width + raw] as u32) << 16) * scale;
+        }
+    }
+
+    #[kernel]
+    pub fn gemma_decode_state_update(
+        token: usize,
+        position: usize,
+        mark_seen: bool,
+        mut state: DisjointSlice<usize>,
+        mut seen: DisjointSlice<u8>,
+    ) {
+        if thread::index_1d().get() == 0 {
+            state[0] = token;
+            state[1] = position;
+            if mark_seen {
+                seen[token] = 1;
+            }
+        }
+    }
+
+    #[kernel]
+    pub fn gemma_decode_state_set(token: usize, position: usize, mut state: DisjointSlice<usize>) {
+        if thread::index_1d().get() == 0 {
+            state[0] = token;
+            state[1] = position;
+        }
+    }
+
+    #[kernel]
     pub fn gemma_embedding_rows(
         hidden: usize,
         scale: f32,
@@ -1104,6 +1144,21 @@ pub(crate) mod kernels {
     }
 
     #[kernel]
+    pub fn gemma_cache_write_state(
+        width: usize,
+        cache_capacity: usize,
+        state: &[usize],
+        input: &[f32],
+        mut cache: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if raw < width {
+            cache[(state[1] % cache_capacity) * width + raw] = input[raw];
+        }
+    }
+
+    #[kernel]
     pub fn gemma_gelu_mul(gate: &[f32], up: &[f32], mut output: DisjointSlice<f32>) {
         let index = thread::index_1d();
         let raw = index.get();
@@ -1157,6 +1212,48 @@ pub(crate) mod kernels {
             let exponent = -((2 * frequency_index) as f32) / head_dim as f32;
             let frequency = core::intrinsics::powf32(theta, exponent) / factor;
             let angle = (position_offset + token) as f32 * frequency;
+            let rotated = if dimension < half {
+                -input[head_base + pair]
+            } else {
+                input[head_base + pair]
+            };
+            *value = input[raw] * core::intrinsics::cosf32(angle)
+                + rotated * core::intrinsics::sinf32(angle);
+        }
+    }
+
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemma_rope_state(
+        heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        theta: f32,
+        factor: f32,
+        state: &[usize],
+        input: &[f32],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            let dimension = raw % head_dim;
+            let half = head_dim / 2;
+            let frequency_index = dimension % half;
+            if frequency_index >= rotary_dim / 2 {
+                *value = input[raw];
+                return;
+            }
+            let token = raw / (heads * head_dim);
+            let head_base = raw - dimension;
+            let pair = if dimension < half {
+                dimension + half
+            } else {
+                dimension - half
+            };
+            let exponent = -((2 * frequency_index) as f32) / head_dim as f32;
+            let frequency = core::intrinsics::powf32(theta, exponent) / factor;
+            let angle = (state[1] + token) as f32 * frequency;
             let rotated = if dimension < half {
                 -input[head_base + pair]
             } else {
@@ -1232,6 +1329,74 @@ pub(crate) mod kernels {
         }
     }
 
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemma_gqa_decode_state(
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        window: usize,
+        cache_capacity: usize,
+        state: &[usize],
+        query: &[f32],
+        key_cache: &[f32],
+        value_cache: &[f32],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            let total_seen = state[1] + 1;
+            let sequence = total_seen.min(cache_capacity);
+            let cache_start = if total_seen > cache_capacity {
+                total_seen % cache_capacity
+            } else {
+                0
+            };
+            let head = raw / head_dim;
+            let dimension = raw % head_dim;
+            let kv_head = head / (heads / kv_heads);
+            let start = if window == 0 || sequence <= window {
+                0
+            } else {
+                sequence - window
+            };
+            let mut maximum = f32::NEG_INFINITY;
+            let mut position = start;
+            while position < sequence {
+                let physical = (cache_start + position) % cache_capacity;
+                let mut score = 0.0;
+                let mut inner = 0;
+                while inner < head_dim {
+                    score += query[head * head_dim + inner]
+                        * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
+                    inner += 1;
+                }
+                maximum = maximum.max(score);
+                position += 1;
+            }
+            let mut normalizer = 0.0;
+            let mut weighted = 0.0;
+            position = start;
+            while position < sequence {
+                let physical = (cache_start + position) % cache_capacity;
+                let mut score = 0.0;
+                let mut inner = 0;
+                while inner < head_dim {
+                    score += query[head * head_dim + inner]
+                        * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
+                    inner += 1;
+                }
+                let probability = core::intrinsics::expf32(score - maximum);
+                normalizer += probability;
+                weighted += probability
+                    * value_cache[(physical * kv_heads + kv_head) * head_dim + dimension];
+                position += 1;
+            }
+            *value = weighted / normalizer;
+        }
+    }
+
     /// Single-query GQA specialized for decode. Attention scores are computed
     /// once per head and shared by all head dimensions, instead of recomputing
     /// the same dot product twice for every output element.
@@ -1257,6 +1422,88 @@ pub(crate) mod kernels {
         if head >= heads {
             return;
         }
+        let kv_head = head / (heads / kv_heads);
+        let start = if window == 0 || sequence <= window {
+            0
+        } else {
+            sequence - window
+        };
+        if lane == 0 {
+            let mut maximum = f32::NEG_INFINITY;
+            let mut position = start;
+            while position < sequence {
+                let physical = (cache_start + position) % cache_capacity;
+                let mut score = 0.0;
+                let mut inner = 0;
+                while inner < head_dim {
+                    score += query[head * head_dim + inner]
+                        * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
+                    inner += 1;
+                }
+                unsafe { PROBABILITIES[position - start] = score };
+                if score > maximum {
+                    maximum = score;
+                }
+                position += 1;
+            }
+            let mut normalizer = 0.0;
+            position = start;
+            while position < sequence {
+                let probability =
+                    core::intrinsics::expf32(unsafe { PROBABILITIES[position - start] } - maximum);
+                unsafe { PROBABILITIES[position - start] = probability };
+                normalizer += probability;
+                position += 1;
+            }
+            unsafe { NORMALIZER[0] = normalizer };
+        }
+        thread::sync_threads();
+        let normalizer = unsafe { NORMALIZER[0] };
+        let mut dimension = lane;
+        while dimension < head_dim {
+            let mut weighted = 0.0;
+            let mut position = start;
+            while position < sequence {
+                let physical = (cache_start + position) % cache_capacity;
+                weighted += unsafe { PROBABILITIES[position - start] }
+                    * value_cache[(physical * kv_heads + kv_head) * head_dim + dimension];
+                position += 1;
+            }
+            unsafe {
+                *output.get_unchecked_mut(head * head_dim + dimension) = weighted / normalizer
+            };
+            dimension += 256;
+        }
+    }
+
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemma_gqa_decode_block_state(
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        window: usize,
+        cache_capacity: usize,
+        state: &[usize],
+        query: &[f32],
+        key_cache: &[f32],
+        value_cache: &[f32],
+        mut output: DisjointSlice<f32>,
+    ) {
+        static mut PROBABILITIES: SharedArray<f32, 4096> = SharedArray::UNINIT;
+        static mut NORMALIZER: SharedArray<f32, 1> = SharedArray::UNINIT;
+        let head = thread::blockIdx_x() as usize;
+        let lane = thread::threadIdx_x() as usize;
+        if head >= heads {
+            return;
+        }
+        let total_seen = state[1] + 1;
+        let sequence = total_seen.min(cache_capacity);
+        let cache_start = if total_seen > cache_capacity {
+            total_seen % cache_capacity
+        } else {
+            0
+        };
         let kv_head = head / (heads / kv_heads);
         let start = if window == 0 || sequence <= window {
             0

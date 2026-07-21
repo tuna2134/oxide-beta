@@ -21,6 +21,8 @@ mod tensor;
 mod cublas;
 #[cfg(feature = "cuda")]
 mod cuda;
+#[cfg(feature = "cuda")]
+mod cuda_graph;
 #[cfg(feature = "cudnn")]
 mod cudnn;
 #[cfg(feature = "cuda")]
