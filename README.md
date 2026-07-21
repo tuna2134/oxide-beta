@@ -43,6 +43,14 @@ cargo +stable run --example mlp
 cuda-oxideは通常の `cargo run` ではなく、専用codegen backendを使います。
 Linux、NVIDIA GPU/driver、CUDA Toolkit、LLVM 22、固定nightlyが必要です。
 
+このリポジトリの既定CUDA targetはGoogle ColabのNVIDIA L4に合わせた
+`sm_89`です。別GPUではビルド時にtargetを上書きしてください。
+
+```bash
+CUDA_OXIDE_TARGET=sm_80 cargo oxide build --arch sm_80 --features cuda -- \
+  --example gemma4_load --release
+```
+
 ```bash
 cargo install --git https://github.com/NVlabs/cuda-oxide.git cargo-oxide
 cargo oxide doctor

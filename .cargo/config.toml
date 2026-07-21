@@ -1,0 +1,5 @@
+[env]
+# Google Colab's NVIDIA L4 is Ada compute capability 8.9. cuda-oxide embeds
+# architecture-tagged device IR, and its loader requires an exact match for
+# pre-Blackwell GPUs instead of forwarding an sm_80 artifact to sm_89.
+CUDA_OXIDE_TARGET = { value = "sm_89", force = false }
