@@ -293,8 +293,10 @@ impl Gemma4CudaState {
         input: &DeviceBuffer<f32>,
         heads: usize,
         head_dim: usize,
+        rotary_dim: usize,
         position: usize,
         theta: f32,
+        factor: f32,
     ) -> Result<DeviceBuffer<f32>> {
         if heads == 0 || input.len() != heads * head_dim {
             return Err(Error::InvalidShape("RoPE shape mismatch".into()));
@@ -308,9 +310,10 @@ impl Gemma4CudaState {
                 Self::launch_config(input.len())?,
                 heads,
                 head_dim,
-                head_dim,
+                rotary_dim,
                 position,
                 theta,
+                factor,
                 input,
                 &mut output,
             )
@@ -824,8 +827,8 @@ impl Gemma4CudaState {
         )?;
         let key = self.rms_norm(&key, &format!("{prefix}.self_attn.k_norm.weight"), epsilon)?;
         let value = self.rms_norm_unit(&value, head_dim, epsilon)?;
-        let query = self.rope(&query, heads, head_dim, 0, 10_000.0)?;
-        let key = self.rope(&key, kv_heads, head_dim, 0, 10_000.0)?;
+        let query = self.rope(&query, heads, head_dim, head_dim, 0, 10_000.0, 1.0)?;
+        let key = self.rope(&key, kv_heads, head_dim, head_dim, 0, 10_000.0, 1.0)?;
         let attended = self.gqa(
             &query, &key, &value, heads, kv_heads, head_dim, 1, window, 0, 1,
         )?;
@@ -868,13 +871,23 @@ impl Gemma4CudaState {
         let key = self.rms_norm(&key, &format!("{prefix}.self_attn.k_norm.weight"), epsilon)?;
         let value = self.rms_norm_unit(&value, cache.head_dim, epsilon)?;
         let absolute_position = cache.total_seen;
-        let query = self.rope(&query, heads, cache.head_dim, absolute_position, 10_000.0)?;
+        let query = self.rope(
+            &query,
+            heads,
+            cache.head_dim,
+            cache.head_dim,
+            absolute_position,
+            10_000.0,
+            1.0,
+        )?;
         let key = self.rope(
             &key,
             cache.kv_heads,
             cache.head_dim,
+            cache.head_dim,
             absolute_position,
             10_000.0,
+            1.0,
         )?;
         self.append_kv(cache, &key, &value)?;
         let attended = self.gqa(
@@ -939,6 +952,13 @@ impl Gemma4CudaState {
         } else {
             config.global_head_dim
         };
+        let rope = config
+            .rope_parameters
+            .as_ref()
+            .and_then(|parameters| parameters.get(layer_type))
+            .ok_or_else(|| Error::Execution(format!("RoPE parameters for {layer_type} missing")))?;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rotary_dim = (rope.partial_rotary_factor * head_dim as f32) as usize;
         let query = self.linear(&normalized, 1, &format!("{prefix}.self_attn.q_proj.weight"))?;
         let query = self.rms_norm(
             &query,
@@ -949,8 +969,10 @@ impl Gemma4CudaState {
             &query,
             config.num_attention_heads,
             head_dim,
+            rotary_dim,
             table.position,
-            10_000.0,
+            rope.rope_theta,
+            rope.factor,
         )?;
         let source = table.sources[layer];
         if source == layer {
@@ -965,7 +987,15 @@ impl Gemma4CudaState {
             let cache = table.layers[layer]
                 .as_mut()
                 .ok_or_else(|| Error::Execution(format!("layer {layer} cache is missing")))?;
-            let key = self.rope(&key, cache.kv_heads, head_dim, table.position, 10_000.0)?;
+            let key = self.rope(
+                &key,
+                cache.kv_heads,
+                head_dim,
+                rotary_dim,
+                table.position,
+                rope.rope_theta,
+                rope.factor,
+            )?;
             let value = self.rms_norm_unit(&value, head_dim, config.rms_norm_eps)?;
             self.append_kv(cache, &key, &value)?;
         }

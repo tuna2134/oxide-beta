@@ -7,6 +7,7 @@
 use crate::safetensors::{LoadedTensor, SafeTensorLoader, TensorMetadata};
 use crate::{Device, Error, Result, Tensor};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
@@ -295,6 +296,27 @@ fn default_true() -> bool {
     true
 }
 
+fn default_rope_theta() -> f32 {
+    10_000.0
+}
+
+fn default_rope_factor() -> f32 {
+    1.0
+}
+
+/// Per-layer-type rotary embedding parameters from Hugging Face config.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Gemma4RopeParameters {
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f32,
+    #[serde(default)]
+    pub rope_type: String,
+    #[serde(default = "default_rope_factor")]
+    pub partial_rotary_factor: f32,
+    #[serde(default = "default_rope_factor")]
+    pub factor: f32,
+}
+
 /// Hugging Face compatible `Gemma4TextConfig` subset used by the Rust model.
 #[derive(Clone, Debug, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
@@ -339,6 +361,8 @@ pub struct Gemma4TextConfig {
     pub use_double_wide_mlp: bool,
     #[serde(default)]
     pub final_logit_softcapping: Option<f32>,
+    #[serde(default)]
+    pub rope_parameters: Option<HashMap<String, Gemma4RopeParameters>>,
     #[serde(default = "default_true")]
     pub tie_word_embeddings: bool,
 }
@@ -376,6 +400,28 @@ impl Gemma4TextConfig {
             return Err(Error::InvalidShape(
                 "Gemma 4 layer_types length does not match num_hidden_layers".into(),
             ));
+        }
+        if self.rope_parameters.is_none() {
+            self.rope_parameters = Some(HashMap::from([
+                (
+                    "sliding_attention".to_owned(),
+                    Gemma4RopeParameters {
+                        rope_theta: 10_000.0,
+                        rope_type: "default".to_owned(),
+                        partial_rotary_factor: 1.0,
+                        factor: 1.0,
+                    },
+                ),
+                (
+                    "full_attention".to_owned(),
+                    Gemma4RopeParameters {
+                        rope_theta: 1_000_000.0,
+                        rope_type: "proportional".to_owned(),
+                        partial_rotary_factor: 0.25,
+                        factor: 1.0,
+                    },
+                ),
+            ]));
         }
         Ok(self)
     }

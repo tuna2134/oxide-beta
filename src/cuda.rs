@@ -1007,6 +1007,7 @@ pub(crate) mod kernels {
         rotary_dim: usize,
         position_offset: usize,
         theta: f32,
+        factor: f32,
         input: &[f32],
         mut output: DisjointSlice<f32>,
     ) {
@@ -1014,21 +1015,21 @@ pub(crate) mod kernels {
         let raw = index.get();
         if let Some(value) = output.get_mut(index) {
             let dimension = raw % head_dim;
-            if dimension >= rotary_dim {
+            let half = head_dim / 2;
+            let frequency_index = dimension % half;
+            if frequency_index >= rotary_dim / 2 {
                 *value = input[raw];
                 return;
             }
             let token = raw / (heads * head_dim);
             let head_base = raw - dimension;
-            let half = rotary_dim / 2;
             let pair = if dimension < half {
                 dimension + half
             } else {
                 dimension - half
             };
-            let frequency_index = dimension % half;
             let exponent = -((2 * frequency_index) as f32) / rotary_dim as f32;
-            let frequency = core::intrinsics::powf32(theta, exponent);
+            let frequency = core::intrinsics::powf32(theta, exponent) / factor;
             let angle = (position_offset + token) as f32 * frequency;
             let rotated = if dimension < half {
                 -input[head_base + pair]
