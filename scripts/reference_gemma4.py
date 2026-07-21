@@ -69,6 +69,14 @@ def main():
         handle.remove()
     top = torch.topk(output.logits[0, -1].float(), 10)
     print("Gemma4 reference top10:", list(zip(top.indices.cpu().tolist(), top.values.cpu().tolist())))
+    with torch.inference_mode():
+        generated = model.generate(
+            **{key: value.to("cuda") for key, value in encoded.items()},
+            do_sample=False,
+            max_new_tokens=20,
+        )[0, encoded.input_ids.shape[1]:]
+    print("Gemma4 reference greedy ids:", generated.cpu().tolist())
+    print("Gemma4 reference greedy text:", tokenizer.decode(generated, skip_special_tokens=True))
 
 
 if __name__ == "__main__":

@@ -144,9 +144,10 @@ fn main() -> oxide_torch::Result<()> {
                 }
                 generated.push(next);
                 println!(
-                    "Gemma4 generate: {}/{} {:?}",
+                    "Gemma4 generate: {}/{} token={} {:?}",
                     index + 1,
                     generation.max_new_tokens,
+                    next,
                     tokenizer.decode(&generated, true)?,
                 );
                 logits = cuda.decode_token(next, model.config(), &mut cache_table)?;
