@@ -116,7 +116,7 @@ fn main() -> oxide_torch::Result<()> {
             cache_table.shared_layer_count(),
             cache_table.source_layer(model.config().num_hidden_layers - 1),
         );
-        if std::env::var_os("GEMMA4_DECODE").is_some() {
+        if std::env::var_os("GEMMA4_SKIP_DECODE").is_none() {
             let mut logits = Vec::new();
             for (index, &token) in token_ids.iter().enumerate() {
                 logits = cuda.decode_token(token, model.config(), &mut cache_table)?;
