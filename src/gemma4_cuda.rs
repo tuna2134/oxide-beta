@@ -214,7 +214,10 @@ impl Gemma4CudaState {
     }
     pub(crate) fn load(model: &Gemma4ForCausalLM, device: usize) -> Result<Self> {
         let context = CudaContext::new(device).map_err(cuda_error)?;
-        let stream = context.default_stream();
+        // CUDA Graph capture is unsupported on the legacy default stream.
+        // Keep all Gemma allocations, kernels and cuBLAS calls on one
+        // dedicated non-blocking stream for both normal execution and replay.
+        let stream = context.new_stream().map_err(cuda_error)?;
         let cublas = Cublas::new()?;
         cublas.bind_stream(&stream)?;
         let module = crate::cuda::kernels::load(&context).map_err(cuda_error)?;
