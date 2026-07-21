@@ -43,71 +43,73 @@ fn main() -> oxide_torch::Result<()> {
             cuda.weight_count(),
             cuda.weight_bytes() / (1024 * 1024),
         );
-        let logits = cuda.embedding_logits(
-            *token_ids
-                .last()
-                .ok_or_else(|| oxide_torch::Error::Execution("empty prompt".into()))?,
-            model.config().hidden_size,
-        )?;
-        let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        println!(
-            "CUDA BF16 cuBLAS smoke: logits={} max={maximum:.4}",
-            logits.len()
-        );
-        let mlp = cuda.decoder_mlp_smoke(
-            *token_ids
-                .last()
-                .ok_or_else(|| oxide_torch::Error::Execution("empty prompt".into()))?,
-            0,
-            model.config().hidden_size,
-            model.config().rms_norm_eps,
-        )?;
-        let maximum = mlp.iter().map(|value| value.abs()).fold(0.0_f32, f32::max);
-        println!(
-            "CUDA decoder layer 0 MLP smoke: hidden={} abs_max={maximum:.4}",
-            mlp.len()
-        );
-        let attention = cuda.decoder_attention_smoke(
-            *token_ids
-                .last()
-                .ok_or_else(|| oxide_torch::Error::Execution("empty prompt".into()))?,
-            0,
-            model.config().hidden_size,
-            model.config().num_attention_heads,
-            model.config().num_key_value_heads,
-            model.config().head_dim,
-            model.config().rms_norm_eps,
-            model.config().sliding_window,
-        )?;
-        let maximum = attention
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0_f32, f32::max);
-        println!(
-            "CUDA decoder layer 0 attention smoke: hidden={} abs_max={maximum:.4}",
-            attention.len()
-        );
-        let mut cache = cuda.new_kv_cache(
-            model.config().num_key_value_heads,
-            model.config().head_dim,
-            model.config().sliding_window,
-        )?;
-        for &token in token_ids.iter().rev().take(2).rev() {
-            let output = cuda.cached_attention_smoke(
-                token,
+        if std::env::var_os("GEMMA4_DIAGNOSTICS").is_some() {
+            let logits = cuda.embedding_logits(
+                *token_ids
+                    .last()
+                    .ok_or_else(|| oxide_torch::Error::Execution("empty prompt".into()))?,
+                model.config().hidden_size,
+            )?;
+            let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            println!(
+                "CUDA BF16 cuBLAS smoke: logits={} max={maximum:.4}",
+                logits.len()
+            );
+            let mlp = cuda.decoder_mlp_smoke(
+                *token_ids
+                    .last()
+                    .ok_or_else(|| oxide_torch::Error::Execution("empty prompt".into()))?,
+                0,
+                model.config().hidden_size,
+                model.config().rms_norm_eps,
+            )?;
+            let maximum = mlp.iter().map(|value| value.abs()).fold(0.0_f32, f32::max);
+            println!(
+                "CUDA decoder layer 0 MLP smoke: hidden={} abs_max={maximum:.4}",
+                mlp.len()
+            );
+            let attention = cuda.decoder_attention_smoke(
+                *token_ids
+                    .last()
+                    .ok_or_else(|| oxide_torch::Error::Execution("empty prompt".into()))?,
                 0,
                 model.config().hidden_size,
                 model.config().num_attention_heads,
+                model.config().num_key_value_heads,
+                model.config().head_dim,
                 model.config().rms_norm_eps,
-                &mut cache,
+                model.config().sliding_window,
             )?;
-            if output.iter().any(|value| !value.is_finite()) {
-                return Err(oxide_torch::Error::Execution(
-                    "cached attention produced a non-finite value".into(),
-                ));
+            let maximum = attention
+                .iter()
+                .map(|value| value.abs())
+                .fold(0.0_f32, f32::max);
+            println!(
+                "CUDA decoder layer 0 attention smoke: hidden={} abs_max={maximum:.4}",
+                attention.len()
+            );
+            let mut cache = cuda.new_kv_cache(
+                model.config().num_key_value_heads,
+                model.config().head_dim,
+                model.config().sliding_window,
+            )?;
+            for &token in token_ids.iter().rev().take(2).rev() {
+                let output = cuda.cached_attention_smoke(
+                    token,
+                    0,
+                    model.config().hidden_size,
+                    model.config().num_attention_heads,
+                    model.config().rms_norm_eps,
+                    &mut cache,
+                )?;
+                if output.iter().any(|value| !value.is_finite()) {
+                    return Err(oxide_torch::Error::Execution(
+                        "cached attention produced a non-finite value".into(),
+                    ));
+                }
             }
+            println!("CUDA persistent KV cache smoke: sequence={}", cache.len());
         }
-        println!("CUDA persistent KV cache smoke: sequence={}", cache.len());
         let mut cache_table = cuda.new_cache_table(model.config(), token_ids.len() + 128)?;
         println!(
             "CUDA 35-layer cache table: layers={} physical={} shared={} last_source={:?}",
@@ -122,13 +124,36 @@ fn main() -> oxide_torch::Result<()> {
                 logits = cuda.decode_token(token, model.config(), &mut cache_table)?;
                 eprintln!("Gemma4 prefill: {}/{}", index + 1, token_ids.len());
             }
-            let generation = GenerationConfig::default();
+            let max_new_tokens = std::env::var("GEMMA4_MAX_NEW_TOKENS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(32);
+            let generation = GenerationConfig {
+                max_new_tokens,
+                temperature: 1.0,
+                top_k: 1,
+                top_p: 1.0,
+                ..GenerationConfig::default()
+            };
             let mut random = generation.seed;
-            let next = sample_token(&logits, &generation, &mut random)?;
-            println!("CUDA 35-layer next_token={next}");
+            let mut generated = Vec::with_capacity(generation.max_new_tokens);
+            for index in 0..generation.max_new_tokens {
+                let next = sample_token(&logits, &generation, &mut random)?;
+                if generation.eos_token_ids.contains(&next) {
+                    break;
+                }
+                generated.push(next);
+                println!(
+                    "Gemma4 generate: {}/{} {:?}",
+                    index + 1,
+                    generation.max_new_tokens,
+                    tokenizer.decode(&generated, true)?,
+                );
+                logits = cuda.decode_token(next, model.config(), &mut cache_table)?;
+            }
             println!(
-                "CUDA 35-layer decoded={:?}",
-                tokenizer.decode(&[next], true)?
+                "CUDA Gemma4 response: {}",
+                tokenizer.decode(&generated, true)?
             );
         }
     }
