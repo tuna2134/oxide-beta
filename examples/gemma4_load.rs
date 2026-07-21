@@ -1,7 +1,7 @@
 use oxide_torch::Device;
 use oxide_torch::models::gemma4::{Gemma4ForCausalLM, Gemma4Tokenizer};
 #[cfg(feature = "cuda")]
-use oxide_torch::models::gemma4::{GenerationConfig, sample_token};
+use oxide_torch::models::gemma4::{GenerationConfig, sample_token, sample_topk_candidates};
 
 #[allow(clippy::too_many_lines)]
 fn main() -> oxide_torch::Result<()> {
@@ -201,13 +201,14 @@ fn main() -> oxide_torch::Result<()> {
             let mut random = generation.seed;
             let mut generated = Vec::with_capacity(generation.max_new_tokens);
             let mut streamed = String::new();
+            let mut topk_candidates = None;
             let generation_started = std::time::Instant::now();
             let mut decode_seconds = 0.0_f64;
             let mut sampling_seconds = 0.0_f64;
             const TEXT_STOP_MARKERS: [&str; 4] =
                 ["<turn|>", "<|turn>", "<end_of_turn>", "<start_of_turn>"];
             for index in 0..generation.max_new_tokens {
-                if repetition_penalty > 1.0 {
+                if topk_candidates.is_none() && repetition_penalty > 1.0 {
                     let mut penalized = std::collections::HashSet::with_capacity(generated.len());
                     for &token in &generated {
                         if !penalized.insert(token) {
@@ -223,7 +224,11 @@ fn main() -> oxide_torch::Result<()> {
                     }
                 }
                 let sampling_started = std::time::Instant::now();
-                let next = sample_token(&logits, &generation, &mut random)?;
+                let next = if let Some(candidates) = &topk_candidates {
+                    sample_topk_candidates(candidates, &generation, &mut random)?
+                } else {
+                    sample_token(&logits, &generation, &mut random)?
+                };
                 sampling_seconds += sampling_started.elapsed().as_secs_f64();
                 if generation.eos_token_ids.contains(&next) {
                     break;
@@ -247,7 +252,14 @@ fn main() -> oxide_torch::Result<()> {
                     break;
                 }
                 let decode_started = std::time::Instant::now();
-                logits = cuda.decode_token(next, model.config(), &mut cache_table)?;
+                topk_candidates = Some(cuda.decode_topk(
+                    next,
+                    model.config(),
+                    &mut cache_table,
+                    generation.top_k,
+                    repetition_penalty,
+                    true,
+                )?);
                 decode_seconds += decode_started.elapsed().as_secs_f64();
             }
             if profile {

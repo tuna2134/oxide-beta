@@ -122,6 +122,7 @@ pub struct Gemma4CudaState {
     weights: HashMap<String, CudaWeight>,
     f32_pool: BufferPool<f32>,
     bf16_pool: BufferPool<u16>,
+    seen_tokens: RefCell<Option<DeviceBuffer<u8>>>,
 }
 
 impl Gemma4CudaState {
@@ -217,6 +218,7 @@ impl Gemma4CudaState {
             weights,
             f32_pool: Rc::new(RefCell::new(HashMap::new())),
             bf16_pool: Rc::new(RefCell::new(HashMap::new())),
+            seen_tokens: RefCell::new(None),
         })
     }
 
@@ -1332,6 +1334,18 @@ impl Gemma4CudaState {
         config: &Gemma4TextConfig,
         table: &mut Gemma4CudaCacheTable,
     ) -> Result<Vec<f32>> {
+        let logits = self.decode_logits(token, config, table)?;
+        let mut logits = logits.to_host_vec(&self.stream).map_err(cuda_error)?;
+        apply_logit_softcap(&mut logits, config.final_logit_softcapping);
+        Ok(logits)
+    }
+
+    fn decode_logits(
+        &self,
+        token: u32,
+        config: &Gemma4TextConfig,
+        table: &mut Gemma4CudaCacheTable,
+    ) -> Result<WorkspaceF32> {
         let hidden = self.forward_token(token, config, table)?;
         let hidden = self.rms_norm(&hidden, "norm.weight", config.rms_norm_eps)?;
         let embedding = self.weight("embed_tokens.weight")?;
@@ -1346,13 +1360,93 @@ impl Gemma4CudaState {
             &embedding.buffer,
             &mut logits,
         )?;
-        let mut logits = logits.to_host_vec(&self.stream).map_err(cuda_error)?;
-        if let Some(cap) = config.final_logit_softcapping {
-            for logit in &mut logits {
-                *logit = (*logit / cap).tanh() * cap;
-            }
-        }
         Ok(logits)
+    }
+
+    /// Runs decode and transfers only the global top-k candidates to the
+    /// host. Repetition penalty is applied before selection using a persistent
+    /// device-side seen-token bitmap.
+    pub fn decode_topk(
+        &self,
+        token: u32,
+        config: &Gemma4TextConfig,
+        table: &mut Gemma4CudaCacheTable,
+        top_k: usize,
+        repetition_penalty: f32,
+        mark_seen: bool,
+    ) -> Result<Vec<(u32, f32)>> {
+        let top_k = top_k.clamp(1, 64).min(config.vocab_size);
+        if self.seen_tokens.borrow().is_none() {
+            *self.seen_tokens.borrow_mut() =
+                Some(DeviceBuffer::zeroed(&self.stream, config.vocab_size).map_err(cuda_error)?);
+        }
+        let mut seen = self.seen_tokens.borrow_mut();
+        let seen = seen
+            .as_mut()
+            .ok_or_else(|| Error::Execution("CUDA seen-token state is missing".into()))?;
+        if mark_seen {
+            unsafe {
+                self.module.gemma_mark_seen(
+                    &self.stream,
+                    Self::launch_config(1)?,
+                    token as usize,
+                    seen,
+                )
+            }
+            .map_err(cuda_error)?;
+        }
+        let logits = self.decode_logits(token, config, table)?;
+        let blocks = config.vocab_size.div_ceil(256);
+        let candidates = blocks * top_k;
+        let mut stage_scores = self.output_f32(candidates)?;
+        let mut stage_ids = self.output_f32(candidates)?;
+        unsafe {
+            self.module.gemma_topk_stage1(
+                &self.stream,
+                LaunchConfig {
+                    grid_dim: (blocks as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                top_k,
+                repetition_penalty,
+                &logits,
+                seen,
+                &mut stage_scores,
+                &mut stage_ids,
+            )
+        }
+        .map_err(cuda_error)?;
+        let mut final_scores = self.output_f32(top_k)?;
+        let mut final_ids = self.output_f32(top_k)?;
+        unsafe {
+            self.module.gemma_topk_stage2(
+                &self.stream,
+                Self::launch_config(1)?,
+                top_k,
+                &stage_scores,
+                &stage_ids,
+                &mut final_scores,
+                &mut final_ids,
+            )
+        }
+        .map_err(cuda_error)?;
+        let mut scores = final_scores.to_host_vec(&self.stream).map_err(cuda_error)?;
+        let ids = final_ids.to_host_vec(&self.stream).map_err(cuda_error)?;
+        apply_logit_softcap(&mut scores, config.final_logit_softcapping);
+        Ok(ids
+            .into_iter()
+            .zip(scores)
+            .map(|(id, score)| (id as u32, score))
+            .collect())
+    }
+}
+
+fn apply_logit_softcap(logits: &mut [f32], softcap: Option<f32>) {
+    if let Some(cap) = softcap {
+        for logit in logits {
+            *logit = (*logit / cap).tanh() * cap;
+        }
     }
 }
 

@@ -1266,6 +1266,103 @@ pub(crate) mod kernels {
             dimension += 256;
         }
     }
+
+    #[kernel]
+    pub fn gemma_mark_seen(token: usize, mut seen: DisjointSlice<u8>) {
+        if thread::index_1d().get() == 0 && token < seen.len() {
+            unsafe { *seen.get_unchecked_mut(token) = 1 };
+        }
+    }
+
+    /// Produces sorted local top-k lists, one list per 256-logit block.
+    #[kernel]
+    pub fn gemma_topk_stage1(
+        top_k: usize,
+        repetition_penalty: f32,
+        logits: &[f32],
+        seen: &[u8],
+        mut scores: DisjointSlice<f32>,
+        mut ids: DisjointSlice<f32>,
+    ) {
+        if thread::threadIdx_x() != 0 {
+            return;
+        }
+        let block = thread::blockIdx_x() as usize;
+        let mut best_scores = [f32::NEG_INFINITY; 64];
+        let mut best_ids = [0_u32; 64];
+        let start = block * 256;
+        let end = (start + 256).min(logits.len());
+        let mut index = start;
+        while index < end {
+            let mut score = logits[index];
+            if seen[index] != 0 && repetition_penalty > 1.0 {
+                score = if score >= 0.0 {
+                    score / repetition_penalty
+                } else {
+                    score * repetition_penalty
+                };
+            }
+            if score == score && score > best_scores[top_k - 1] {
+                let mut position = top_k - 1;
+                while position > 0 && score > best_scores[position - 1] {
+                    best_scores[position] = best_scores[position - 1];
+                    best_ids[position] = best_ids[position - 1];
+                    position -= 1;
+                }
+                best_scores[position] = score;
+                best_ids[position] = index as u32;
+            }
+            index += 1;
+        }
+        let mut rank = 0;
+        while rank < top_k {
+            let output_index = block * top_k + rank;
+            unsafe {
+                *scores.get_unchecked_mut(output_index) = best_scores[rank];
+                *ids.get_unchecked_mut(output_index) = best_ids[rank] as f32;
+            }
+            rank += 1;
+        }
+    }
+
+    /// Merges the block-local lists into the final global top-k list.
+    #[kernel]
+    pub fn gemma_topk_stage2(
+        top_k: usize,
+        input_scores: &[f32],
+        input_ids: &[f32],
+        mut scores: DisjointSlice<f32>,
+        mut ids: DisjointSlice<f32>,
+    ) {
+        if thread::index_1d().get() != 0 {
+            return;
+        }
+        let mut best_scores = [f32::NEG_INFINITY; 64];
+        let mut best_ids = [0_u32; 64];
+        let mut index = 0;
+        while index < input_scores.len() {
+            let score = input_scores[index];
+            if score > best_scores[top_k - 1] {
+                let mut position = top_k - 1;
+                while position > 0 && score > best_scores[position - 1] {
+                    best_scores[position] = best_scores[position - 1];
+                    best_ids[position] = best_ids[position - 1];
+                    position -= 1;
+                }
+                best_scores[position] = score;
+                best_ids[position] = input_ids[index] as u32;
+            }
+            index += 1;
+        }
+        let mut rank = 0;
+        while rank < top_k {
+            unsafe {
+                *scores.get_unchecked_mut(rank) = best_scores[rank];
+                *ids.get_unchecked_mut(rank) = best_ids[rank] as f32;
+            }
+            rank += 1;
+        }
+    }
 }
 
 type Buffer = Arc<DeviceBuffer<f32>>;
