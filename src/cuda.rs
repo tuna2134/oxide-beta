@@ -925,6 +925,51 @@ pub(crate) mod kernels {
     }
 
     #[kernel]
+    pub fn gemma_mul(left: &[f32], right: &[f32], mut output: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            *value = left[raw] * right[raw];
+        }
+    }
+
+    #[kernel]
+    pub fn gemma_scale(scale: f32, input: &[f32], mut output: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            *value = input[raw] * scale;
+        }
+    }
+
+    #[kernel]
+    pub fn gemma_slice(offset: usize, input: &[f32], mut output: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            *value = input[offset + raw];
+        }
+    }
+
+    #[kernel]
+    pub fn gemma_gelu(input: &[f32], mut output: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            let x = input[raw];
+            let inner = 0.797_884_6 * (x + 0.044_715 * x * x * x);
+            let tanh = if inner >= 0.0 {
+                let exponential = core::intrinsics::expf32(-2.0 * inner);
+                (1.0 - exponential) / (1.0 + exponential)
+            } else {
+                let exponential = core::intrinsics::expf32(2.0 * inner);
+                (exponential - 1.0) / (exponential + 1.0)
+            };
+            *value = 0.5 * x * (1.0 + tanh);
+        }
+    }
+
+    #[kernel]
     pub fn gemma_cache_write(offset: usize, input: &[f32], mut cache: DisjointSlice<f32>) {
         let index = thread::index_1d();
         let raw = index.get();

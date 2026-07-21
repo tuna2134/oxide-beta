@@ -583,6 +583,157 @@ impl Gemma4CudaState {
         Ok(output)
     }
 
+    fn mul(
+        &self,
+        left: &DeviceBuffer<f32>,
+        right: &DeviceBuffer<f32>,
+    ) -> Result<DeviceBuffer<f32>> {
+        if left.len() != right.len() {
+            return Err(Error::InvalidShape("elementwise multiply mismatch".into()));
+        }
+        let mut output = self.output_f32(left.len())?;
+        // SAFETY: equal extents and three disjoint allocations.
+        unsafe {
+            self.module.gemma_mul(
+                &self.stream,
+                Self::launch_config(left.len())?,
+                left,
+                right,
+                &mut output,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
+    fn scale(&self, input: &DeviceBuffer<f32>, scale: f32) -> Result<DeviceBuffer<f32>> {
+        let mut output = self.output_f32(input.len())?;
+        // SAFETY: input/output extents match and allocations are disjoint.
+        unsafe {
+            self.module.gemma_scale(
+                &self.stream,
+                Self::launch_config(input.len())?,
+                scale,
+                input,
+                &mut output,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
+    fn slice(
+        &self,
+        input: &DeviceBuffer<f32>,
+        offset: usize,
+        len: usize,
+    ) -> Result<DeviceBuffer<f32>> {
+        if offset.checked_add(len).is_none_or(|end| end > input.len()) {
+            return Err(Error::InvalidShape("CUDA slice is out of bounds".into()));
+        }
+        let mut output = self.output_f32(len)?;
+        // SAFETY: the source range was checked and output has `len` elements.
+        unsafe {
+            self.module.gemma_slice(
+                &self.stream,
+                Self::launch_config(len)?,
+                offset,
+                input,
+                &mut output,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
+    fn gelu(&self, input: &DeviceBuffer<f32>) -> Result<DeviceBuffer<f32>> {
+        let mut output = self.output_f32(input.len())?;
+        // SAFETY: input/output extents match and allocations are disjoint.
+        unsafe {
+            self.module.gemma_gelu(
+                &self.stream,
+                Self::launch_config(input.len())?,
+                input,
+                &mut output,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
+    fn packed_ple(
+        &self,
+        token: u32,
+        embedding: &DeviceBuffer<f32>,
+        config: &Gemma4TextConfig,
+    ) -> Result<Option<DeviceBuffer<f32>>> {
+        let dimension = config.hidden_size_per_layer_input;
+        if dimension == 0 {
+            return Ok(None);
+        }
+        let packed = config.num_hidden_layers * dimension;
+        let token_weight = self.weight("embed_tokens_per_layer.weight")?;
+        if token_weight.shape.as_slice() != [config.vocab_size_per_layer_input, packed] {
+            return Err(Error::InvalidShape(format!(
+                "embed_tokens_per_layer.weight has shape {:?}",
+                token_weight.shape
+            )));
+        }
+        let token = token as usize;
+        if token >= token_weight.shape[0] {
+            return Err(Error::Execution("PLE token exceeds vocabulary".into()));
+        }
+        let mut token_ple = self.output_f32(packed)?;
+        #[allow(clippy::cast_precision_loss)]
+        let token_scale = (dimension as f32).sqrt();
+        // SAFETY: token row and packed output extent were validated.
+        unsafe {
+            self.module.gemma_bf16_to_f32_scaled(
+                &self.stream,
+                Self::launch_config(packed)?,
+                token * packed,
+                token_scale,
+                &token_weight.buffer,
+                &mut token_ple,
+            )
+        }
+        .map_err(cuda_error)?;
+        let context = self.linear(embedding, 1, "per_layer_model_projection.weight")?;
+        #[allow(clippy::cast_precision_loss)]
+        let context = self.scale(&context, 1.0 / (config.hidden_size as f32).sqrt())?;
+        let context = self.rms_norm(
+            &context,
+            "per_layer_projection_norm.weight",
+            config.rms_norm_eps,
+        )?;
+        let combined = self.add(&context, &token_ple)?;
+        Ok(Some(
+            self.scale(&combined, core::f32::consts::FRAC_1_SQRT_2)?,
+        ))
+    }
+
+    fn apply_ple(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        packed_ple: &DeviceBuffer<f32>,
+        layer: usize,
+        config: &Gemma4TextConfig,
+    ) -> Result<DeviceBuffer<f32>> {
+        let dimension = config.hidden_size_per_layer_input;
+        let per_layer = self.slice(packed_ple, layer * dimension, dimension)?;
+        let prefix = format!("layers.{layer}");
+        let gate = self.linear(hidden, 1, &format!("{prefix}.per_layer_input_gate.weight"))?;
+        let gate = self.gelu(&gate)?;
+        let gated = self.mul(&gate, &per_layer)?;
+        let projected = self.linear(&gated, 1, &format!("{prefix}.per_layer_projection.weight"))?;
+        let projected = self.rms_norm(
+            &projected,
+            &format!("{prefix}.post_per_layer_input_norm.weight"),
+            config.rms_norm_eps,
+        )?;
+        self.add(hidden, &projected)
+    }
+
     /// Executes tied-embedding LM-head projection for one token.
     ///
     /// This is also a runtime validation of the persistent BF16 store and the
@@ -852,10 +1003,15 @@ impl Gemma4CudaState {
         config: &Gemma4TextConfig,
         table: &mut Gemma4CudaCacheTable,
     ) -> Result<Vec<f32>> {
-        let mut hidden = self.embedding(token, config.hidden_size)?;
+        let embedding = self.embedding(token, config.hidden_size)?;
+        let packed_ple = self.packed_ple(token, &embedding, config)?;
+        let mut hidden = embedding;
         for layer in 0..config.num_hidden_layers {
             hidden = self.decoder_attention(&hidden, layer, config, table)?;
             hidden = self.decoder_mlp(&hidden, layer, config.rms_norm_eps)?;
+            if let Some(ple) = &packed_ple {
+                hidden = self.apply_ple(&hidden, ple, layer, config)?;
+            }
         }
         hidden = self.rms_norm(&hidden, "norm.weight", config.rms_norm_eps)?;
         table.position += 1;
