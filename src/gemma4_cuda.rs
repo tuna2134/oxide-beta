@@ -344,6 +344,38 @@ impl Gemma4CudaState {
         Ok(hidden)
     }
 
+    fn embedding_rows(&self, tokens: &[u32], hidden_size: usize) -> Result<WorkspaceF32> {
+        let embedding = self.weight("embed_tokens.weight")?;
+        if tokens.is_empty()
+            || embedding.shape.len() != 2
+            || embedding.shape[1] != hidden_size
+            || tokens
+                .iter()
+                .any(|&token| token as usize >= embedding.shape[0])
+        {
+            return Err(Error::InvalidShape(
+                "invalid batched CUDA embedding input".into(),
+            ));
+        }
+        let token_buffer = DeviceBuffer::from_host(&self.stream, tokens).map_err(cuda_error)?;
+        let mut hidden = self.output_f32(tokens.len() * hidden_size)?;
+        #[allow(clippy::cast_precision_loss)]
+        let scale = (hidden_size as f32).sqrt();
+        unsafe {
+            self.module.gemma_embedding_rows(
+                &self.stream,
+                Self::launch_config(hidden.len())?,
+                hidden_size,
+                scale,
+                &token_buffer,
+                &embedding.buffer,
+                &mut hidden,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(hidden)
+    }
+
     fn to_bf16(&self, input: &DeviceBuffer<f32>) -> Result<WorkspaceBf16> {
         let mut output = self.output_bf16(input.len())?;
         // SAFETY: input/output have equal lengths and are disjoint.
@@ -463,12 +495,12 @@ impl Gemma4CudaState {
         theta: f32,
         factor: f32,
     ) -> Result<WorkspaceF32> {
-        if heads == 0 || input.len() != heads * head_dim {
+        if heads == 0 || head_dim == 0 || input.len() % (heads * head_dim) != 0 {
             return Err(Error::InvalidShape("RoPE shape mismatch".into()));
         }
         let mut output = self.output_f32(input.len())?;
-        // SAFETY: the input is one complete `[heads, head_dim]` token and
-        // rotary_dim equals head_dim. Output has an identical extent.
+        // SAFETY: the input contains complete `[heads, head_dim]` rows and
+        // output has an identical extent.
         unsafe {
             self.module.gemma_rope(
                 &self.stream,
@@ -555,6 +587,55 @@ impl Gemma4CudaState {
                     &mut output,
                 )
             }
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gqa_prefill(
+        &self,
+        query: &DeviceBuffer<f32>,
+        key: &DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+        rows: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        window: usize,
+    ) -> Result<WorkspaceF32> {
+        if rows == 0
+            || rows > 4096
+            || query.len() != rows * heads * head_dim
+            || key.len() < rows * kv_heads * head_dim
+            || value.len() != key.len()
+            || heads % kv_heads != 0
+        {
+            return Err(Error::InvalidShape("prefill GQA shape mismatch".into()));
+        }
+        let blocks = rows
+            .checked_mul(heads)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| Error::InvalidShape("prefill GQA grid overflow".into()))?;
+        let mut output = self.output_f32(query.len())?;
+        unsafe {
+            self.module.gemma_gqa_prefill_block(
+                &self.stream,
+                LaunchConfig {
+                    grid_dim: (blocks, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                rows,
+                heads,
+                kv_heads,
+                head_dim,
+                window,
+                query,
+                key,
+                value,
+                &mut output,
+            )
         }
         .map_err(cuda_error)?;
         Ok(output)
@@ -874,6 +955,40 @@ impl Gemma4CudaState {
         Ok(output)
     }
 
+    fn slice_rows(
+        &self,
+        input: &DeviceBuffer<f32>,
+        rows: usize,
+        input_width: usize,
+        column_offset: usize,
+        output_width: usize,
+    ) -> Result<WorkspaceF32> {
+        if rows == 0
+            || input.len() != rows * input_width
+            || column_offset
+                .checked_add(output_width)
+                .is_none_or(|end| end > input_width)
+        {
+            return Err(Error::InvalidShape(
+                "CUDA row slice is out of bounds".into(),
+            ));
+        }
+        let mut output = self.output_f32(rows * output_width)?;
+        unsafe {
+            self.module.gemma_slice_rows(
+                &self.stream,
+                Self::launch_config(output.len())?,
+                input_width,
+                output_width,
+                column_offset,
+                input,
+                &mut output,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
     fn gelu(&self, input: &DeviceBuffer<f32>) -> Result<WorkspaceF32> {
         let mut output = self.output_f32(input.len())?;
         // SAFETY: input/output extents match and allocations are disjoint.
@@ -940,6 +1055,56 @@ impl Gemma4CudaState {
         ))
     }
 
+    fn packed_ple_rows(
+        &self,
+        tokens: &[u32],
+        embedding: &DeviceBuffer<f32>,
+        config: &Gemma4TextConfig,
+    ) -> Result<Option<WorkspaceF32>> {
+        let rows = tokens.len();
+        let dimension = config.hidden_size_per_layer_input;
+        if dimension == 0 {
+            return Ok(None);
+        }
+        let packed = config.num_hidden_layers * dimension;
+        let token_weight = self.weight("embed_tokens_per_layer.weight")?;
+        if token_weight.shape.as_slice() != [config.vocab_size_per_layer_input, packed]
+            || tokens
+                .iter()
+                .any(|&token| token as usize >= token_weight.shape[0])
+        {
+            return Err(Error::InvalidShape("invalid batched PLE input".into()));
+        }
+        let token_buffer = DeviceBuffer::from_host(&self.stream, tokens).map_err(cuda_error)?;
+        let mut token_ple = self.output_f32(rows * packed)?;
+        #[allow(clippy::cast_precision_loss)]
+        let token_scale = (dimension as f32).sqrt();
+        unsafe {
+            self.module.gemma_embedding_rows(
+                &self.stream,
+                Self::launch_config(token_ple.len())?,
+                packed,
+                token_scale,
+                &token_buffer,
+                &token_weight.buffer,
+                &mut token_ple,
+            )
+        }
+        .map_err(cuda_error)?;
+        let context = self.linear(embedding, rows, "per_layer_model_projection.weight")?;
+        #[allow(clippy::cast_precision_loss)]
+        let context = self.scale(&context, 1.0 / (config.hidden_size as f32).sqrt())?;
+        let context = self.rms_norm(
+            &context,
+            "per_layer_projection_norm.weight",
+            config.rms_norm_eps,
+        )?;
+        let combined = self.add(&context, &token_ple)?;
+        Ok(Some(
+            self.scale(&combined, core::f32::consts::FRAC_1_SQRT_2)?,
+        ))
+    }
+
     fn apply_ple(
         &self,
         hidden: &DeviceBuffer<f32>,
@@ -954,6 +1119,38 @@ impl Gemma4CudaState {
         let gate = self.gelu(&gate)?;
         let gated = self.mul(&gate, &per_layer)?;
         let projected = self.linear(&gated, 1, &format!("{prefix}.per_layer_projection.weight"))?;
+        let projected = self.rms_norm(
+            &projected,
+            &format!("{prefix}.post_per_layer_input_norm.weight"),
+            config.rms_norm_eps,
+        )?;
+        self.add(hidden, &projected)
+    }
+
+    fn apply_ple_rows(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        packed_ple: &DeviceBuffer<f32>,
+        rows: usize,
+        layer: usize,
+        config: &Gemma4TextConfig,
+    ) -> Result<WorkspaceF32> {
+        let dimension = config.hidden_size_per_layer_input;
+        let packed = config.num_hidden_layers * dimension;
+        let per_layer = self.slice_rows(packed_ple, rows, packed, layer * dimension, dimension)?;
+        let prefix = format!("layers.{layer}");
+        let gate = self.linear(
+            hidden,
+            rows,
+            &format!("{prefix}.per_layer_input_gate.weight"),
+        )?;
+        let gate = self.gelu(&gate)?;
+        let gated = self.mul(&gate, &per_layer)?;
+        let projected = self.linear(
+            &gated,
+            rows,
+            &format!("{prefix}.per_layer_projection.weight"),
+        )?;
         let projected = self.rms_norm(
             &projected,
             &format!("{prefix}.post_per_layer_input_norm.weight"),
@@ -1154,6 +1351,32 @@ impl Gemma4CudaState {
         self.add(hidden, &down)
     }
 
+    fn decoder_mlp_rows(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        rows: usize,
+        layer: usize,
+        epsilon: f32,
+    ) -> Result<WorkspaceF32> {
+        let prefix = format!("layers.{layer}");
+        let normalized = self.rms_norm_bf16(
+            hidden,
+            &format!("{prefix}.pre_feedforward_layernorm.weight"),
+            epsilon,
+        )?;
+        let gate =
+            self.linear_bf16(&normalized, rows, &format!("{prefix}.mlp.gate_proj.weight"))?;
+        let up = self.linear_bf16(&normalized, rows, &format!("{prefix}.mlp.up_proj.weight"))?;
+        let activated = self.gelu_mul(&gate, &up)?;
+        let down = self.linear(&activated, rows, &format!("{prefix}.mlp.down_proj.weight"))?;
+        let down = self.rms_norm(
+            &down,
+            &format!("{prefix}.post_feedforward_layernorm.weight"),
+            epsilon,
+        )?;
+        self.add(hidden, &down)
+    }
+
     fn decoder_attention(
         &self,
         hidden: &DeviceBuffer<f32>,
@@ -1285,6 +1508,141 @@ impl Gemma4CudaState {
         Ok(output)
     }
 
+    fn decoder_attention_rows(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        rows: usize,
+        layer: usize,
+        config: &Gemma4TextConfig,
+        table: &mut Gemma4CudaCacheTable,
+    ) -> Result<WorkspaceF32> {
+        let prefix = format!("layers.{layer}");
+        let normalized = self.rms_norm_bf16(
+            hidden,
+            &format!("{prefix}.input_layernorm.weight"),
+            config.rms_norm_eps,
+        )?;
+        let layer_type = &config
+            .layer_types
+            .as_ref()
+            .ok_or_else(|| Error::Execution("Gemma 4 layer_types are missing".into()))?[layer];
+        let sliding = layer_type == "sliding_attention";
+        let head_dim = if sliding {
+            config.head_dim
+        } else {
+            config.global_head_dim
+        };
+        let rope = config
+            .rope_parameters
+            .as_ref()
+            .and_then(|parameters| parameters.get(layer_type))
+            .ok_or_else(|| Error::Execution(format!("RoPE parameters for {layer_type} missing")))?;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let rotary_dim = (rope.partial_rotary_factor * head_dim as f32) as usize;
+        let query = self.linear_bf16(
+            &normalized,
+            rows,
+            &format!("{prefix}.self_attn.q_proj.weight"),
+        )?;
+        let query = self.rms_norm(
+            &query,
+            &format!("{prefix}.self_attn.q_norm.weight"),
+            config.rms_norm_eps,
+        )?;
+        let query = self.rope(
+            &query,
+            config.num_attention_heads,
+            head_dim,
+            rotary_dim,
+            0,
+            rope.rope_theta,
+            rope.factor,
+        )?;
+        let source = table.sources[layer];
+        if source == layer {
+            let key = self.linear_bf16(
+                &normalized,
+                rows,
+                &format!("{prefix}.self_attn.k_proj.weight"),
+            )?;
+            let value = self.linear_bf16(
+                &normalized,
+                rows,
+                &format!("{prefix}.self_attn.v_proj.weight"),
+            )?;
+            let key = self.rms_norm(
+                &key,
+                &format!("{prefix}.self_attn.k_norm.weight"),
+                config.rms_norm_eps,
+            )?;
+            let cache = table.layers[layer]
+                .as_mut()
+                .ok_or_else(|| Error::Execution(format!("layer {layer} cache is missing")))?;
+            let key = self.rope(
+                &key,
+                cache.kv_heads,
+                head_dim,
+                rotary_dim,
+                0,
+                rope.rope_theta,
+                rope.factor,
+            )?;
+            let value = self.rms_norm_unit(&value, head_dim, config.rms_norm_eps)?;
+            let width = cache.kv_heads * head_dim;
+            if cache.len != 0 || cache.start != 0 || rows > cache.capacity {
+                return Err(Error::Execution(
+                    "batched prefill requires an empty contiguous KV cache".into(),
+                ));
+            }
+            unsafe {
+                self.module.gemma_cache_write(
+                    &self.stream,
+                    Self::launch_config(rows * width)?,
+                    0,
+                    &key,
+                    &mut cache.key,
+                )
+            }
+            .map_err(cuda_error)?;
+            unsafe {
+                self.module.gemma_cache_write(
+                    &self.stream,
+                    Self::launch_config(rows * width)?,
+                    0,
+                    &value,
+                    &mut cache.value,
+                )
+            }
+            .map_err(cuda_error)?;
+            cache.len = rows;
+            cache.total_seen = rows;
+        }
+        let cache = table.layers[source]
+            .as_ref()
+            .ok_or_else(|| Error::Execution(format!("source cache {source} is missing")))?;
+        let attended = self.gqa_prefill(
+            &query,
+            &cache.key,
+            &cache.value,
+            rows,
+            config.num_attention_heads,
+            cache.kv_heads,
+            head_dim,
+            if sliding { config.sliding_window } else { 0 },
+        )?;
+        let projected = self.linear(
+            &attended,
+            rows,
+            &format!("{prefix}.self_attn.o_proj.weight"),
+        )?;
+        let projected = self.rms_norm(
+            &projected,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            config.rms_norm_eps,
+        )?;
+        self.add(hidden, &projected)
+    }
+
     fn forward_token(
         &self,
         token: u32,
@@ -1311,6 +1669,76 @@ impl Gemma4CudaState {
         }
         table.position += 1;
         Ok(hidden)
+    }
+
+    fn forward_prompt_rows(
+        &self,
+        tokens: &[u32],
+        config: &Gemma4TextConfig,
+        table: &mut Gemma4CudaCacheTable,
+    ) -> Result<WorkspaceF32> {
+        if tokens.is_empty() || tokens.len() > 4096 || table.position != 0 {
+            return Err(Error::Execution(
+                "batched prefill requires 1..=4096 tokens and an empty cache table".into(),
+            ));
+        }
+        if table
+            .layers
+            .iter()
+            .flatten()
+            .any(|cache| cache.capacity < tokens.len() || !cache.is_empty())
+        {
+            return Err(Error::Execution(
+                "prompt does not fit the contiguous batched-prefill cache".into(),
+            ));
+        }
+        let rows = tokens.len();
+        let embedding = self.embedding_rows(tokens, config.hidden_size)?;
+        let packed_ple = self.packed_ple_rows(tokens, &embedding, config)?;
+        let mut hidden = embedding;
+        for layer in 0..config.num_hidden_layers {
+            hidden = self.decoder_attention_rows(&hidden, rows, layer, config, table)?;
+            hidden = self.decoder_mlp_rows(&hidden, rows, layer, config.rms_norm_eps)?;
+            if let Some(ple) = &packed_ple {
+                hidden = self.apply_ple_rows(&hidden, ple, rows, layer, config)?;
+            }
+            hidden = self.scale_by_weight(&hidden, &format!("layers.{layer}.layer_scalar"))?;
+        }
+        table.position = rows;
+        Ok(hidden)
+    }
+
+    /// Prefills a complete prompt with matrix-shaped projections and returns
+    /// the final-token logits. The empty-cache restriction keeps causal KV
+    /// layout simple and preserves the one-token path as a safe fallback.
+    pub fn prefill_prompt(
+        &self,
+        tokens: &[u32],
+        config: &Gemma4TextConfig,
+        table: &mut Gemma4CudaCacheTable,
+    ) -> Result<Vec<f32>> {
+        let hidden = self.forward_prompt_rows(tokens, config, table)?;
+        let last = self.slice(
+            &hidden,
+            (tokens.len() - 1) * config.hidden_size,
+            config.hidden_size,
+        )?;
+        let hidden = self.rms_norm(&last, "norm.weight", config.rms_norm_eps)?;
+        let embedding = self.weight("embed_tokens.weight")?;
+        let hidden_bf16 = self.to_bf16(&hidden)?;
+        let mut logits = self.output_f32(config.vocab_size)?;
+        self.cublas.linear_bf16_f32(
+            &self.stream,
+            1,
+            config.vocab_size,
+            config.hidden_size,
+            &hidden_bf16,
+            &embedding.buffer,
+            &mut logits,
+        )?;
+        let mut logits = logits.to_host_vec(&self.stream).map_err(cuda_error)?;
+        apply_logit_softcap(&mut logits, config.final_logit_softcapping);
+        Ok(logits)
     }
 
     /// Prefills one token into the persistent KV cache without evaluating the

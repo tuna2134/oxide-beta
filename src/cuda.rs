@@ -983,6 +983,24 @@ pub(crate) mod kernels {
     }
 
     #[kernel]
+    pub fn gemma_embedding_rows(
+        hidden: usize,
+        scale: f32,
+        tokens: &[u32],
+        embedding_bf16: &[u16],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            let row = raw / hidden;
+            let column = raw % hidden;
+            let token = tokens[row] as usize;
+            *value = f32::from_bits((embedding_bf16[token * hidden + column] as u32) << 16) * scale;
+        }
+    }
+
+    #[kernel]
     pub fn gemma_f32_to_bf16(input: &[f32], mut output: DisjointSlice<u16>) {
         let index = thread::index_1d();
         let raw = index.get();
@@ -1027,6 +1045,23 @@ pub(crate) mod kernels {
         let raw = index.get();
         if let Some(value) = output.get_mut(index) {
             *value = input[offset + raw];
+        }
+    }
+
+    #[kernel]
+    pub fn gemma_slice_rows(
+        input_width: usize,
+        output_width: usize,
+        column_offset: usize,
+        input: &[f32],
+        mut output: DisjointSlice<f32>,
+    ) {
+        let index = thread::index_1d();
+        let raw = index.get();
+        if let Some(value) = output.get_mut(index) {
+            let row = raw / output_width;
+            let column = raw % output_width;
+            *value = input[row * input_width + column_offset + column];
         }
     }
 
@@ -1262,6 +1297,85 @@ pub(crate) mod kernels {
             }
             unsafe {
                 *output.get_unchecked_mut(head * head_dim + dimension) = weighted / normalizer
+            };
+            dimension += 256;
+        }
+    }
+
+    /// Causal GQA for a complete prompt resident in a contiguous KV cache.
+    /// Each block owns one `(token, query_head)` pair and shares its attention
+    /// probabilities across all dimensions of that head.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemma_gqa_prefill_block(
+        rows: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        window: usize,
+        query: &[f32],
+        key_cache: &[f32],
+        value_cache: &[f32],
+        mut output: DisjointSlice<f32>,
+    ) {
+        static mut PROBABILITIES: SharedArray<f32, 4096> = SharedArray::UNINIT;
+        static mut NORMALIZER: SharedArray<f32, 1> = SharedArray::UNINIT;
+        let block = thread::blockIdx_x() as usize;
+        let lane = thread::threadIdx_x() as usize;
+        let row = block / heads;
+        let head = block % heads;
+        if row >= rows {
+            return;
+        }
+        let visible = row + 1;
+        let start = if window == 0 || visible <= window {
+            0
+        } else {
+            visible - window
+        };
+        let kv_head = head / (heads / kv_heads);
+        if lane == 0 {
+            let mut maximum = f32::NEG_INFINITY;
+            let mut position = start;
+            while position < visible {
+                let mut score = 0.0;
+                let mut inner = 0;
+                while inner < head_dim {
+                    score += query[(row * heads + head) * head_dim + inner]
+                        * key_cache[(position * kv_heads + kv_head) * head_dim + inner];
+                    inner += 1;
+                }
+                unsafe { PROBABILITIES[position - start] = score };
+                if score > maximum {
+                    maximum = score;
+                }
+                position += 1;
+            }
+            let mut normalizer = 0.0;
+            position = start;
+            while position < visible {
+                let probability =
+                    core::intrinsics::expf32(unsafe { PROBABILITIES[position - start] } - maximum);
+                unsafe { PROBABILITIES[position - start] = probability };
+                normalizer += probability;
+                position += 1;
+            }
+            unsafe { NORMALIZER[0] = normalizer };
+        }
+        thread::sync_threads();
+        let normalizer = unsafe { NORMALIZER[0] };
+        let mut dimension = lane;
+        while dimension < head_dim {
+            let mut weighted = 0.0;
+            let mut position = start;
+            while position < visible {
+                weighted += unsafe { PROBABILITIES[position - start] }
+                    * value_cache[(position * kv_heads + kv_head) * head_dim + dimension];
+                position += 1;
+            }
+            unsafe {
+                *output.get_unchecked_mut((row * heads + head) * head_dim + dimension) =
+                    weighted / normalizer
             };
             dimension += 256;
         }

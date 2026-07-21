@@ -138,14 +138,26 @@ fn main() -> oxide_torch::Result<()> {
         if std::env::var_os("GEMMA4_SKIP_DECODE").is_none() {
             let mut logits = Vec::new();
             let prefill_started = std::time::Instant::now();
-            for (index, &token) in token_ids.iter().enumerate() {
-                if index + 1 == token_ids.len() {
-                    logits = cuda.decode_token(token, model.config(), &mut cache_table)?;
-                } else {
-                    cuda.prefill_token(token, model.config(), &mut cache_table)?;
-                }
+            let batched_prefill = std::env::var_os("GEMMA4_SEQUENTIAL_PREFILL").is_none();
+            if batched_prefill {
+                logits = cuda.prefill_prompt(&token_ids, model.config(), &mut cache_table)?;
                 if verbose {
-                    eprintln!("Gemma4 prefill: {}/{}", index + 1, token_ids.len());
+                    eprintln!(
+                        "Gemma4 prefill: {}/{} (batched)",
+                        token_ids.len(),
+                        token_ids.len()
+                    );
+                }
+            } else {
+                for (index, &token) in token_ids.iter().enumerate() {
+                    if index + 1 == token_ids.len() {
+                        logits = cuda.decode_token(token, model.config(), &mut cache_table)?;
+                    } else {
+                        cuda.prefill_token(token, model.config(), &mut cache_table)?;
+                    }
+                    if verbose {
+                        eprintln!("Gemma4 prefill: {}/{}", index + 1, token_ids.len());
+                    }
                 }
             }
             if profile {
