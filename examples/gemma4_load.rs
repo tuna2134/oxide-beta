@@ -174,6 +174,8 @@ fn main() -> oxide_torch::Result<()> {
             }
             let mut random = generation.seed;
             let mut generated = Vec::with_capacity(generation.max_new_tokens);
+            let mut streamed = String::new();
+            const TEXT_STOP_MARKERS: [&str; 2] = ["<end_of_turn>", "<start_of_turn>"];
             for index in 0..generation.max_new_tokens {
                 let mut sampling_logits = logits.clone();
                 if repetition_penalty > 1.0 {
@@ -196,19 +198,31 @@ fn main() -> oxide_torch::Result<()> {
                     break;
                 }
                 generated.push(next);
+                let piece = tokenizer.decode(&[next], true)?;
+                streamed.push_str(&piece);
                 println!(
                     "Gemma4 generate: {}/{} token={} piece={:?}",
                     index + 1,
                     generation.max_new_tokens,
                     next,
-                    tokenizer.decode(&[next], true)?,
+                    piece,
                 );
+                if TEXT_STOP_MARKERS
+                    .iter()
+                    .any(|marker| streamed.ends_with(marker))
+                {
+                    break;
+                }
                 logits = cuda.decode_token(next, model.config(), &mut cache_table)?;
             }
-            println!(
-                "CUDA Gemma4 response: {}",
-                tokenizer.decode(&generated, true)?
-            );
+            let mut response = tokenizer.decode(&generated, true)?;
+            for marker in TEXT_STOP_MARKERS {
+                if let Some(stripped) = response.strip_suffix(marker) {
+                    response = stripped.to_owned();
+                    break;
+                }
+            }
+            println!("CUDA Gemma4 response: {response}");
         }
     }
     Ok(())
