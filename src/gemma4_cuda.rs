@@ -60,6 +60,31 @@ struct CudaWeight {
     buffer: DeviceBuffer<u16>,
 }
 
+struct Gemma4DecodeLayerPlan {
+    source: usize,
+    sliding: bool,
+    head_dim: usize,
+    rotary_dim: usize,
+    rope_theta: f32,
+    rope_factor: f32,
+    input_norm: usize,
+    query_projection: usize,
+    fused_qkv: bool,
+    query_norm: usize,
+    key_norm: Option<usize>,
+    output_projection: usize,
+    post_attention_norm: usize,
+    pre_feedforward_norm: usize,
+    gate_projection: usize,
+    up_projection: usize,
+    down_projection: usize,
+    post_feedforward_norm: usize,
+    ple_gate: Option<usize>,
+    ple_projection: Option<usize>,
+    ple_norm: Option<usize>,
+    layer_scalar: usize,
+}
+
 /// Persistent fixed-allocation ring buffer for autoregressive K/V state.
 pub struct Gemma4CudaKvCache {
     key: DeviceBuffer<f32>,
@@ -119,7 +144,9 @@ pub struct Gemma4CudaState {
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) cublas: Cublas,
     module: crate::cuda::kernels::LoadedModule,
-    weights: HashMap<String, CudaWeight>,
+    weights: Vec<CudaWeight>,
+    weight_indices: HashMap<String, usize>,
+    decode_plan: Vec<Gemma4DecodeLayerPlan>,
     f32_pool: BufferPool<f32>,
     bf16_pool: BufferPool<u16>,
     seen_tokens: RefCell<Option<DeviceBuffer<u8>>>,
@@ -207,7 +234,13 @@ impl Gemma4CudaState {
                     buffer,
                 })
             })?;
-            weights.insert(name, weight);
+            let canonical_name = name
+                .strip_prefix("model.language_model.")
+                .or_else(|| name.strip_prefix("language_model."))
+                .or_else(|| name.strip_prefix("model."))
+                .unwrap_or(name.as_str())
+                .to_owned();
+            weights.insert(canonical_name, weight);
         }
         // Qwen/tinygrad-style fused QKV projection. Gemma's first physical
         // cache layers produce Q, K and V together; later KV-sharing layers
@@ -280,6 +313,105 @@ impl Gemma4CudaState {
                 },
             );
         }
+        let mut named_weights: Vec<_> = weights.into_iter().collect();
+        named_weights.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let mut weight_indices = HashMap::with_capacity(named_weights.len());
+        let mut weights = Vec::with_capacity(named_weights.len());
+        for (name, weight) in named_weights {
+            weight_indices.insert(name, weights.len());
+            weights.push(weight);
+        }
+        let weight_index = |name: &str| {
+            weight_indices
+                .get(name)
+                .copied()
+                .ok_or_else(|| Error::Execution(format!("missing CUDA weight `{name}`")))
+        };
+        let layer_types = model
+            .config()
+            .layer_types
+            .as_ref()
+            .ok_or_else(|| Error::Execution("Gemma 4 layer_types are missing".into()))?;
+        let mut decode_plan = Vec::with_capacity(model.config().num_hidden_layers);
+        let mut last_sliding = None;
+        let mut last_full = None;
+        for (layer, layer_type) in layer_types.iter().enumerate() {
+            let prefix = format!("layers.{layer}");
+            let sliding = layer_type == "sliding_attention";
+            let source = if layer < physical_layers {
+                if sliding {
+                    last_sliding = Some(layer);
+                } else {
+                    last_full = Some(layer);
+                }
+                layer
+            } else if sliding {
+                last_sliding.ok_or_else(|| {
+                    Error::Execution(format!("layer {layer} has no sliding KV source"))
+                })?
+            } else {
+                last_full.ok_or_else(|| {
+                    Error::Execution(format!("layer {layer} has no global KV source"))
+                })?
+            };
+            let head_dim = if sliding {
+                model.config().head_dim
+            } else {
+                model.config().global_head_dim
+            };
+            let rope = model
+                .config()
+                .rope_parameters
+                .as_ref()
+                .and_then(|parameters| parameters.get(layer_type))
+                .ok_or_else(|| {
+                    Error::Execution(format!("RoPE parameters for {layer_type} missing"))
+                })?;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let rotary_dim = (rope.partial_rotary_factor * head_dim as f32) as usize;
+            decode_plan.push(Gemma4DecodeLayerPlan {
+                source,
+                sliding,
+                head_dim,
+                rotary_dim,
+                rope_theta: rope.rope_theta,
+                rope_factor: rope.factor,
+                input_norm: weight_index(&format!("{prefix}.input_layernorm.weight"))?,
+                query_projection: weight_index(&if source == layer {
+                    format!("{prefix}.self_attn.qkv_proj.weight")
+                } else {
+                    format!("{prefix}.self_attn.q_proj.weight")
+                })?,
+                fused_qkv: source == layer,
+                query_norm: weight_index(&format!("{prefix}.self_attn.q_norm.weight"))?,
+                key_norm: (source == layer)
+                    .then(|| weight_index(&format!("{prefix}.self_attn.k_norm.weight")))
+                    .transpose()?,
+                output_projection: weight_index(&format!("{prefix}.self_attn.o_proj.weight"))?,
+                post_attention_norm: weight_index(&format!(
+                    "{prefix}.post_attention_layernorm.weight"
+                ))?,
+                pre_feedforward_norm: weight_index(&format!(
+                    "{prefix}.pre_feedforward_layernorm.weight"
+                ))?,
+                gate_projection: weight_index(&format!("{prefix}.mlp.gate_proj.weight"))?,
+                up_projection: weight_index(&format!("{prefix}.mlp.up_proj.weight"))?,
+                down_projection: weight_index(&format!("{prefix}.mlp.down_proj.weight"))?,
+                post_feedforward_norm: weight_index(&format!(
+                    "{prefix}.post_feedforward_layernorm.weight"
+                ))?,
+                ple_gate: (model.config().hidden_size_per_layer_input != 0)
+                    .then(|| weight_index(&format!("{prefix}.per_layer_input_gate.weight")))
+                    .transpose()?,
+                ple_projection: (model.config().hidden_size_per_layer_input != 0)
+                    .then(|| weight_index(&format!("{prefix}.per_layer_projection.weight")))
+                    .transpose()?,
+                ple_norm: (model.config().hidden_size_per_layer_input != 0)
+                    .then(|| weight_index(&format!("{prefix}.post_per_layer_input_norm.weight")))
+                    .transpose()?,
+                layer_scalar: weight_index(&format!("{prefix}.layer_scalar"))?,
+            });
+        }
         stream.synchronize().map_err(cuda_error)?;
         Ok(Self {
             _context: context,
@@ -287,6 +419,8 @@ impl Gemma4CudaState {
             cublas,
             module,
             weights,
+            weight_indices,
+            decode_plan,
             f32_pool: Rc::new(RefCell::new(HashMap::new())),
             bf16_pool: Rc::new(RefCell::new(HashMap::new())),
             seen_tokens: RefCell::new(None),
@@ -303,7 +437,7 @@ impl Gemma4CudaState {
     #[must_use]
     pub fn weight_bytes(&self) -> usize {
         self.weights
-            .values()
+            .iter()
             .map(|weight| weight.buffer.len() * std::mem::size_of::<u16>())
             .sum()
     }
@@ -324,8 +458,15 @@ impl Gemma4CudaState {
         ];
         aliases
             .iter()
-            .find_map(|name| self.weights.get(name))
+            .find_map(|name| self.weight_indices.get(name).copied())
+            .map(|index| &self.weights[index])
             .ok_or_else(|| Error::Execution(format!("CUDA weight `{suffix}` is missing")))
+    }
+
+    fn weight_at(&self, index: usize) -> Result<&CudaWeight> {
+        self.weights
+            .get(index)
+            .ok_or_else(|| Error::Execution("CUDA decode-plan weight index is invalid".into()))
     }
 
     fn output_f32(&self, len: usize) -> Result<WorkspaceF32> {
@@ -497,6 +638,39 @@ impl Gemma4CudaState {
         Ok(output)
     }
 
+    fn rms_norm_at(
+        &self,
+        input: &DeviceBuffer<f32>,
+        weight_index: usize,
+        epsilon: f32,
+    ) -> Result<WorkspaceF32> {
+        let weight = self.weight_at(weight_index)?;
+        let hidden = *weight
+            .shape
+            .first()
+            .filter(|_| weight.shape.len() == 1)
+            .ok_or_else(|| Error::InvalidShape("decode-plan RMSNorm weight is invalid".into()))?;
+        if input.len() % hidden != 0 {
+            return Err(Error::InvalidShape(
+                "decode-plan RMSNorm input mismatch".into(),
+            ));
+        }
+        let mut output = self.output_f32(input.len())?;
+        unsafe {
+            self.module.gemma_rms_norm(
+                &self.stream,
+                Self::row_launch_config(input.len() / hidden)?,
+                hidden,
+                epsilon,
+                input,
+                &weight.buffer,
+                &mut output,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
     fn rms_norm_bf16(
         &self,
         input: &DeviceBuffer<f32>,
@@ -513,6 +687,39 @@ impl Gemma4CudaState {
             return Err(Error::InvalidShape(format!(
                 "{weight_name} does not match its RMSNorm input"
             )));
+        }
+        let mut output = self.output_bf16(input.len())?;
+        unsafe {
+            self.module.gemma_rms_norm_bf16(
+                &self.stream,
+                Self::row_launch_config(input.len() / hidden)?,
+                hidden,
+                epsilon,
+                input,
+                &weight.buffer,
+                &mut output,
+            )
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
+    fn rms_norm_bf16_at(
+        &self,
+        input: &DeviceBuffer<f32>,
+        weight_index: usize,
+        epsilon: f32,
+    ) -> Result<WorkspaceBf16> {
+        let weight = self.weight_at(weight_index)?;
+        let hidden = *weight
+            .shape
+            .first()
+            .filter(|_| weight.shape.len() == 1)
+            .ok_or_else(|| Error::InvalidShape("decode-plan RMSNorm weight is invalid".into()))?;
+        if input.len() % hidden != 0 {
+            return Err(Error::InvalidShape(
+                "decode-plan RMSNorm input mismatch".into(),
+            ));
         }
         let mut output = self.output_bf16(input.len())?;
         unsafe {
@@ -907,6 +1114,47 @@ impl Gemma4CudaState {
         Ok(output)
     }
 
+    fn linear_bf16_at(
+        &self,
+        input: &DeviceBuffer<u16>,
+        rows: usize,
+        weight_index: usize,
+    ) -> Result<WorkspaceF32> {
+        let weight = self.weight_at(weight_index)?;
+        if weight.shape.len() != 2 {
+            return Err(Error::InvalidShape(
+                "decode-plan linear weight is not a matrix".into(),
+            ));
+        }
+        let (output_width, input_width) = (weight.shape[0], weight.shape[1]);
+        if input.len() != rows * input_width {
+            return Err(Error::InvalidShape(
+                "decode-plan BF16 linear input mismatch".into(),
+            ));
+        }
+        let mut output = self.output_f32(rows * output_width)?;
+        self.cublas.linear_bf16_f32(
+            &self.stream,
+            rows,
+            output_width,
+            input_width,
+            input,
+            &weight.buffer,
+            &mut output,
+        )?;
+        Ok(output)
+    }
+
+    fn linear_at(
+        &self,
+        input: &DeviceBuffer<f32>,
+        rows: usize,
+        weight_index: usize,
+    ) -> Result<WorkspaceF32> {
+        let input = self.to_bf16(input)?;
+        self.linear_bf16_at(&input, rows, weight_index)
+    }
+
     fn linear_qkv_bf16(
         &self,
         input: &DeviceBuffer<u16>,
@@ -923,6 +1171,34 @@ impl Gemma4CudaState {
             return Err(Error::InvalidShape(format!(
                 "{fused_name} output has an unexpected extent"
             )));
+        }
+        let query = self.slice_rows(&fused, rows, row_width, 0, query_width)?;
+        let key = self.slice_rows(&fused, rows, row_width, query_width, key_width)?;
+        let value = self.slice_rows(
+            &fused,
+            rows,
+            row_width,
+            query_width + key_width,
+            value_width,
+        )?;
+        Ok((query, key, value))
+    }
+
+    fn linear_qkv_bf16_at(
+        &self,
+        input: &DeviceBuffer<u16>,
+        rows: usize,
+        weight_index: usize,
+        query_width: usize,
+        key_width: usize,
+        value_width: usize,
+    ) -> Result<(WorkspaceF32, WorkspaceF32, WorkspaceF32)> {
+        let fused = self.linear_bf16_at(input, rows, weight_index)?;
+        let row_width = query_width + key_width + value_width;
+        if fused.len() != rows * row_width {
+            return Err(Error::InvalidShape(
+                "decode-plan fused QKV output mismatch".into(),
+            ));
         }
         let query = self.slice_rows(&fused, rows, row_width, 0, query_width)?;
         let key = self.slice_rows(&fused, rows, row_width, query_width, key_width)?;
@@ -1009,20 +1285,18 @@ impl Gemma4CudaState {
         Ok(output)
     }
 
-    fn scale_by_weight(
+    fn scale_by_weight_at(
         &self,
         input: &DeviceBuffer<f32>,
-        weight_name: &str,
+        weight_index: usize,
     ) -> Result<WorkspaceF32> {
-        let weight = self.weight(weight_name)?;
+        let weight = self.weight_at(weight_index)?;
         if weight.buffer.len() != 1 {
-            return Err(Error::InvalidShape(format!(
-                "{weight_name} must contain one scalar"
-            )));
+            return Err(Error::InvalidShape(
+                "decode-plan scalar weight is invalid".into(),
+            ));
         }
         let mut output = self.output_f32(input.len())?;
-        // SAFETY: the scalar weight contains one element and output has the
-        // same extent as input.
         unsafe {
             self.module.gemma_mul_bf16_scalar(
                 &self.stream,
@@ -1214,14 +1488,28 @@ impl Gemma4CudaState {
     ) -> Result<WorkspaceF32> {
         let dimension = config.hidden_size_per_layer_input;
         let per_layer = self.slice(packed_ple, layer * dimension, dimension)?;
-        let prefix = format!("layers.{layer}");
-        let gate = self.linear(hidden, 1, &format!("{prefix}.per_layer_input_gate.weight"))?;
+        let plan = self
+            .decode_plan
+            .get(layer)
+            .ok_or_else(|| Error::Execution("Gemma decode layer is missing".into()))?;
+        let gate = self.linear_at(
+            hidden,
+            1,
+            plan.ple_gate
+                .ok_or_else(|| Error::Execution("Gemma PLE gate is missing".into()))?,
+        )?;
         let gate = self.gelu(&gate)?;
         let gated = self.mul(&gate, &per_layer)?;
-        let projected = self.linear(&gated, 1, &format!("{prefix}.per_layer_projection.weight"))?;
-        let projected = self.rms_norm(
+        let projected = self.linear_at(
+            &gated,
+            1,
+            plan.ple_projection
+                .ok_or_else(|| Error::Execution("Gemma PLE projection is missing".into()))?,
+        )?;
+        let projected = self.rms_norm_at(
             &projected,
-            &format!("{prefix}.post_per_layer_input_norm.weight"),
+            plan.ple_norm
+                .ok_or_else(|| Error::Execution("Gemma PLE norm is missing".into()))?,
             config.rms_norm_eps,
         )?;
         self.add(hidden, &projected)
@@ -1238,22 +1526,28 @@ impl Gemma4CudaState {
         let dimension = config.hidden_size_per_layer_input;
         let packed = config.num_hidden_layers * dimension;
         let per_layer = self.slice_rows(packed_ple, rows, packed, layer * dimension, dimension)?;
-        let prefix = format!("layers.{layer}");
-        let gate = self.linear(
+        let plan = self
+            .decode_plan
+            .get(layer)
+            .ok_or_else(|| Error::Execution("Gemma decode layer is missing".into()))?;
+        let gate = self.linear_at(
             hidden,
             rows,
-            &format!("{prefix}.per_layer_input_gate.weight"),
+            plan.ple_gate
+                .ok_or_else(|| Error::Execution("Gemma PLE gate is missing".into()))?,
         )?;
         let gate = self.gelu(&gate)?;
         let gated = self.mul(&gate, &per_layer)?;
-        let projected = self.linear(
+        let projected = self.linear_at(
             &gated,
             rows,
-            &format!("{prefix}.per_layer_projection.weight"),
+            plan.ple_projection
+                .ok_or_else(|| Error::Execution("Gemma PLE projection is missing".into()))?,
         )?;
-        let projected = self.rms_norm(
+        let projected = self.rms_norm_at(
             &projected,
-            &format!("{prefix}.post_per_layer_input_norm.weight"),
+            plan.ple_norm
+                .ok_or_else(|| Error::Execution("Gemma PLE norm is missing".into()))?,
             config.rms_norm_eps,
         )?;
         self.add(hidden, &projected)
@@ -1335,7 +1629,7 @@ impl Gemma4CudaState {
             epsilon,
         )?;
         let (query, key, value) = if self
-            .weights
+            .weight_indices
             .contains_key(&format!("{prefix}.self_attn.qkv_proj.weight"))
         {
             let normalized = self.to_bf16(&normalized)?;
@@ -1400,7 +1694,7 @@ impl Gemma4CudaState {
             epsilon,
         )?;
         let (query, key, value) = if self
-            .weights
+            .weight_indices
             .contains_key(&format!("{prefix}.self_attn.qkv_proj.weight"))
         {
             let normalized = self.to_bf16(&normalized)?;
@@ -1467,21 +1761,16 @@ impl Gemma4CudaState {
         layer: usize,
         epsilon: f32,
     ) -> Result<WorkspaceF32> {
-        let prefix = format!("layers.{layer}");
-        let normalized = self.rms_norm_bf16(
-            hidden,
-            &format!("{prefix}.pre_feedforward_layernorm.weight"),
-            epsilon,
-        )?;
-        let gate = self.linear_bf16(&normalized, 1, &format!("{prefix}.mlp.gate_proj.weight"))?;
-        let up = self.linear_bf16(&normalized, 1, &format!("{prefix}.mlp.up_proj.weight"))?;
+        let plan = self
+            .decode_plan
+            .get(layer)
+            .ok_or_else(|| Error::Execution("Gemma decode layer is missing".into()))?;
+        let normalized = self.rms_norm_bf16_at(hidden, plan.pre_feedforward_norm, epsilon)?;
+        let gate = self.linear_bf16_at(&normalized, 1, plan.gate_projection)?;
+        let up = self.linear_bf16_at(&normalized, 1, plan.up_projection)?;
         let activated = self.gelu_mul(&gate, &up)?;
-        let down = self.linear(&activated, 1, &format!("{prefix}.mlp.down_proj.weight"))?;
-        let down = self.rms_norm(
-            &down,
-            &format!("{prefix}.post_feedforward_layernorm.weight"),
-            epsilon,
-        )?;
+        let down = self.linear_at(&activated, 1, plan.down_projection)?;
+        let down = self.rms_norm_at(&down, plan.post_feedforward_norm, epsilon)?;
         self.add(hidden, &down)
     }
 
@@ -1492,22 +1781,16 @@ impl Gemma4CudaState {
         layer: usize,
         epsilon: f32,
     ) -> Result<WorkspaceF32> {
-        let prefix = format!("layers.{layer}");
-        let normalized = self.rms_norm_bf16(
-            hidden,
-            &format!("{prefix}.pre_feedforward_layernorm.weight"),
-            epsilon,
-        )?;
-        let gate =
-            self.linear_bf16(&normalized, rows, &format!("{prefix}.mlp.gate_proj.weight"))?;
-        let up = self.linear_bf16(&normalized, rows, &format!("{prefix}.mlp.up_proj.weight"))?;
+        let plan = self
+            .decode_plan
+            .get(layer)
+            .ok_or_else(|| Error::Execution("Gemma decode layer is missing".into()))?;
+        let normalized = self.rms_norm_bf16_at(hidden, plan.pre_feedforward_norm, epsilon)?;
+        let gate = self.linear_bf16_at(&normalized, rows, plan.gate_projection)?;
+        let up = self.linear_bf16_at(&normalized, rows, plan.up_projection)?;
         let activated = self.gelu_mul(&gate, &up)?;
-        let down = self.linear(&activated, rows, &format!("{prefix}.mlp.down_proj.weight"))?;
-        let down = self.rms_norm(
-            &down,
-            &format!("{prefix}.post_feedforward_layernorm.weight"),
-            epsilon,
-        )?;
+        let down = self.linear_at(&activated, rows, plan.down_projection)?;
+        let down = self.rms_norm_at(&down, plan.post_feedforward_norm, epsilon)?;
         self.add(hidden, &down)
     }
 
@@ -1518,114 +1801,92 @@ impl Gemma4CudaState {
         config: &Gemma4TextConfig,
         table: &mut Gemma4CudaCacheTable,
     ) -> Result<WorkspaceF32> {
-        let prefix = format!("layers.{layer}");
+        let plan = self
+            .decode_plan
+            .get(layer)
+            .ok_or_else(|| Error::Execution("Gemma decode layer is missing".into()))?;
         let trace =
             std::env::var_os("GEMMA4_TRACE_LAYERS").is_some() && table.position == 0 && layer == 0;
         let normalized_f32 = if trace {
-            Some(self.rms_norm(
-                hidden,
-                &format!("{prefix}.input_layernorm.weight"),
-                config.rms_norm_eps,
-            )?)
+            Some(self.rms_norm_at(hidden, plan.input_norm, config.rms_norm_eps)?)
         } else {
             None
         };
         let normalized = if let Some(value) = &normalized_f32 {
             self.to_bf16(value)?
         } else {
-            self.rms_norm_bf16(
-                hidden,
-                &format!("{prefix}.input_layernorm.weight"),
-                config.rms_norm_eps,
-            )?
+            self.rms_norm_bf16_at(hidden, plan.input_norm, config.rms_norm_eps)?
         };
-        self.trace_weight_fingerprint(
-            "layer.0.input_norm.weight",
-            &format!("{prefix}.input_layernorm.weight"),
-            trace,
-        )?;
+        if trace {
+            self.trace_weight_fingerprint(
+                "layer.0.input_norm.weight",
+                &format!("layers.{layer}.input_layernorm.weight"),
+                true,
+            )?;
+        }
         if let Some(value) = &normalized_f32 {
             self.trace_fingerprint("layer.0.input_norm", value, trace)?;
         }
-        let layer_type = &config
-            .layer_types
-            .as_ref()
-            .ok_or_else(|| Error::Execution("Gemma 4 layer_types are missing".into()))?[layer];
-        let sliding = layer_type == "sliding_attention";
-        let head_dim = if sliding {
-            config.head_dim
-        } else {
-            config.global_head_dim
-        };
-        let rope = config
-            .rope_parameters
-            .as_ref()
-            .and_then(|parameters| parameters.get(layer_type))
-            .ok_or_else(|| Error::Execution(format!("RoPE parameters for {layer_type} missing")))?;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let rotary_dim = (rope.partial_rotary_factor * head_dim as f32) as usize;
-        let source = table.sources[layer];
+        let source = plan.source;
+        debug_assert_eq!(source, table.sources[layer]);
         let cache_kv_heads = table.layers[source]
             .as_ref()
             .ok_or_else(|| Error::Execution(format!("source cache {source} is missing")))?
             .kv_heads;
-        let (query, physical_key, physical_value) = if source == layer {
-            let (query, key, value) = self.linear_qkv_bf16(
+        let (query, physical_key, physical_value) = if plan.fused_qkv {
+            let (query, key, value) = self.linear_qkv_bf16_at(
                 &normalized,
                 1,
-                &prefix,
-                config.num_attention_heads * head_dim,
-                cache_kv_heads * head_dim,
-                cache_kv_heads * head_dim,
+                plan.query_projection,
+                config.num_attention_heads * plan.head_dim,
+                cache_kv_heads * plan.head_dim,
+                cache_kv_heads * plan.head_dim,
             )?;
             (query, Some(key), Some(value))
         } else {
             (
-                self.linear_bf16(&normalized, 1, &format!("{prefix}.self_attn.q_proj.weight"))?,
+                self.linear_bf16_at(&normalized, 1, plan.query_projection)?,
                 None,
                 None,
             )
         };
-        let query = self.rms_norm(
-            &query,
-            &format!("{prefix}.self_attn.q_norm.weight"),
-            config.rms_norm_eps,
-        )?;
+        let query = self.rms_norm_at(&query, plan.query_norm, config.rms_norm_eps)?;
         self.trace_fingerprint("layer.0.query_norm", &query, trace)?;
         let query = self.rope(
             &query,
             config.num_attention_heads,
-            head_dim,
-            rotary_dim,
+            plan.head_dim,
+            plan.rotary_dim,
             table.position,
-            rope.rope_theta,
-            rope.factor,
+            plan.rope_theta,
+            plan.rope_factor,
         )?;
-        if source == layer {
+        if plan.fused_qkv {
             let key = physical_key.ok_or_else(|| {
                 Error::Execution(format!("layer {layer} fused key projection is missing"))
             })?;
             let value = physical_value.ok_or_else(|| {
                 Error::Execution(format!("layer {layer} fused value projection is missing"))
             })?;
-            let key = self.rms_norm(
-                &key,
-                &format!("{prefix}.self_attn.k_norm.weight"),
-                config.rms_norm_eps,
-            )?;
+            let key_norm = plan.key_norm.ok_or_else(|| {
+                Error::Execution(format!(
+                    "layer {layer} key norm is missing from decode plan"
+                ))
+            })?;
+            let key = self.rms_norm_at(&key, key_norm, config.rms_norm_eps)?;
             let cache = table.layers[layer]
                 .as_mut()
                 .ok_or_else(|| Error::Execution(format!("layer {layer} cache is missing")))?;
             let key = self.rope(
                 &key,
                 cache.kv_heads,
-                head_dim,
-                rotary_dim,
+                plan.head_dim,
+                plan.rotary_dim,
                 table.position,
-                rope.rope_theta,
-                rope.factor,
+                plan.rope_theta,
+                plan.rope_factor,
             )?;
-            let value = self.rms_norm_unit(&value, head_dim, config.rms_norm_eps)?;
+            let value = self.rms_norm_unit(&value, plan.head_dim, config.rms_norm_eps)?;
             self.trace_fingerprint("layer.0.value_norm", &value, trace)?;
             self.append_kv(cache, &key, &value)?;
         }
@@ -1638,25 +1899,28 @@ impl Gemma4CudaState {
             &cache.value,
             config.num_attention_heads,
             cache.kv_heads,
-            head_dim,
+            plan.head_dim,
             cache.len,
-            if sliding { config.sliding_window } else { 0 },
+            if plan.sliding {
+                config.sliding_window
+            } else {
+                0
+            },
             cache.start,
             cache.capacity,
         )?;
         self.trace_fingerprint("layer.0.attended", &attended, trace)?;
-        let projected = self.linear(&attended, 1, &format!("{prefix}.self_attn.o_proj.weight"))?;
+        let projected = self.linear_at(&attended, 1, plan.output_projection)?;
         self.trace_fingerprint("layer.0.attention_raw", &projected, trace)?;
-        let projected = self.rms_norm(
-            &projected,
-            &format!("{prefix}.post_attention_layernorm.weight"),
-            config.rms_norm_eps,
-        )?;
-        self.trace_weight_fingerprint(
-            "layer.0.attention_norm.weight",
-            &format!("{prefix}.post_attention_layernorm.weight"),
-            trace,
-        )?;
+        let projected =
+            self.rms_norm_at(&projected, plan.post_attention_norm, config.rms_norm_eps)?;
+        if trace {
+            self.trace_weight_fingerprint(
+                "layer.0.attention_norm.weight",
+                &format!("layers.{layer}.post_attention_layernorm.weight"),
+                true,
+            )?;
+        }
         self.trace_fingerprint("layer.0.attention_norm", &projected, trace)?;
         let output = self.add(hidden, &projected)?;
         self.trace_fingerprint("layer.0.attention_residual", &output, trace)?;
@@ -1834,7 +2098,12 @@ impl Gemma4CudaState {
                 hidden = self.apply_ple(&hidden, ple, layer, config)?;
                 self.trace_fingerprint(&format!("layer.{layer}.ple"), &hidden, trace)?;
             }
-            hidden = self.scale_by_weight(&hidden, &format!("layers.{layer}.layer_scalar"))?;
+            let scalar = self
+                .decode_plan
+                .get(layer)
+                .ok_or_else(|| Error::Execution("Gemma decode layer is missing".into()))?
+                .layer_scalar;
+            hidden = self.scale_by_weight_at(&hidden, scalar)?;
             self.trace_fingerprint(&format!("layer.{layer}.scaled"), &hidden, trace)?;
             self.trace_fingerprint(&format!("layer.{layer}"), &hidden, trace)?;
         }
@@ -1873,7 +2142,12 @@ impl Gemma4CudaState {
             if let Some(ple) = &packed_ple {
                 hidden = self.apply_ple_rows(&hidden, ple, rows, layer, config)?;
             }
-            hidden = self.scale_by_weight(&hidden, &format!("layers.{layer}.layer_scalar"))?;
+            let scalar = self
+                .decode_plan
+                .get(layer)
+                .ok_or_else(|| Error::Execution("Gemma decode layer is missing".into()))?
+                .layer_scalar;
+            hidden = self.scale_by_weight_at(&hidden, scalar)?;
         }
         table.position = rows;
         Ok(hidden)
