@@ -81,6 +81,24 @@ pub struct Gemma4CudaState {
 }
 
 impl Gemma4CudaState {
+    fn trace_fingerprint(
+        &self,
+        label: &str,
+        value: &DeviceBuffer<f32>,
+        enabled: bool,
+    ) -> Result<()> {
+        if !enabled {
+            return Ok(());
+        }
+        let host = value.to_host_vec(&self.stream).map_err(cuda_error)?;
+        let rms = (host.iter().map(|item| item * item).sum::<f32>() / host.len() as f32).sqrt();
+        let maximum = host.iter().map(|item| item.abs()).fold(0.0_f32, f32::max);
+        eprintln!(
+            "Gemma4 trace {label}: rms={rms:.8} abs_max={maximum:.8} first={:?}",
+            &host[..host.len().min(4)]
+        );
+        Ok(())
+    }
     pub(crate) fn load(model: &Gemma4ForCausalLM, device: usize) -> Result<Self> {
         let context = CudaContext::new(device).map_err(cuda_error)?;
         let stream = context.default_stream();
@@ -1036,12 +1054,15 @@ impl Gemma4CudaState {
         let embedding = self.embedding(token, config.hidden_size)?;
         let packed_ple = self.packed_ple(token, &embedding, config)?;
         let mut hidden = embedding;
+        let trace = std::env::var_os("GEMMA4_TRACE_LAYERS").is_some() && table.position == 0;
+        self.trace_fingerprint("embedding", &hidden, trace)?;
         for layer in 0..config.num_hidden_layers {
             hidden = self.decoder_attention(&hidden, layer, config, table)?;
             hidden = self.decoder_mlp(&hidden, layer, config.rms_norm_eps)?;
             if let Some(ple) = &packed_ple {
                 hidden = self.apply_ple(&hidden, ple, layer, config)?;
             }
+            self.trace_fingerprint(&format!("layer.{layer}"), &hidden, trace)?;
         }
         hidden = self.rms_norm(&hidden, "norm.weight", config.rms_norm_eps)?;
         table.position += 1;
