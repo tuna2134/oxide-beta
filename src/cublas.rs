@@ -72,6 +72,21 @@ impl Cublas {
         }
     }
 
+    /// Binds this handle to the inference stream once. Gemma inference uses a
+    /// single stream for the lifetime of the handle, so repeating
+    /// `cublasSetStream_v2` before every projection only adds host API
+    /// overhead between small decode GEMMs.
+    pub(crate) fn bind_stream(&self, stream: &CudaStream) -> Result<()> {
+        // SAFETY: the handle is live and `stream` belongs to the CUDA context
+        // used by all buffers passed to this handle.
+        unsafe {
+            check(
+                (self.set_stream)(self.handle, stream.cu_stream().cast()),
+                "cublasSetStream_v2",
+            )
+        }
+    }
+
     /// Computes row-major `output[m,n] = input[m,k] * weight[n,k]^T`.
     pub(crate) fn linear_bf16_f32(
         &self,
@@ -94,10 +109,6 @@ impl Cublas {
         // SAFETY: buffers have the validated extents; row-major output is
         // represented as its column-major transpose without copying.
         unsafe {
-            check(
-                (self.set_stream)(self.handle, stream.cu_stream().cast()),
-                "cublasSetStream_v2",
-            )?;
             check(
                 (self.gemm_ex)(
                     self.handle,

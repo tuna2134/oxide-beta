@@ -21,6 +21,8 @@ fn main() -> oxide_torch::Result<()> {
         tokenizer.encode_user_turn(if prompt.is_empty() { "Hello" } else { &prompt })?;
     let model = Gemma4ForCausalLM::from_pretrained(&directory, device)?;
     #[cfg(feature = "cuda")]
+    let cuda_prepare_started = std::time::Instant::now();
+    #[cfg(feature = "cuda")]
     let cuda = if matches!(device, Device::Cuda(_)) {
         Some(model.prepare_cuda()?)
     } else {
@@ -38,6 +40,14 @@ fn main() -> oxide_torch::Result<()> {
     );
     #[cfg(feature = "cuda")]
     if let Some(cuda) = cuda {
+        let profile = std::env::var_os("GEMMA4_PROFILE").is_some();
+        let verbose = profile || std::env::var_os("GEMMA4_VERBOSE").is_some();
+        if profile {
+            eprintln!(
+                "Gemma4 profile prepare_cuda={:.3}s",
+                cuda_prepare_started.elapsed().as_secs_f64()
+            );
+        }
         println!(
             "CUDA persistent weights: tensors={} bytes={} MiB",
             cuda.weight_count(),
@@ -127,13 +137,25 @@ fn main() -> oxide_torch::Result<()> {
         );
         if std::env::var_os("GEMMA4_SKIP_DECODE").is_none() {
             let mut logits = Vec::new();
+            let prefill_started = std::time::Instant::now();
             for (index, &token) in token_ids.iter().enumerate() {
                 if index + 1 == token_ids.len() {
                     logits = cuda.decode_token(token, model.config(), &mut cache_table)?;
                 } else {
                     cuda.prefill_token(token, model.config(), &mut cache_table)?;
                 }
-                eprintln!("Gemma4 prefill: {}/{}", index + 1, token_ids.len());
+                if verbose {
+                    eprintln!("Gemma4 prefill: {}/{}", index + 1, token_ids.len());
+                }
+            }
+            if profile {
+                cuda.synchronize()?;
+                eprintln!(
+                    "Gemma4 profile prefill_tokens={} seconds={:.3} ms_per_token={:.3}",
+                    token_ids.len(),
+                    prefill_started.elapsed().as_secs_f64(),
+                    prefill_started.elapsed().as_secs_f64() * 1000.0 / token_ids.len() as f64,
+                );
             }
             let mut generation = GenerationConfig {
                 max_new_tokens,
@@ -179,6 +201,9 @@ fn main() -> oxide_torch::Result<()> {
             let mut random = generation.seed;
             let mut generated = Vec::with_capacity(generation.max_new_tokens);
             let mut streamed = String::new();
+            let generation_started = std::time::Instant::now();
+            let mut decode_seconds = 0.0_f64;
+            let mut sampling_seconds = 0.0_f64;
             const TEXT_STOP_MARKERS: [&str; 4] =
                 ["<turn|>", "<|turn>", "<end_of_turn>", "<start_of_turn>"];
             for index in 0..generation.max_new_tokens {
@@ -197,27 +222,41 @@ fn main() -> oxide_torch::Result<()> {
                         }
                     }
                 }
+                let sampling_started = std::time::Instant::now();
                 let next = sample_token(&logits, &generation, &mut random)?;
+                sampling_seconds += sampling_started.elapsed().as_secs_f64();
                 if generation.eos_token_ids.contains(&next) {
                     break;
                 }
                 generated.push(next);
                 let piece = tokenizer.decode(&[next], true)?;
                 streamed.push_str(&piece);
-                println!(
-                    "Gemma4 generate: {}/{} token={} piece={:?}",
-                    index + 1,
-                    generation.max_new_tokens,
-                    next,
-                    piece,
-                );
+                if verbose {
+                    println!(
+                        "Gemma4 generate: {}/{} token={} piece={:?}",
+                        index + 1,
+                        generation.max_new_tokens,
+                        next,
+                        piece,
+                    );
+                }
                 if TEXT_STOP_MARKERS
                     .iter()
                     .any(|marker| streamed.ends_with(marker))
                 {
                     break;
                 }
+                let decode_started = std::time::Instant::now();
                 logits = cuda.decode_token(next, model.config(), &mut cache_table)?;
+                decode_seconds += decode_started.elapsed().as_secs_f64();
+            }
+            if profile {
+                let elapsed = generation_started.elapsed().as_secs_f64();
+                eprintln!(
+                    "Gemma4 profile generation_tokens={} seconds={elapsed:.3} decode={decode_seconds:.3} sampling={sampling_seconds:.3} tokens_per_second={:.3}",
+                    generated.len(),
+                    generated.len() as f64 / elapsed.max(f64::EPSILON),
+                );
             }
             let mut response = tokenizer.decode(&generated, true)?;
             for marker in TEXT_STOP_MARKERS {

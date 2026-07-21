@@ -124,6 +124,7 @@ impl Gemma4CudaState {
         let context = CudaContext::new(device).map_err(cuda_error)?;
         let stream = context.default_stream();
         let cublas = Cublas::new()?;
+        cublas.bind_stream(&stream)?;
         let module = crate::cuda::kernels::load(&context).map_err(cuda_error)?;
         let names: Vec<_> = model
             .checkpoint_weight_names()
@@ -186,6 +187,13 @@ impl Gemma4CudaState {
             .values()
             .map(|weight| weight.buffer.len() * std::mem::size_of::<u16>())
             .sum()
+    }
+
+    /// Waits until all queued Gemma CUDA work has completed. This is exposed
+    /// for opt-in profiling; normal inference synchronizes only when logits
+    /// are copied to the host.
+    pub fn synchronize(&self) -> Result<()> {
+        self.stream.synchronize().map_err(cuda_error)
     }
 
     fn weight(&self, suffix: &str) -> Result<&CudaWeight> {
