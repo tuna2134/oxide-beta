@@ -216,14 +216,6 @@ dependencies = [
 [[package]]
 name = "cuda-bindings"
 version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
-dependencies = [
- "bindgen",
-]
-
-[[package]]
-name = "cuda-bindings"
-version = "0.2.1"
 source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14#2b1269964beaeab789a1512d0089fe42d9336e14"
 dependencies = [
  "bindgen",
@@ -232,25 +224,13 @@ dependencies = [
 [[package]]
 name = "cuda-core"
 version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
-dependencies = [
- "anyhow",
- "cuda-bindings 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b)",
- "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b)",
- "half",
- "oxide-artifacts 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b)",
-]
-
-[[package]]
-name = "cuda-core"
-version = "0.2.1"
 source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14#2b1269964beaeab789a1512d0089fe42d9336e14"
 dependencies = [
  "anyhow",
- "cuda-bindings 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
+ "cuda-bindings",
  "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
  "half",
- "oxide-artifacts 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
+ "oxide-artifacts",
 ]
 
 [[package]]
@@ -267,7 +247,7 @@ version = "0.2.1"
 source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14#2b1269964beaeab789a1512d0089fe42d9336e14"
 dependencies = [
  "cuda-artifact-finalizer",
- "cuda-core 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
+ "cuda-core",
  "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
  "half",
  "sha2",
@@ -704,14 +684,6 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "oxide-artifacts"
 version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
-dependencies = [
- "object",
-]
-
-[[package]]
-name = "oxide-artifacts"
-version = "0.2.1"
 source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14#2b1269964beaeab789a1512d0089fe42d9336e14"
 dependencies = [
  "object",
@@ -721,7 +693,7 @@ dependencies = [
 name = "oxide-torch"
 version = "0.1.0"
 dependencies = [
- "cuda-core 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b)",
+ "cuda-core",
  "half",
  "memmap2",
  "oxide-torch-cuda",
@@ -735,7 +707,7 @@ dependencies = [
 name = "oxide-torch-cuda"
 version = "0.1.0"
 dependencies = [
- "cuda-core 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b)",
+ "cuda-core",
  "cuda-device",
  "cuda-host",
  "libloading",
@@ -746,7 +718,7 @@ dependencies = [
 name = "oxide-torch-models"
 version = "0.1.0"
 dependencies = [
- "cuda-core 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b)",
+ "cuda-core",
  "oxide-torch",
  "oxide-torch-cuda",
  "safetensors",
