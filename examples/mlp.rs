@@ -1,4 +1,16 @@
+use oxide_torch::nn::Module;
 use oxide_torch::{Device, Result, Tensor, jit};
+
+struct Mlp {
+    weight: Tensor,
+    bias: Tensor,
+}
+
+impl Module for Mlp {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
+        Ok(input.matmul(&self.weight)?.add(&self.bias)?.relu())
+    }
+}
 
 fn main() -> Result<()> {
     let use_cuda = std::env::args().any(|argument| argument == "--cuda");
@@ -12,14 +24,15 @@ fn main() -> Result<()> {
     let weight = Tensor::from_vec(vec![0.5, 1.0, -1.0, 2.0], vec![2, 2])?.to(device);
     let bias = Tensor::from_vec(vec![0.25, 0.25, 0.25, 0.25], vec![2, 2])?.to(device);
 
-    let model = jit::trace(&[x.clone(), weight.clone(), bias.clone()], |inputs| {
-        Ok(inputs[0].matmul(&inputs[1])?.add(&inputs[2])?.relu())
-    })?;
+    // User-defined models only implement `Module`; `jit::compile` traces their
+    // lazy graph and creates a reusable fixed-memory execution plan.
+    let model = Mlp { weight, bias };
+    let compiled = jit::compile(&model, &x)?;
 
-    let output = model.run(&[x, weight, bias])?;
+    let output = compiled.run(&[x])?;
     println!("device: {:?}", output.device());
     println!("shape:  {:?}", output.shape());
     println!("output: {:?}", output.to_vec()?);
-    println!("JIT specializations: {}", model.cached_specializations());
+    println!("JIT specializations: {}", compiled.cached_specializations());
     Ok(())
 }

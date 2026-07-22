@@ -3,8 +3,10 @@
 // call site and documents them with a SAFETY comment.
 #![allow(static_mut_refs, unsafe_code)]
 
+mod jit;
 mod kernel_module;
 mod runtime;
 
+pub(crate) use jit::CudaJitPlan;
 pub(crate) use kernel_module::module as kernels;
 pub(crate) use runtime::*;
