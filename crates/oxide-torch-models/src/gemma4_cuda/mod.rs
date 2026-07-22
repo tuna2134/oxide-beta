@@ -128,8 +128,7 @@ pub struct Gemma4CudaCacheTable {
 
 struct Gemma4CudaDecodeGraph {
     executable: CudaGraphExec,
-    scores: DeviceBuffer<f32>,
-    ids: DeviceBuffer<f32>,
+    candidates: DeviceBuffer<f32>,
     _fixed_f32: Vec<DeviceBuffer<f32>>,
     _fixed_bf16: Vec<DeviceBuffer<u16>>,
     top_k: usize,
@@ -227,7 +226,7 @@ impl Gemma4CudaState {
         let stream = context.new_stream().map_err(cuda_error)?;
         let cublas = Cublas::new()?;
         cublas.bind_stream(&stream)?;
-        let module = oxide_torch_cuda::kernels::load(&context).map_err(cuda_error)?;
+        let module = oxide_torch_cuda::load_kernels(&context).map_err(cuda_error)?;
         let inference = oxide_torch_cuda::kernels::inference::LoadedModule::from_parent(&module)
             .map_err(cuda_error)?;
         let attention = oxide_torch_cuda::kernels::attention::LoadedModule::from_parent(&module)
