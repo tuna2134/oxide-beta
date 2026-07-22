@@ -16,7 +16,7 @@ pub use config::{Gemma4RopeParameters, Gemma4TextConfig, GenerationConfig};
 pub use model::Gemma4ForCausalLM;
 pub use oxide_torch::nn::grouped_query_attention;
 pub use sampling::{sample_token, sample_topk_candidates};
-pub use tokenizer::Gemma4Tokenizer;
+pub use tokenizer::{Gemma4DecodeStream, Gemma4Tokenizer};
 
 #[cfg(test)]
 mod tests {

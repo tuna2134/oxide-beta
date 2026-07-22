@@ -45,6 +45,34 @@ impl Gemma4ForCausalLM {
     /// Returns an error for invalid generation parameters, empty input, a
     /// non-CUDA model, or a CUDA inference failure.
     pub fn generate(&self, input_ids: &[u32], generation: &GenerationConfig) -> Result<Vec<u32>> {
+        self.generate_with_callback(input_ids, generation, |_| Ok(()))
+    }
+
+    /// Autoregressively generates tokens and reports each token immediately.
+    ///
+    /// The callback runs after a token is appended to the output, including a
+    /// terminating token. Use [`Gemma4Tokenizer::decode_stream`](super::Gemma4Tokenizer::decode_stream)
+    /// in the callback when text chunks rather than token IDs are required.
+    /// The returned sequence has the same layout as [`Self::generate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns generation errors as well as errors returned by `on_token`.
+    pub fn generate_stream(
+        &self,
+        input_ids: &[u32],
+        generation: &GenerationConfig,
+        on_token: impl FnMut(u32) -> Result<()>,
+    ) -> Result<Vec<u32>> {
+        self.generate_with_callback(input_ids, generation, on_token)
+    }
+
+    fn generate_with_callback(
+        &self,
+        input_ids: &[u32],
+        generation: &GenerationConfig,
+        mut on_token: impl FnMut(u32) -> Result<()>,
+    ) -> Result<Vec<u32>> {
         generation.validate()?;
         if input_ids.is_empty() {
             return Err(Error::Execution(
@@ -86,6 +114,7 @@ impl Gemma4ForCausalLM {
                 None => sample_token(&logits, generation, &mut random)?,
             };
             generated.push(next);
+            on_token(next)?;
             if generation.eos_token_ids.contains(&next)
                 || generation
                     .stop_token_sequences
