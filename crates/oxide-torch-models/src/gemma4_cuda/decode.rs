@@ -697,7 +697,7 @@ impl Gemma4CudaState {
         }
         if mark_seen {
             unsafe {
-                self.module
+                self.sampling
                     .mark_seen(&self.stream, Self::launch_config(1)?, token as usize, seen)
             }
             .map_err(cuda_error)?;

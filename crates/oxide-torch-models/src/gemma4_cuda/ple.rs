@@ -183,42 +183,42 @@ impl Gemma4CudaState {
         )?;
         self.add(hidden, &projected)
     }
-}
 
-pub(super) fn apply_ple_rows(
-    &self,
-    hidden: &DeviceBuffer<f32>,
-    packed_ple: &DeviceBuffer<f32>,
-    rows: usize,
-    layer: usize,
-    config: &Gemma4TextConfig,
-) -> Result<WorkspaceF32> {
-    let dimension = config.hidden_size_per_layer_input;
-    let packed = config.num_hidden_layers * dimension;
-    let per_layer = self.slice_rows(packed_ple, rows, packed, layer * dimension, dimension)?;
-    let plan = self
-        .decode_plan
-        .get(layer)
-        .ok_or_else(|| Error::Execution("Gemma decode layer is missing".into()))?;
-    let gate = self.linear_at(
-        hidden,
-        rows,
-        plan.ple_gate
-            .ok_or_else(|| Error::Execution("Gemma PLE gate is missing".into()))?,
-    )?;
-    let gate = self.gelu(&gate)?;
-    let gated = self.mul(&gate, &per_layer)?;
-    let projected = self.linear_at(
-        &gated,
-        rows,
-        plan.ple_projection
-            .ok_or_else(|| Error::Execution("Gemma PLE projection is missing".into()))?,
-    )?;
-    let projected = self.rms_norm_at(
-        &projected,
-        plan.ple_norm
-            .ok_or_else(|| Error::Execution("Gemma PLE norm is missing".into()))?,
-        config.rms_norm_eps,
-    )?;
-    self.add(hidden, &projected)
+    pub(super) fn apply_ple_rows(
+        &self,
+        hidden: &DeviceBuffer<f32>,
+        packed_ple: &DeviceBuffer<f32>,
+        rows: usize,
+        layer: usize,
+        config: &Gemma4TextConfig,
+    ) -> Result<WorkspaceF32> {
+        let dimension = config.hidden_size_per_layer_input;
+        let packed = config.num_hidden_layers * dimension;
+        let per_layer = self.slice_rows(packed_ple, rows, packed, layer * dimension, dimension)?;
+        let plan = self
+            .decode_plan
+            .get(layer)
+            .ok_or_else(|| Error::Execution("Gemma decode layer is missing".into()))?;
+        let gate = self.linear_at(
+            hidden,
+            rows,
+            plan.ple_gate
+                .ok_or_else(|| Error::Execution("Gemma PLE gate is missing".into()))?,
+        )?;
+        let gate = self.gelu(&gate)?;
+        let gated = self.mul(&gate, &per_layer)?;
+        let projected = self.linear_at(
+            &gated,
+            rows,
+            plan.ple_projection
+                .ok_or_else(|| Error::Execution("Gemma PLE projection is missing".into()))?,
+        )?;
+        let projected = self.rms_norm_at(
+            &projected,
+            plan.ple_norm
+                .ok_or_else(|| Error::Execution("Gemma PLE norm is missing".into()))?,
+            config.rms_norm_eps,
+        )?;
+        self.add(hidden, &projected)
+    }
 }
