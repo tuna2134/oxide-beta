@@ -30,7 +30,7 @@ export MNIST_TEST_LIMIT="${MNIST_TEST_LIMIT:-256}"
 export MNIST_LOG_INTERVAL="${MNIST_LOG_INTERVAL:-10}"
 
 echo "profile: build and warm up CUDA/cuDNN"
-MNIST_TRAIN_LIMIT=256 MNIST_TEST_LIMIT=16 cargo oxide run --features cuda,cudnn --bin mnist-training
+MNIST_TRAIN_LIMIT=256 MNIST_TEST_LIMIT=16 cargo oxide run -p oxide-torch-models --features cuda,cudnn --bin mnist-training
 
 readonly BINARY="${PROJECT_DIR}/target/release/mnist-training"
 [[ -x "${BINARY}" ]] || { echo "error: binary not found: ${BINARY}" >&2; exit 1; }

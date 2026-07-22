@@ -1,7 +1,7 @@
 use oxide_torch::Device;
-use oxide_torch::models::gemma4::{Gemma4ForCausalLM, Gemma4Tokenizer};
+use oxide_torch_models::gemma4::{Gemma4ForCausalLM, Gemma4Tokenizer};
 #[cfg(feature = "cuda")]
-use oxide_torch::models::gemma4::{GenerationConfig, sample_token, sample_topk_candidates};
+use oxide_torch_models::gemma4::{GenerationConfig, sample_token, sample_topk_candidates};
 
 #[allow(clippy::too_many_lines)]
 fn main() -> oxide_torch::Result<()> {

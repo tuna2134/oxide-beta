@@ -1,0 +1,24 @@
+[package]
+name = "oxide-torch-cuda"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "CUDA backend primitives for oxide-torch"
+license = "Apache-2.0"
+
+[features]
+default = []
+cuda = ["dep:cuda-core", "dep:cuda-device", "dep:cuda-host", "dep:libloading"]
+
+[dependencies]
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "072318bc5e2ef3b5686e6ec8078e892a2a82bf2b", optional = true }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "072318bc5e2ef3b5686e6ec8078e892a2a82bf2b", optional = true }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "072318bc5e2ef3b5686e6ec8078e892a2a82bf2b", optional = true }
+libloading = { version = "0.8", optional = true }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

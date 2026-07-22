@@ -1,0 +1,40 @@
+[package]
+name = "oxide-torch-models"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Reference models for oxide-torch"
+license = "Apache-2.0"
+
+[features]
+default = []
+cuda = [
+    "oxide-torch/cuda",
+    "dep:cuda-core",
+    "dep:oxide-torch-cuda",
+]
+cudnn = ["cuda", "oxide-torch/cudnn"]
+
+[dependencies]
+oxide-torch = { path = "../oxide-torch", default-features = false }
+oxide-torch-cuda = { path = "../oxide-torch-cuda", features = ["cuda"], optional = true }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "072318bc5e2ef3b5686e6ec8078e892a2a82bf2b", optional = true }
+safetensors = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[[bin]]
+name = "mnist-training"
+path = "src/bin/mnist_training.rs"
+
+[[bin]]
+name = "mnist-inference"
+path = "src/bin/mnist_inference.rs"

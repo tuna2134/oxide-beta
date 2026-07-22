@@ -1,6 +1,3 @@
-#![cfg_attr(feature = "cuda", feature(core_intrinsics))]
-#![cfg_attr(feature = "cuda", allow(internal_features))]
-
 //! A compact Torch-like tensor API with a lazy graph and a traced JIT.
 //!
 //! The default backend is portable CPU Rust. Enable `cuda` and build with
@@ -11,22 +8,15 @@ pub mod data;
 mod error;
 pub mod jit;
 pub mod loss;
-pub mod models;
 pub mod nn;
 pub mod optim;
 pub mod safetensors;
 mod tensor;
 
 #[cfg(feature = "cuda")]
-mod cublas;
+pub mod cuda;
 #[cfg(feature = "cuda")]
-mod cuda;
-#[cfg(feature = "cuda")]
-mod cuda_graph;
-#[cfg(feature = "cudnn")]
-mod cudnn;
-#[cfg(feature = "cuda")]
-pub mod gemma4_cuda;
+pub use oxide_torch_cuda::{cublas, cuda_graph};
 
 pub use error::{Error, Result};
 pub use tensor::{Device, Tensor};

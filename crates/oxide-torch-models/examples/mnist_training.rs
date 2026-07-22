@@ -1,9 +1,9 @@
 use oxide_torch::data::Mnist;
 use oxide_torch::loss::cross_entropy;
-use oxide_torch::models::mobilenet_v4::MobileNetV4ConvSmall;
 use oxide_torch::nn::Module;
 use oxide_torch::optim::{AdamW, Optimizer};
 use oxide_torch::{Device, Result, Tensor};
+use oxide_torch_models::mobilenet_v4::MobileNetV4ConvSmall;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 

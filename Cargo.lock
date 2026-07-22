@@ -203,41 +203,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "cuda-bindings"
+name = "cuda-artifact-finalizer"
 version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6a92f548f25899352e47e173bfd387b2cd0d1e18#6a92f548f25899352e47e173bfd387b2cd0d1e18"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
 dependencies = [
- "bindgen",
-]
-
-[[package]]
-name = "cuda-core"
-version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6a92f548f25899352e47e173bfd387b2cd0d1e18#6a92f548f25899352e47e173bfd387b2cd0d1e18"
-dependencies = [
- "anyhow",
- "cuda-bindings",
- "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=6a92f548f25899352e47e173bfd387b2cd0d1e18)",
- "half",
- "oxide-artifacts",
-]
-
-[[package]]
-name = "cuda-device"
-version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=52accfa488fe7ca148dd5f7746794119b15c5390#52accfa488fe7ca148dd5f7746794119b15c5390"
-dependencies = [
- "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=52accfa488fe7ca148dd5f7746794119b15c5390)",
-]
-
-[[package]]
-name = "cuda-host"
-version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6a92f548f25899352e47e173bfd387b2cd0d1e18#6a92f548f25899352e47e173bfd387b2cd0d1e18"
-dependencies = [
- "cuda-core",
- "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=6a92f548f25899352e47e173bfd387b2cd0d1e18)",
- "half",
  "libnvvm-sys",
  "nvjitlink-sys",
  "sha2",
@@ -245,24 +214,54 @@ dependencies = [
 ]
 
 [[package]]
-name = "cuda-macros"
+name = "cuda-bindings"
 version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=52accfa488fe7ca148dd5f7746794119b15c5390#52accfa488fe7ca148dd5f7746794119b15c5390"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
 dependencies = [
- "proc-macro2",
- "quote",
- "reserved-oxide-symbols 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=52accfa488fe7ca148dd5f7746794119b15c5390)",
- "syn 2.0.119",
+ "bindgen",
+]
+
+[[package]]
+name = "cuda-core"
+version = "0.2.1"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
+dependencies = [
+ "anyhow",
+ "cuda-bindings",
+ "cuda-macros",
+ "half",
+ "oxide-artifacts",
+]
+
+[[package]]
+name = "cuda-device"
+version = "0.2.1"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
+dependencies = [
+ "cuda-macros",
+]
+
+[[package]]
+name = "cuda-host"
+version = "0.2.1"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
+dependencies = [
+ "cuda-artifact-finalizer",
+ "cuda-core",
+ "cuda-macros",
+ "half",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
 name = "cuda-macros"
 version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6a92f548f25899352e47e173bfd387b2cd0d1e18#6a92f548f25899352e47e173bfd387b2cd0d1e18"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
 dependencies = [
  "proc-macro2",
  "quote",
- "reserved-oxide-symbols 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=6a92f548f25899352e47e173bfd387b2cd0d1e18)",
+ "reserved-oxide-symbols",
  "syn 2.0.119",
 ]
 
@@ -557,7 +556,7 @@ dependencies = [
 [[package]]
 name = "libnvvm-sys"
 version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6a92f548f25899352e47e173bfd387b2cd0d1e18#6a92f548f25899352e47e173bfd387b2cd0d1e18"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
 dependencies = [
  "libloading",
  "thiserror",
@@ -647,7 +646,7 @@ dependencies = [
 [[package]]
 name = "nvjitlink-sys"
 version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6a92f548f25899352e47e173bfd387b2cd0d1e18#6a92f548f25899352e47e173bfd387b2cd0d1e18"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
 dependencies = [
  "libloading",
  "thiserror",
@@ -674,7 +673,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "oxide-artifacts"
 version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6a92f548f25899352e47e173bfd387b2cd0d1e18#6a92f548f25899352e47e173bfd387b2cd0d1e18"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
 dependencies = [
  "object",
 ]
@@ -684,11 +683,31 @@ name = "oxide-torch"
 version = "0.1.0"
 dependencies = [
  "cuda-core",
+ "half",
+ "memmap2",
+ "oxide-torch-cuda",
+ "safetensors",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "oxide-torch-cuda"
+version = "0.1.0"
+dependencies = [
+ "cuda-core",
  "cuda-device",
  "cuda-host",
- "half",
  "libloading",
- "memmap2",
+]
+
+[[package]]
+name = "oxide-torch-models"
+version = "0.1.0"
+dependencies = [
+ "cuda-core",
+ "oxide-torch",
+ "oxide-torch-cuda",
  "safetensors",
  "serde",
  "serde_json",
@@ -842,12 +861,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "reserved-oxide-symbols"
 version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=52accfa488fe7ca148dd5f7746794119b15c5390#52accfa488fe7ca148dd5f7746794119b15c5390"
-
-[[package]]
-name = "reserved-oxide-symbols"
-version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=6a92f548f25899352e47e173bfd387b2cd0d1e18#6a92f548f25899352e47e173bfd387b2cd0d1e18"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
 
 [[package]]
 name = "rustc-hash"

@@ -1,10 +1,10 @@
 //! `MobileNetV4` models described by tables 11-15 of `mobilenet.pdf`.
 
-use crate::nn::{
+use oxide_torch::nn::{
     Conv2d, ConvNormAct, FusedInvertedBottleneck, Module, ModuleMode, Parameter, Trainable,
     UniversalInvertedBottleneck,
 };
-use crate::{Device, Error, Result, Tensor};
+use oxide_torch::{Device, Error, Result, Tensor};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -466,8 +466,8 @@ mod tests {
     #[test]
     #[ignore = "full naive-CPU MobileNet backward is intentionally expensive"]
     fn mnist_variant_completes_a_full_training_step() {
-        use crate::loss::cross_entropy;
-        use crate::optim::{AdamW, Optimizer};
+        use oxide_torch::loss::cross_entropy;
+        use oxide_torch::optim::{AdamW, Optimizer};
 
         let mut model = MobileNetV4ConvSmall::mnist(Device::Cpu).unwrap();
         let input = Tensor::zeros(vec![2, 1, 28, 28]).unwrap();
