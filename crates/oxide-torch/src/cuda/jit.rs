@@ -1,10 +1,10 @@
 //! Fixed-buffer CUDA execution plans for the public trace JIT.
 
 use super::kernels;
-use crate::cuda_graph::CudaGraphExec;
 use crate::jit::{BufferPlan, GraphPlan, PlanOperation};
 use crate::{Error, Result, Tensor};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
+use oxide_torch_cuda::cuda_graph::CudaGraphExec;
 use std::sync::{Arc, Mutex};
 
 pub(crate) struct CudaJitPlan {

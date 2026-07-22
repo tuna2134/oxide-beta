@@ -4,6 +4,7 @@
 //! token embeddings, 5:1 local/global decoder layers, GQA, PLE, gated MLP,
 //! final `RMSNorm`, and a tied or independent LM head.
 
+pub use oxide_torch::nn::grouped_query_attention;
 use oxide_torch::safetensors::{LoadedTensor, SafeTensorLoader, TensorMetadata};
 use oxide_torch::{Device, Error, Result, Tensor};
 use serde::Deserialize;
@@ -258,82 +259,6 @@ pub fn sample_topk_candidates(
         .last()
         .map(|candidate| candidate.0)
         .ok_or_else(|| Error::Execution("candidate sampling removed all tokens".into()))
-}
-
-/// Reference grouped-query causal attention used to validate the CUDA kernel.
-/// Layouts are Q=`[q, heads, dim]`, K/V=`[kv, kv_heads, dim]`.
-///
-/// # Errors
-///
-/// Returns an error for incompatible shapes or an invalid sliding window.
-#[allow(clippy::too_many_arguments)]
-pub fn grouped_query_attention(
-    query: &[f32],
-    key: &[f32],
-    value: &[f32],
-    q_len: usize,
-    kv_len: usize,
-    heads: usize,
-    kv_heads: usize,
-    head_dim: usize,
-    sliding_window: Option<usize>,
-) -> Result<Vec<f32>> {
-    if heads == 0
-        || kv_heads == 0
-        || heads % kv_heads != 0
-        || q_len > kv_len
-        || query.len() != q_len * heads * head_dim
-        || key.len() != kv_len * kv_heads * head_dim
-        || value.len() != key.len()
-        || sliding_window == Some(0)
-    {
-        return Err(Error::InvalidShape(
-            "invalid grouped-query attention shape".into(),
-        ));
-    }
-    let groups = heads / kv_heads;
-    let query_offset = kv_len - q_len;
-    let mut output = vec![0.0; query.len()];
-    let mut scores = vec![0.0; kv_len];
-    for q in 0..q_len {
-        let absolute_q = query_offset + q;
-        let start = sliding_window.map_or(0, |window| (absolute_q + 1).saturating_sub(window));
-        for head in 0..heads {
-            let kv_head = head / groups;
-            let q_base = (q * heads + head) * head_dim;
-            let mut maximum = f32::NEG_INFINITY;
-            for (position, score_slot) in scores
-                .iter_mut()
-                .enumerate()
-                .take(absolute_q + 1)
-                .skip(start)
-            {
-                let k_base = (position * kv_heads + kv_head) * head_dim;
-                let score = query[q_base..q_base + head_dim]
-                    .iter()
-                    .zip(&key[k_base..k_base + head_dim])
-                    .map(|(a, b)| a * b)
-                    .sum();
-                *score_slot = score;
-                maximum = maximum.max(score);
-            }
-            let normalizer: f32 = (start..=absolute_q)
-                .map(|position| {
-                    scores[position] = (scores[position] - maximum).exp();
-                    scores[position]
-                })
-                .sum();
-            let out_base = q_base;
-            for (position, score) in scores.iter().enumerate().take(absolute_q + 1).skip(start) {
-                let probability = score / normalizer;
-                let v_base = (position * kv_heads + kv_head) * head_dim;
-                for dimension in 0..head_dim {
-                    output[out_base + dimension] += probability * value[v_base + dimension];
-                }
-            }
-        }
-    }
-    Ok(output)
 }
 
 fn default_vocab_size() -> usize {

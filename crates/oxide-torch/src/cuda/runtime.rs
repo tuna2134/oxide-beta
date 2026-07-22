@@ -38,7 +38,7 @@ struct Executor {
     pending_host_copies: Vec<Arc<[f32]>>,
     pending_host_bytes: usize,
     #[cfg(feature = "cudnn")]
-    cudnn: Option<crate::cudnn::Cudnn>,
+    cudnn: Option<oxide_torch_cuda::cudnn::Cudnn>,
 }
 
 impl Executor {
@@ -48,7 +48,7 @@ impl Executor {
         let module = kernels::load(&context).map_err(cuda_error)?;
         let root_gradient = Arc::new(DeviceBuffer::from_host(&stream, &[1.0]).map_err(cuda_error)?);
         #[cfg(feature = "cudnn")]
-        let cudnn = crate::cudnn::Cudnn::try_new();
+        let cudnn = oxide_torch_cuda::cudnn::Cudnn::try_new();
         #[cfg(feature = "cudnn")]
         eprintln!(
             "CUDA device {device}: cuDNN {}",
@@ -1153,7 +1153,7 @@ fn cudnn_shape(
     stride: usize,
     padding: usize,
     groups: usize,
-) -> crate::cudnn::ConvShape {
+) -> oxide_torch_cuda::cudnn::ConvShape {
     cudnn_shape_from_parts(
         input,
         weight,
@@ -1174,8 +1174,8 @@ fn cudnn_shape_from_parts(
     stride: usize,
     padding: usize,
     groups: usize,
-) -> crate::cudnn::ConvShape {
-    crate::cudnn::ConvShape {
+) -> oxide_torch_cuda::cudnn::ConvShape {
+    oxide_torch_cuda::cudnn::ConvShape {
         batch: input.shape()[0],
         in_channels: input.shape()[1],
         height: input.shape()[2],

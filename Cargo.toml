@@ -1,37 +1,10 @@
-[package]
-name = "oxide-torch"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-description = "A tiny Torch-like lazy tensor library powered by NVLabs cuda-oxide"
-license = "Apache-2.0"
-
 [workspace]
-members = ["crates/oxide-torch-models"]
+members = [
+    "crates/oxide-torch",
+    "crates/oxide-torch-cuda",
+    "crates/oxide-torch-models",
+]
 resolver = "3"
-
-[features]
-default = []
-cuda = ["dep:cuda-core", "dep:cuda-device", "dep:cuda-host", "dep:libloading"]
-cudnn = ["cuda"]
-
-[dependencies]
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6a92f548f25899352e47e173bfd387b2cd0d1e18", optional = true }
-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "52accfa488fe7ca148dd5f7746794119b15c5390", optional = true }
-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6a92f548f25899352e47e173bfd387b2cd0d1e18", optional = true }
-libloading = { version = "0.8", optional = true }
-half = "2.6"
-memmap2 = "0.9"
-safetensors = "0.8"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-[lints.rust]
-unsafe_code = "warn"
-
-[lints.clippy]
-all = "warn"
-pedantic = "warn"
 
 # cuda-oxide currently lowers device code through legacy LLVM 7 NVVM IR,
 # which cannot export Rust debug metadata. Keeping debug info disabled also
@@ -39,7 +12,3 @@ pedantic = "warn"
 # failing late during PTX generation.
 [profile.dev]
 debug = 0
-
-[[example]]
-name = "mlp"
-required-features = []

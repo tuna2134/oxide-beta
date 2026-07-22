@@ -661,6 +661,87 @@ fn initialized_weights(shape: &[usize], input_channels_per_group: usize) -> Vec<
         .collect()
 }
 
+/// Computes grouped-query causal attention for reusable Transformer models.
+///
+/// Layouts are Q=`[q, heads, dim]` and K/V=`[kv, kv_heads, dim]`.
+///
+/// # Errors
+///
+/// Returns an error for incompatible shapes or an invalid sliding window.
+#[allow(clippy::too_many_arguments)]
+pub fn grouped_query_attention(
+    query: &[f32],
+    key: &[f32],
+    value: &[f32],
+    query_length: usize,
+    key_value_length: usize,
+    heads: usize,
+    key_value_heads: usize,
+    head_dimension: usize,
+    sliding_window: Option<usize>,
+) -> Result<Vec<f32>> {
+    if heads == 0
+        || key_value_heads == 0
+        || heads % key_value_heads != 0
+        || query_length > key_value_length
+        || query.len() != query_length * heads * head_dimension
+        || key.len() != key_value_length * key_value_heads * head_dimension
+        || value.len() != key.len()
+        || sliding_window == Some(0)
+    {
+        return Err(Error::InvalidShape(
+            "invalid grouped-query attention shape".into(),
+        ));
+    }
+    let groups = heads / key_value_heads;
+    let query_offset = key_value_length - query_length;
+    let mut output = vec![0.0; query.len()];
+    let mut scores = vec![0.0; key_value_length];
+    for query_index in 0..query_length {
+        let absolute_query = query_offset + query_index;
+        let start = sliding_window.map_or(0, |window| (absolute_query + 1).saturating_sub(window));
+        for head in 0..heads {
+            let key_value_head = head / groups;
+            let query_base = (query_index * heads + head) * head_dimension;
+            let mut maximum = f32::NEG_INFINITY;
+            for (position, score_slot) in scores
+                .iter_mut()
+                .enumerate()
+                .take(absolute_query + 1)
+                .skip(start)
+            {
+                let key_base = (position * key_value_heads + key_value_head) * head_dimension;
+                let score = query[query_base..query_base + head_dimension]
+                    .iter()
+                    .zip(&key[key_base..key_base + head_dimension])
+                    .map(|(left, right)| left * right)
+                    .sum();
+                *score_slot = score;
+                maximum = maximum.max(score);
+            }
+            let normalizer: f32 = (start..=absolute_query)
+                .map(|position| {
+                    scores[position] = (scores[position] - maximum).exp();
+                    scores[position]
+                })
+                .sum();
+            for (position, score) in scores
+                .iter()
+                .enumerate()
+                .take(absolute_query + 1)
+                .skip(start)
+            {
+                let probability = score / normalizer;
+                let value_base = (position * key_value_heads + key_value_head) * head_dimension;
+                for dimension in 0..head_dimension {
+                    output[query_base + dimension] += probability * value[value_base + dimension];
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -684,14 +684,22 @@ name = "oxide-torch"
 version = "0.1.0"
 dependencies = [
  "cuda-core",
- "cuda-device",
- "cuda-host",
  "half",
- "libloading",
  "memmap2",
+ "oxide-torch-cuda",
  "safetensors",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "oxide-torch-cuda"
+version = "0.1.0"
+dependencies = [
+ "cuda-core",
+ "cuda-device",
+ "cuda-host",
+ "libloading",
 ]
 
 [[package]]
@@ -700,6 +708,7 @@ version = "0.1.0"
 dependencies = [
  "cuda-core",
  "oxide-torch",
+ "oxide-torch-cuda",
  "safetensors",
  "serde",
  "serde_json",

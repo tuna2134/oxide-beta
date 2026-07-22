@@ -307,7 +307,7 @@ impl Gemma4CudaState {
         // SAFETY: the input contains complete `[heads, head_dim]` rows and
         // output has an identical extent.
         unsafe {
-            self.gemma4.rope(
+            self.attention.rope(
                 &self.stream,
                 Self::launch_config(input.len())?,
                 heads,
@@ -340,7 +340,7 @@ impl Gemma4CudaState {
         }
         let mut output = self.output_f32(input.len())?;
         unsafe {
-            self.gemma4.rope_state(
+            self.attention.rope_state(
                 &self.stream,
                 Self::launch_config(input.len())?,
                 heads,
@@ -393,7 +393,7 @@ impl Gemma4CudaState {
         };
         unsafe {
             if sequence <= 4096 {
-                self.gemma4.gqa_decode_block(
+                self.attention.gqa_decode_block(
                     &self.stream,
                     config,
                     heads,
@@ -409,7 +409,7 @@ impl Gemma4CudaState {
                     &mut output,
                 )
             } else {
-                self.gemma4.gqa_decode(
+                self.attention.gqa_decode(
                     &self.stream,
                     config,
                     heads,
@@ -455,7 +455,7 @@ impl Gemma4CudaState {
         let mut output = self.output_f32(query.len())?;
         unsafe {
             if use_block {
-                self.gemma4.gqa_decode_block_state(
+                self.attention.gqa_decode_block_state(
                     &self.stream,
                     LaunchConfig {
                         grid_dim: (heads as u32, 1, 1),
@@ -474,7 +474,7 @@ impl Gemma4CudaState {
                     &mut output,
                 )
             } else {
-                self.gemma4.gqa_decode_state(
+                self.attention.gqa_decode_state(
                     &self.stream,
                     Self::launch_config(query.len())?,
                     heads,
@@ -521,7 +521,7 @@ impl Gemma4CudaState {
             .ok_or_else(|| Error::InvalidShape("prefill GQA grid overflow".into()))?;
         let mut output = self.output_f32(query.len())?;
         unsafe {
-            self.gemma4.gqa_prefill_block(
+            self.attention.gqa_prefill_block(
                 &self.stream,
                 LaunchConfig {
                     grid_dim: (blocks, 1, 1),

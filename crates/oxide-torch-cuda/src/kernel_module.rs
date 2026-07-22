@@ -1161,8 +1161,8 @@ pub mod module {
         }
     }
 
-    /// Kernels whose math or memory layout follows the Gemma 4 architecture.
-    pub mod gemma4 {
+    /// Reusable rotary-position and grouped-query attention kernels.
+    pub mod attention {
         use super::*;
 
         #[kernel]

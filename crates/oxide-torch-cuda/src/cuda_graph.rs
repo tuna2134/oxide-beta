@@ -44,7 +44,13 @@ impl CudaGraphExec {
     ///
     /// Returns an error when the CUDA Driver API is unavailable or capture,
     /// recording, or graph instantiation fails.
-    pub fn capture(stream: &CudaStream, record: impl FnOnce() -> Result<()>) -> Result<Self> {
+    pub fn capture<E>(
+        stream: &CudaStream,
+        record: impl FnOnce() -> std::result::Result<(), E>,
+    ) -> Result<Self>
+    where
+        E: std::fmt::Display,
+    {
         stream.synchronize().map_err(cuda_error)?;
         let library = ["libcuda.so.1", "libcuda.so"]
             .into_iter()
@@ -85,7 +91,9 @@ impl CudaGraphExec {
                 // SAFETY: a non-null graph returned by the driver is owned here.
                 let _ = unsafe { graph_destroy(discarded) };
             }
-            return Err(error);
+            return Err(Error::Execution(format!(
+                "CUDA graph recording failed: {error}"
+            )));
         }
 
         let mut graph = std::ptr::null_mut();

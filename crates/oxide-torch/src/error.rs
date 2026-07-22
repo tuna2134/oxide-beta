@@ -26,3 +26,10 @@ impl Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(feature = "cuda")]
+impl From<oxide_torch_cuda::Error> for Error {
+    fn from(error: oxide_torch_cuda::Error) -> Self {
+        Self::Execution(error.to_string())
+    }
+}
