@@ -1,5 +1,6 @@
+use oxide_torch::nn::Module;
 use oxide_torch::{Device, Error, Result};
-use oxide_torch_models::bert::{BertForSequenceClassification, BertTokenizer};
+use oxide_torch_models::bert::{BertForSequenceClassification, BertInput, BertTokenizer};
 
 fn main() -> Result<()> {
     let directory = std::env::args_os().nth(1).ok_or_else(|| {
@@ -16,7 +17,8 @@ fn main() -> Result<()> {
     } else {
         &text
     })?;
-    let logits = model.forward(&[input_ids], None, None)?.to_vec()?;
+    let input = BertInput::from_ids(&[input_ids], None, None)?;
+    let logits = model.forward(&input)?.to_vec()?;
     let prediction = logits
         .iter()
         .enumerate()

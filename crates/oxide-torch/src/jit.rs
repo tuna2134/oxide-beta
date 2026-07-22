@@ -7,7 +7,7 @@
 
 use crate::nn::Module;
 use crate::tensor::{Op, eval_cpu};
-use crate::{Device, Error, Result, Tensor};
+use crate::{CustomInput, CustomOp, Device, Error, Result, Tensor};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -59,6 +59,12 @@ pub(crate) enum PlanOperation {
         rows: usize,
         columns: usize,
         inner: usize,
+    },
+    Custom {
+        inputs: Vec<usize>,
+        input_shapes: Vec<Vec<usize>>,
+        operation: Arc<dyn CustomOp>,
+        output: usize,
     },
 }
 
@@ -122,7 +128,7 @@ pub fn trace(
 ///
 /// Returns an error when tracing fails or the model output is on a different
 /// device than `example`.
-pub fn compile<M: Module>(model: &M, example: &Tensor) -> Result<JitModule> {
+pub fn compile<M: Module<Output = Tensor>>(model: &M, example: &Tensor) -> Result<JitModule> {
     trace(std::slice::from_ref(example), |inputs| {
         model.forward(&inputs[0])
     })
@@ -336,6 +342,24 @@ impl PlanBuilder {
                 output
             }
             Op::Reshape(input) => self.lower(input)?,
+            Op::Custom { inputs, operation } => {
+                if operation.kind() == crate::CustomOpKind::User {
+                    self.supported = false;
+                    return Ok(self.push_workspace(tensor.numel()));
+                }
+                let input_slots = inputs
+                    .iter()
+                    .map(|input| self.lower(input))
+                    .collect::<Result<Vec<_>>>()?;
+                let output = self.push_workspace(tensor.numel());
+                self.operations.push(PlanOperation::Custom {
+                    inputs: input_slots,
+                    input_shapes: inputs.iter().map(|input| input.shape().to_vec()).collect(),
+                    operation: Arc::clone(operation),
+                    output,
+                });
+                output
+            }
             _ => {
                 self.supported = false;
                 self.push_workspace(tensor.numel())
@@ -384,13 +408,13 @@ impl CpuCompiledPlan {
             buffers[*slot].copy_from_slice(&values);
         }
         for operation in &self.graph.operations {
-            execute_cpu(operation, &mut buffers);
+            execute_cpu(operation, &mut buffers)?;
         }
         Ok(buffers[self.graph.output].clone())
     }
 }
 
-fn execute_cpu(operation: &PlanOperation, buffers: &mut [Vec<f32>]) {
+fn execute_cpu(operation: &PlanOperation, buffers: &mut [Vec<f32>]) -> Result<()> {
     let (left, right, output) = match operation {
         PlanOperation::Add {
             left,
@@ -409,6 +433,7 @@ fn execute_cpu(operation: &PlanOperation, buffers: &mut [Vec<f32>]) {
             ..
         } => (*left, Some(*right), *output),
         PlanOperation::Relu { input, output } => (*input, None, *output),
+        PlanOperation::Custom { output, .. } => (0, None, *output),
     };
     let (sources, destination) = buffers.split_at_mut(output);
     let output_buffer = &mut destination[0];
@@ -446,7 +471,30 @@ fn execute_cpu(operation: &PlanOperation, buffers: &mut [Vec<f32>]) {
                 }
             }
         }
+        PlanOperation::Custom {
+            inputs,
+            input_shapes,
+            operation,
+            ..
+        } => {
+            let custom_inputs = inputs
+                .iter()
+                .zip(input_shapes)
+                .map(|(slot, shape)| CustomInput {
+                    shape,
+                    values: &sources[*slot],
+                })
+                .collect::<Vec<_>>();
+            let values = operation.forward(&custom_inputs)?;
+            if values.len() != output_buffer.len() {
+                return Err(Error::Execution(
+                    "custom JIT operation returned the wrong output size".into(),
+                ));
+            }
+            output_buffer.copy_from_slice(&values);
+        }
     }
+    Ok(())
 }
 
 fn bind_placeholders(graph: &Tensor, inputs: &[Tensor]) -> Result<Tensor> {
@@ -512,6 +560,17 @@ fn bind_placeholders(graph: &Tensor, inputs: &[Tensor]) -> Result<Tensor> {
                 *momentum,
                 *epsilon,
             )?,
+            Op::Custom {
+                inputs: operands,
+                operation,
+            } => Tensor::custom(
+                operands
+                    .iter()
+                    .map(|operand| bind(operand, inputs, cache))
+                    .collect::<Result<Vec<_>>>()?,
+                tensor.shape().to_vec(),
+                Arc::clone(operation),
+            )?,
         };
         cache.insert(tensor.node.id, result.clone());
         Ok(result)
@@ -529,6 +588,8 @@ mod tests {
     }
 
     impl Module for CustomModel {
+        type Output = Tensor;
+
         fn forward(&self, input: &Tensor) -> Result<Tensor> {
             Ok(input.matmul(&self.weight)?.add(&self.bias)?.relu())
         }

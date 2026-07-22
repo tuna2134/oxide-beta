@@ -1,9 +1,10 @@
-//! Fine-tunes BERT's sequence-classification head while keeping the encoder frozen.
+//! Fine-tunes the complete BERT encoder and sequence-classification head.
 
 use oxide_torch::loss::cross_entropy;
+use oxide_torch::nn::Module;
 use oxide_torch::optim::{AdamW, Optimizer};
 use oxide_torch::{Device, Error, Result, Tensor};
-use oxide_torch_models::bert::{BertForSequenceClassification, BertTokenizer};
+use oxide_torch_models::bert::{BertForSequenceClassification, BertInput, BertTokenizer};
 
 fn main() -> Result<()> {
     let directory = std::env::args_os().nth(1).ok_or_else(|| {
@@ -39,11 +40,12 @@ fn main() -> Result<()> {
         samples.iter().map(|(_, label)| *label).collect(),
         vec![samples.len()],
     )?;
+    let input = BertInput::from_ids(&encoded, Some(&masks), None)?;
     let mut optimizer = AdamW::new(2e-4, 0.01)?;
 
     for epoch in 1..=5 {
         optimizer.zero_grad(&model)?;
-        let logits = model.forward(&encoded, Some(&masks), None)?;
+        let logits = model.forward(&input)?;
         let loss = cross_entropy(&logits, &labels)?;
         loss.backward()?;
         optimizer.step(&mut model)?;

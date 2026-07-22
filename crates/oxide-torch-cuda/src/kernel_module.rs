@@ -33,6 +33,303 @@ pub mod module {
         }
     }
 
+    /// Backend-neutral transformer primitives used by the public tensor API.
+    pub mod transformer {
+        use super::*;
+
+        #[kernel]
+        pub fn linear(
+            input_width: usize,
+            output_width: usize,
+            input: &[f32],
+            weight: &[f32],
+            bias: &[f32],
+            mut output: DisjointSlice<f32>,
+        ) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                let row = raw / output_width;
+                let column = raw % output_width;
+                let mut sum = bias[column];
+                let mut inner = 0;
+                while inner < input_width {
+                    sum += input[row * input_width + inner] * weight[column * input_width + inner];
+                    inner += 1;
+                }
+                *value = sum;
+            }
+        }
+
+        #[kernel]
+        pub fn gelu(input: &[f32], mut output: DisjointSlice<f32>) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                let x = input[raw];
+                let inner = 0.797_884_6 * (x + 0.044_715 * x * x * x);
+                let e = core::intrinsics::expf32(if inner >= 0.0 {
+                    -2.0 * inner
+                } else {
+                    2.0 * inner
+                });
+                let tanh = if inner >= 0.0 {
+                    (1.0 - e) / (1.0 + e)
+                } else {
+                    (e - 1.0) / (e + 1.0)
+                };
+                *value = 0.5 * x * (1.0 + tanh);
+            }
+        }
+
+        #[kernel]
+        pub fn tanh(input: &[f32], mut output: DisjointSlice<f32>) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                let x = input[raw];
+                let e = core::intrinsics::expf32(if x >= 0.0 { -2.0 * x } else { 2.0 * x });
+                *value = if x >= 0.0 {
+                    (1.0 - e) / (1.0 + e)
+                } else {
+                    (e - 1.0) / (e + 1.0)
+                };
+            }
+        }
+
+        #[kernel]
+        pub fn embedding(
+            hidden: usize,
+            vocabulary: usize,
+            ids: &[f32],
+            weight: &[f32],
+            mut output: DisjointSlice<f32>,
+        ) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                let row = raw / hidden;
+                let column = raw % hidden;
+                let id = ids[row] as usize;
+                *value = if id < vocabulary {
+                    weight[id * hidden + column]
+                } else {
+                    0.0
+                };
+            }
+        }
+
+        #[kernel]
+        pub fn layer_norm(
+            hidden: usize,
+            epsilon: f32,
+            input: &[f32],
+            weight: &[f32],
+            bias: &[f32],
+            mut output: DisjointSlice<f32>,
+        ) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                let row = raw / hidden;
+                let column = raw % hidden;
+                let offset = row * hidden;
+                let mut mean = 0.0;
+                let mut inner = 0;
+                while inner < hidden {
+                    mean += input[offset + inner];
+                    inner += 1;
+                }
+                mean /= hidden as f32;
+                let mut variance = 0.0;
+                inner = 0;
+                while inner < hidden {
+                    let centered = input[offset + inner] - mean;
+                    variance += centered * centered;
+                    inner += 1;
+                }
+                variance /= hidden as f32;
+                *value = (input[raw] - mean) / core::intrinsics::sqrtf32(variance + epsilon)
+                    * weight[column]
+                    + bias[column];
+            }
+        }
+
+        #[kernel]
+        pub fn select_first(
+            sequence: usize,
+            hidden: usize,
+            input: &[f32],
+            mut output: DisjointSlice<f32>,
+        ) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                let batch = raw / hidden;
+                let column = raw % hidden;
+                *value = input[batch * sequence * hidden + column];
+            }
+        }
+
+        #[kernel]
+        #[allow(clippy::too_many_arguments)]
+        pub fn projected_attention(
+            sequence: usize,
+            hidden: usize,
+            heads: usize,
+            query: &[f32],
+            key: &[f32],
+            value: &[f32],
+            mask: &[f32],
+            mut output: DisjointSlice<f32>,
+        ) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(result) = output.get_mut(index) {
+                let batch = raw / (sequence * hidden);
+                let token = (raw / hidden) % sequence;
+                let dimension = raw % hidden;
+                let head_dim = hidden / heads;
+                let head = dimension / head_dim;
+                let scale = 1.0 / core::intrinsics::sqrtf32(head_dim as f32);
+                let mut maximum = f32::NEG_INFINITY;
+                let mut key_token = 0;
+                while key_token < sequence {
+                    if mask[batch * sequence + key_token] != 0.0 {
+                        let mut score = 0.0;
+                        let mut local = 0;
+                        while local < head_dim {
+                            let projected = head * head_dim + local;
+                            score += query[(batch * sequence + token) * hidden + projected]
+                                * key[(batch * sequence + key_token) * hidden + projected];
+                            local += 1;
+                        }
+                        maximum = maximum.max(score * scale);
+                    }
+                    key_token += 1;
+                }
+                if maximum == f32::NEG_INFINITY {
+                    *result = 0.0;
+                    return;
+                }
+                let mut normalizer = 0.0;
+                let mut weighted = 0.0;
+                key_token = 0;
+                while key_token < sequence {
+                    if mask[batch * sequence + key_token] != 0.0 {
+                        let mut score = 0.0;
+                        let mut local = 0;
+                        while local < head_dim {
+                            let projected = head * head_dim + local;
+                            score += query[(batch * sequence + token) * hidden + projected]
+                                * key[(batch * sequence + key_token) * hidden + projected];
+                            local += 1;
+                        }
+                        let probability = core::intrinsics::expf32(score * scale - maximum);
+                        normalizer += probability;
+                        weighted += probability
+                            * value[(batch * sequence + key_token) * hidden + dimension];
+                    }
+                    key_token += 1;
+                }
+                *result = weighted / normalizer;
+            }
+        }
+
+        #[kernel]
+        #[allow(clippy::too_many_arguments)]
+        pub fn scaled_dot_product_attention(
+            sequence: usize,
+            hidden: usize,
+            heads: usize,
+            input: &[f32],
+            mask: &[f32],
+            query_weight: &[f32],
+            query_bias: &[f32],
+            key_weight: &[f32],
+            key_bias: &[f32],
+            value_weight: &[f32],
+            value_bias: &[f32],
+            mut output: DisjointSlice<f32>,
+        ) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(result) = output.get_mut(index) {
+                let batch = raw / (sequence * hidden);
+                let token = (raw / hidden) % sequence;
+                let dimension = raw % hidden;
+                let head_dim = hidden / heads;
+                let head = dimension / head_dim;
+                let scale = 1.0 / core::intrinsics::sqrtf32(head_dim as f32);
+                let mut maximum = f32::NEG_INFINITY;
+                let mut key_token = 0;
+                while key_token < sequence {
+                    if mask[batch * sequence + key_token] != 0.0 {
+                        let mut score = 0.0;
+                        let mut local = 0;
+                        while local < head_dim {
+                            let projected = head * head_dim + local;
+                            let mut query = query_bias[projected];
+                            let mut key = key_bias[projected];
+                            let mut inner = 0;
+                            while inner < hidden {
+                                query += input[(batch * sequence + token) * hidden + inner]
+                                    * query_weight[projected * hidden + inner];
+                                key += input[(batch * sequence + key_token) * hidden + inner]
+                                    * key_weight[projected * hidden + inner];
+                                inner += 1;
+                            }
+                            score += query * key;
+                            local += 1;
+                        }
+                        maximum = maximum.max(score * scale);
+                    }
+                    key_token += 1;
+                }
+                if maximum == f32::NEG_INFINITY {
+                    *result = 0.0;
+                    return;
+                }
+                let mut normalizer = 0.0;
+                let mut weighted = 0.0;
+                key_token = 0;
+                while key_token < sequence {
+                    if mask[batch * sequence + key_token] != 0.0 {
+                        let mut score = 0.0;
+                        let mut local = 0;
+                        while local < head_dim {
+                            let projected = head * head_dim + local;
+                            let mut query = query_bias[projected];
+                            let mut key = key_bias[projected];
+                            let mut inner = 0;
+                            while inner < hidden {
+                                query += input[(batch * sequence + token) * hidden + inner]
+                                    * query_weight[projected * hidden + inner];
+                                key += input[(batch * sequence + key_token) * hidden + inner]
+                                    * key_weight[projected * hidden + inner];
+                                inner += 1;
+                            }
+                            score += query * key;
+                            local += 1;
+                        }
+                        let probability = core::intrinsics::expf32(score * scale - maximum);
+                        let mut value = value_bias[dimension];
+                        let mut inner = 0;
+                        while inner < hidden {
+                            value += input[(batch * sequence + key_token) * hidden + inner]
+                                * value_weight[dimension * hidden + inner];
+                            inner += 1;
+                        }
+                        normalizer += probability;
+                        weighted += probability * value;
+                    }
+                    key_token += 1;
+                }
+                *result = weighted / normalizer;
+            }
+        }
+    }
+
     #[kernel]
     pub fn matmul(
         m: usize,

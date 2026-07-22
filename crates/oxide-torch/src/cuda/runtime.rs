@@ -1,6 +1,6 @@
 use crate::nn::Parameter;
 use crate::tensor::{BatchNormState, Op, Tensor};
-use crate::{Device, Error, Result};
+use crate::{CustomInput, CustomOp, CustomOpKind, Device, Error, Result};
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -29,6 +29,7 @@ struct Executor {
     _context: Arc<CudaContext>,
     stream: Arc<cuda_core::CudaStream>,
     module: kernels::LoadedModule,
+    transformer: kernels::transformer::LoadedModule,
     values: HashMap<u64, Buffer>,
     gradients: HashMap<u64, Buffer>,
     batch_norm_states: HashMap<usize, BatchNormDeviceState>,
@@ -46,6 +47,8 @@ impl Executor {
         let context = CudaContext::new(device).map_err(cuda_error)?;
         let stream = context.default_stream();
         let module = oxide_torch_cuda::load_kernels(&context).map_err(cuda_error)?;
+        let transformer =
+            kernels::transformer::LoadedModule::from_parent(&module).map_err(cuda_error)?;
         let root_gradient = Arc::new(DeviceBuffer::from_host(&stream, &[1.0]).map_err(cuda_error)?);
         #[cfg(feature = "cudnn")]
         let cudnn = oxide_torch_cuda::cudnn::Cudnn::try_new();
@@ -62,6 +65,7 @@ impl Executor {
             _context: context,
             stream,
             module,
+            transformer,
             values: HashMap::new(),
             gradients: HashMap::new(),
             batch_norm_states: HashMap::new(),
@@ -304,9 +308,160 @@ impl Executor {
             } => self.eval_batch_norm(
                 tensor, input, weight, bias, state, *training, *momentum, *epsilon,
             )?,
+            Op::Custom { inputs, operation } => {
+                self.eval_builtin_custom(tensor, inputs, operation.kind())?
+            }
         };
         let output = Arc::new(output);
         self.values.insert(tensor.node.id, output.clone());
+        Ok(output)
+    }
+
+    fn eval_builtin_custom(
+        &mut self,
+        tensor: &Tensor,
+        inputs: &[Tensor],
+        kind: CustomOpKind,
+    ) -> Result<DeviceBuffer<f32>> {
+        if kind == CustomOpKind::User {
+            return Err(Error::Execution(
+                "user-defined custom operations currently require the CPU backend".into(),
+            ));
+        }
+        let buffers = inputs
+            .iter()
+            .map(|input| self.eval_node(input))
+            .collect::<Result<Vec<_>>>()?;
+        if let CustomOpKind::ScaledDotProductAttention { heads } = kind {
+            return self.eval_attention_custom(tensor, inputs, &buffers, heads);
+        }
+        let mut output = self.output_buffer(tensor.numel())?;
+        let config = launch_config(tensor.numel())?;
+        // SAFETY: the public transformer constructors validate shapes and all
+        // kernels bounds-check their output index.
+        unsafe {
+            match kind {
+                CustomOpKind::Linear => self.transformer.linear(
+                    &self.stream,
+                    config,
+                    inputs[0].shape()[inputs[0].shape().len() - 1],
+                    inputs[1].shape()[0],
+                    &buffers[0],
+                    &buffers[1],
+                    &buffers[2],
+                    &mut output,
+                ),
+                CustomOpKind::Gelu => {
+                    self.transformer
+                        .gelu(&self.stream, config, &buffers[0], &mut output)
+                }
+                CustomOpKind::Tanh => {
+                    self.transformer
+                        .tanh(&self.stream, config, &buffers[0], &mut output)
+                }
+                CustomOpKind::Embedding => self.transformer.embedding(
+                    &self.stream,
+                    config,
+                    inputs[1].shape()[1],
+                    inputs[1].shape()[0],
+                    &buffers[0],
+                    &buffers[1],
+                    &mut output,
+                ),
+                CustomOpKind::LayerNorm { epsilon } => self.transformer.layer_norm(
+                    &self.stream,
+                    config,
+                    inputs[1].numel(),
+                    epsilon,
+                    &buffers[0],
+                    &buffers[1],
+                    &buffers[2],
+                    &mut output,
+                ),
+                CustomOpKind::SelectFirst => self.transformer.select_first(
+                    &self.stream,
+                    config,
+                    inputs[0].shape()[1],
+                    inputs[0].shape()[2],
+                    &buffers[0],
+                    &mut output,
+                ),
+                CustomOpKind::ScaledDotProductAttention { .. } => unreachable!(),
+                CustomOpKind::User => unreachable!(),
+            }
+        }
+        .map_err(cuda_error)?;
+        Ok(output)
+    }
+
+    fn eval_attention_custom(
+        &self,
+        tensor: &Tensor,
+        inputs: &[Tensor],
+        buffers: &[Buffer],
+        heads: usize,
+    ) -> Result<DeviceBuffer<f32>> {
+        let hidden = inputs[0].shape()[2];
+        let elements = inputs[0].numel();
+        let mut query = self.output_buffer(elements)?;
+        let mut key = self.output_buffer(elements)?;
+        let mut value = self.output_buffer(elements)?;
+        let mut output = self.output_buffer(tensor.numel())?;
+        let projection_config = launch_config(elements)?;
+        // SAFETY: Q/K/V projection tensors all use validated [hidden, hidden]
+        // weights and distinct output buffers.
+        unsafe {
+            self.transformer
+                .linear(
+                    &self.stream,
+                    projection_config,
+                    hidden,
+                    hidden,
+                    &buffers[0],
+                    &buffers[2],
+                    &buffers[3],
+                    &mut query,
+                )
+                .map_err(cuda_error)?;
+            self.transformer
+                .linear(
+                    &self.stream,
+                    projection_config,
+                    hidden,
+                    hidden,
+                    &buffers[0],
+                    &buffers[4],
+                    &buffers[5],
+                    &mut key,
+                )
+                .map_err(cuda_error)?;
+            self.transformer
+                .linear(
+                    &self.stream,
+                    projection_config,
+                    hidden,
+                    hidden,
+                    &buffers[0],
+                    &buffers[6],
+                    &buffers[7],
+                    &mut value,
+                )
+                .map_err(cuda_error)?;
+            self.transformer
+                .projected_attention(
+                    &self.stream,
+                    launch_config(tensor.numel())?,
+                    inputs[0].shape()[1],
+                    hidden,
+                    heads,
+                    &query,
+                    &key,
+                    &value,
+                    &buffers[1],
+                    &mut output,
+                )
+                .map_err(cuda_error)?;
+        }
         Ok(output)
     }
 
@@ -578,7 +733,54 @@ impl Executor {
                 training,
                 ..
             } => self.backward_batch_norm(tensor, input, weight, bias, *training, &gradient),
+            Op::Custom { inputs, operation } => {
+                self.backward_custom(inputs, operation.as_ref(), &gradient)
+            }
         }
+    }
+
+    fn backward_custom(
+        &mut self,
+        inputs: &[Tensor],
+        operation: &dyn CustomOp,
+        gradient: &Buffer,
+    ) -> Result<()> {
+        if operation.kind() == CustomOpKind::User {
+            return Err(Error::Execution(
+                "user-defined custom operations currently require CPU autograd".into(),
+            ));
+        }
+        let input_values = inputs
+            .iter()
+            .map(|input| {
+                self.eval_node(input)?
+                    .to_host_vec(&self.stream)
+                    .map_err(cuda_error)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let host_gradient = gradient.to_host_vec(&self.stream).map_err(cuda_error)?;
+        let custom_inputs = inputs
+            .iter()
+            .zip(&input_values)
+            .map(|(input, values)| CustomInput {
+                shape: input.shape(),
+                values,
+            })
+            .collect::<Vec<_>>();
+        let gradients = operation.backward(&custom_inputs, &host_gradient)?;
+        if gradients.len() != inputs.len() {
+            return Err(Error::Execution(
+                "built-in custom operation returned the wrong gradient count".into(),
+            ));
+        }
+        for (input, gradient) in inputs.iter().zip(gradients) {
+            if let Some(gradient) = gradient {
+                let gradient =
+                    Arc::new(DeviceBuffer::from_host(&self.stream, &gradient).map_err(cuda_error)?);
+                self.accumulate_gradient(input, &gradient)?;
+            }
+        }
+        Ok(())
     }
 
     fn backward_matmul(&mut self, left: &Tensor, right: &Tensor, gradient: &Buffer) -> Result<()> {
@@ -1100,6 +1302,11 @@ fn collect_topological(tensor: &Tensor, seen: &mut HashSet<u64>, output: &mut Ve
         Op::CrossEntropy { logits, targets } => {
             collect_topological(logits, seen, output);
             collect_topological(targets, seen, output);
+        }
+        Op::Custom { inputs, .. } => {
+            for input in inputs {
+                collect_topological(input, seen, output);
+            }
         }
     }
     output.push(tensor.clone());

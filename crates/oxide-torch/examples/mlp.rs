@@ -7,6 +7,8 @@ struct Mlp {
 }
 
 impl Module for Mlp {
+    type Output = Tensor;
+
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         Ok(input.matmul(&self.weight)?.add(&self.bias)?.relu())
     }

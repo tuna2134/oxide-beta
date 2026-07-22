@@ -7,13 +7,15 @@ use std::sync::{Arc, Mutex};
 
 static NEXT_PARAMETER_ID: AtomicU64 = AtomicU64::new(1);
 
-pub trait Module {
+pub trait Module<Input: ?Sized = Tensor> {
+    type Output;
+
     /// Runs a lazy forward pass.
     ///
     /// # Errors
     ///
     /// Returns an error when an input shape/device is incompatible with the module.
-    fn forward(&self, input: &Tensor) -> Result<Tensor>;
+    fn forward(&self, input: &Input) -> Result<Self::Output>;
 }
 
 /// Switches stateful layers between training and inference behavior.
@@ -174,6 +176,8 @@ impl BatchNorm2d {
 }
 
 impl Module for BatchNorm2d {
+    type Output = Tensor;
+
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         input.batch_norm2d(
             self.weight.value(),
@@ -317,6 +321,8 @@ impl Conv2d {
 }
 
 impl Module for Conv2d {
+    type Output = Tensor;
+
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         input.conv2d(
             self.weight.value(),
@@ -378,6 +384,8 @@ impl ConvNormAct {
 }
 
 impl Module for ConvNormAct {
+    type Output = Tensor;
+
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let output = self.norm.forward(&self.conv.forward(input)?)?;
         Ok(if self.activation {
@@ -487,6 +495,8 @@ impl UniversalInvertedBottleneck {
 }
 
 impl Module for UniversalInvertedBottleneck {
+    type Output = Tensor;
+
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let residual = input;
         let mut output = input.clone();
@@ -603,6 +613,8 @@ impl FusedInvertedBottleneck {
 }
 
 impl Module for FusedInvertedBottleneck {
+    type Output = Tensor;
+
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let output = self.project.forward(&self.expand.forward(input)?)?;
         if self.residual {

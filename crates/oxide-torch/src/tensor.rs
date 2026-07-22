@@ -19,6 +19,50 @@ pub struct Tensor {
     pub(crate) node: Arc<Node>,
 }
 
+/// Read-only input passed to a user-defined CPU tensor operation.
+pub struct CustomInput<'a> {
+    pub shape: &'a [usize],
+    pub values: &'a [f32],
+}
+
+/// Backend-dispatch identifier for built-in extensible operations.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CustomOpKind {
+    User,
+    Linear,
+    Gelu,
+    Tanh,
+    Embedding,
+    LayerNorm { epsilon: f32 },
+    SelectFirst,
+    ScaledDotProductAttention { heads: usize },
+}
+
+/// Extensible differentiable CPU operation used by higher-level model crates.
+pub trait CustomOp: std::fmt::Debug + Send + Sync {
+    /// Identifies operations that have native backend implementations.
+    fn kind(&self) -> CustomOpKind {
+        CustomOpKind::User
+    }
+
+    /// Evaluates the operation on materialized CPU inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input shapes or values are invalid.
+    fn forward(&self, inputs: &[CustomInput<'_>]) -> Result<Vec<f32>>;
+    /// Computes input gradients for a materialized output gradient.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the gradient shape is invalid.
+    fn backward(
+        &self,
+        inputs: &[CustomInput<'_>],
+        output_gradient: &[f32],
+    ) -> Result<Vec<Option<Vec<f32>>>>;
+}
+
 #[derive(Debug)]
 pub(crate) struct Node {
     pub(crate) id: u64,
@@ -78,9 +122,32 @@ pub(crate) enum Op {
         momentum: f32,
         epsilon: f32,
     },
+    Custom {
+        inputs: Vec<Tensor>,
+        operation: Arc<dyn CustomOp>,
+    },
 }
 
 impl Tensor {
+    /// Creates a differentiable custom CPU operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidShape`] for an invalid output shape or
+    /// [`Error::DeviceMismatch`] when inputs are placed on different devices.
+    pub fn custom(
+        inputs: Vec<Tensor>,
+        shape: impl Into<Vec<usize>>,
+        operation: Arc<dyn CustomOp>,
+    ) -> Result<Self> {
+        let shape = shape.into();
+        checked_numel(&shape)?;
+        let device = inputs.first().map_or(Device::Cpu, Tensor::device);
+        if inputs.iter().any(|input| input.device() != device) {
+            return Err(Error::DeviceMismatch);
+        }
+        Ok(Self::new(shape, device, Op::Custom { inputs, operation }))
+    }
     /// Constructs a CPU tensor from row-major data.
     ///
     /// # Errors
@@ -706,6 +773,24 @@ pub(crate) fn eval_cpu(
             cache,
             inputs,
         )?,
+        Op::Custom {
+            inputs: operands,
+            operation,
+        } => {
+            let values = operands
+                .iter()
+                .map(|operand| eval_cpu(operand, cache, inputs))
+                .collect::<Result<Vec<_>>>()?;
+            let custom_inputs = operands
+                .iter()
+                .zip(&values)
+                .map(|(operand, values)| CustomInput {
+                    shape: operand.shape(),
+                    values,
+                })
+                .collect::<Vec<_>>();
+            operation.forward(&custom_inputs)?
+        }
     };
     cache.insert(tensor.node.id, value.clone());
     Ok(value)
@@ -778,6 +863,13 @@ fn clone_to_device(tensor: &Tensor, device: Device, cache: &mut HashMap<u64, Ten
             training: *training,
             momentum: *momentum,
             epsilon: *epsilon,
+        },
+        Op::Custom { inputs, operation } => Op::Custom {
+            inputs: inputs
+                .iter()
+                .map(|input| clone_to_device(input, device, cache))
+                .collect(),
+            operation: Arc::clone(operation),
         },
     };
     let result = Tensor::new(tensor.node.shape.clone(), device, op);
@@ -1124,6 +1216,11 @@ fn clear_graph_grads(tensor: &Tensor, visited: &mut HashSet<u64>) -> Result<()> 
             clear_graph_grads(logits, visited)?;
             clear_graph_grads(targets, visited)?;
         }
+        Op::Custom { inputs, .. } => {
+            for input in inputs {
+                clear_graph_grads(input, visited)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1221,6 +1318,32 @@ fn backward_node(
             &gradient,
             values,
         ),
+        Op::Custom { inputs, operation } => {
+            let input_values = inputs
+                .iter()
+                .map(|input| eval_cpu(input, values, None))
+                .collect::<Result<Vec<_>>>()?;
+            let custom_inputs = inputs
+                .iter()
+                .zip(&input_values)
+                .map(|(input, values)| CustomInput {
+                    shape: input.shape(),
+                    values,
+                })
+                .collect::<Vec<_>>();
+            let gradients = operation.backward(&custom_inputs, &gradient)?;
+            if gradients.len() != inputs.len() {
+                return Err(Error::Execution(
+                    "custom op returned the wrong gradient count".into(),
+                ));
+            }
+            for (input, gradient) in inputs.iter().zip(gradients) {
+                if let Some(gradient) = gradient {
+                    backward_node(input, gradient, values)?;
+                }
+            }
+            Ok(())
+        }
     }
 }
 

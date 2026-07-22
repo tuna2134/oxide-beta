@@ -2,7 +2,7 @@
 
 use super::kernels;
 use crate::jit::{BufferPlan, GraphPlan, PlanOperation};
-use crate::{Error, Result, Tensor};
+use crate::{CustomOpKind, Error, Result, Tensor};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 use oxide_torch_cuda::cuda_graph::CudaGraphExec;
 use std::sync::{Arc, Mutex};
@@ -15,6 +15,7 @@ struct CudaJitState {
     _context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     module: kernels::LoadedModule,
+    transformer: kernels::transformer::LoadedModule,
     buffers: Vec<DeviceBuffer<f32>>,
     inputs: Vec<usize>,
     output: usize,
@@ -28,6 +29,8 @@ impl CudaJitPlan {
         // gives copies and graph replays a stable ordering.
         let stream = context.new_stream().map_err(cuda_error)?;
         let module = oxide_torch_cuda::load_kernels(&context).map_err(cuda_error)?;
+        let transformer =
+            kernels::transformer::LoadedModule::from_parent(&module).map_err(cuda_error)?;
         let mut buffers = plan
             .buffers
             .iter()
@@ -42,13 +45,20 @@ impl CudaJitPlan {
             .collect::<Result<Vec<_>>>()?;
 
         let graph = CudaGraphExec::capture(&stream, || {
-            launch_operations(&module, &stream, &plan.operations, &mut buffers)
+            launch_operations(
+                &module,
+                &transformer,
+                &stream,
+                &plan.operations,
+                &mut buffers,
+            )
         })?;
         Ok(Self {
             state: Mutex::new(CudaJitState {
                 _context: context,
                 stream,
                 module,
+                transformer,
                 buffers,
                 inputs: plan.inputs,
                 output: plan.output,
@@ -90,6 +100,7 @@ impl CudaJitPlan {
 
 fn launch_operations(
     module: &kernels::LoadedModule,
+    transformer: &kernels::transformer::LoadedModule,
     stream: &CudaStream,
     operations: &[PlanOperation],
     buffers: &mut [DeviceBuffer<f32>],
@@ -117,6 +128,7 @@ fn launch_operations(
                 columns,
                 ..
             } => (*left, Some(*right), *output, rows * columns),
+            PlanOperation::Custom { output, .. } => (0, None, *output, buffers[*output].len()),
         };
         // PlanBuilder emits each output after all of its inputs. Splitting here
         // makes non-aliasing visible to Rust as well as to the CUDA launcher.
@@ -159,11 +171,102 @@ fn launch_operations(
                     &sources[right.expect("matmul right input")],
                     destination,
                 ),
+                PlanOperation::Custom {
+                    inputs,
+                    input_shapes,
+                    operation,
+                    ..
+                } => launch_custom(
+                    transformer,
+                    stream,
+                    config,
+                    operation.kind(),
+                    inputs,
+                    input_shapes,
+                    sources,
+                    destination,
+                ),
             }
         }
         .map_err(cuda_error)?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_custom(
+    module: &kernels::transformer::LoadedModule,
+    stream: &CudaStream,
+    config: LaunchConfig,
+    kind: CustomOpKind,
+    inputs: &[usize],
+    shapes: &[Vec<usize>],
+    buffers: &[DeviceBuffer<f32>],
+    output: &mut DeviceBuffer<f32>,
+) -> std::result::Result<(), cuda_core::DriverError> {
+    // SAFETY: GraphPlan shape validation and fixed non-aliasing buffers satisfy
+    // every generated kernel launch contract.
+    unsafe {
+        match kind {
+            CustomOpKind::Linear => module.linear(
+                stream,
+                config,
+                shapes[0][shapes[0].len() - 1],
+                shapes[1][0],
+                &buffers[inputs[0]],
+                &buffers[inputs[1]],
+                &buffers[inputs[2]],
+                output,
+            ),
+            CustomOpKind::Gelu => module.gelu(stream, config, &buffers[inputs[0]], output),
+            CustomOpKind::Tanh => module.tanh(stream, config, &buffers[inputs[0]], output),
+            CustomOpKind::Embedding => module.embedding(
+                stream,
+                config,
+                shapes[1][1],
+                shapes[1][0],
+                &buffers[inputs[0]],
+                &buffers[inputs[1]],
+                output,
+            ),
+            CustomOpKind::LayerNorm { epsilon } => module.layer_norm(
+                stream,
+                config,
+                shapes[1].iter().product(),
+                epsilon,
+                &buffers[inputs[0]],
+                &buffers[inputs[1]],
+                &buffers[inputs[2]],
+                output,
+            ),
+            CustomOpKind::SelectFirst => module.select_first(
+                stream,
+                config,
+                shapes[0][1],
+                shapes[0][2],
+                &buffers[inputs[0]],
+                output,
+            ),
+            CustomOpKind::ScaledDotProductAttention { heads } => module
+                .scaled_dot_product_attention(
+                    stream,
+                    config,
+                    shapes[0][1],
+                    shapes[0][2],
+                    heads,
+                    &buffers[inputs[0]],
+                    &buffers[inputs[1]],
+                    &buffers[inputs[2]],
+                    &buffers[inputs[3]],
+                    &buffers[inputs[4]],
+                    &buffers[inputs[5]],
+                    &buffers[inputs[6]],
+                    &buffers[inputs[7]],
+                    output,
+                ),
+            CustomOpKind::User => panic!("user custom operations cannot enter a CUDA JIT plan"),
+        }
+    }
 }
 
 fn launch_config(elements: usize) -> Result<LaunchConfig> {
