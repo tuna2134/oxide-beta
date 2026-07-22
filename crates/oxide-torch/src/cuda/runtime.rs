@@ -381,7 +381,7 @@ impl Executor {
     fn eval_transformer_cuda(
         &mut self,
         tensor: &Tensor,
-        inputs: &[Tensor],
+        inputs: &[&Tensor],
         primitive: crate::transformer::Primitive,
     ) -> Result<DeviceBuffer<f32>> {
         let buffers = inputs
@@ -454,7 +454,7 @@ impl Executor {
     fn eval_attention_custom(
         &self,
         tensor: &Tensor,
-        inputs: &[Tensor],
+        inputs: &[&Tensor],
         buffers: &[Buffer],
         heads: usize,
     ) -> Result<DeviceBuffer<f32>> {
@@ -861,7 +861,7 @@ impl Executor {
 
     fn backward_transformer_cuda(
         &mut self,
-        inputs: &[Tensor],
+        inputs: &[&Tensor],
         primitive: crate::transformer::Primitive,
         gradient: &Buffer,
     ) -> Result<()> {
