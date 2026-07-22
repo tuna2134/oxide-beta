@@ -552,9 +552,9 @@ impl Gemma4CudaState {
         let mut candidates = self.output_f32(top_k * 2)?.into_inner();
         let executable = CudaGraphExec::capture(&self.stream, || {
             let logits = self.decode_logits_state(config, table)?;
-            let candidates = blocks * top_k;
-            let mut stage_scores = self.output_f32(candidates)?;
-            let mut stage_ids = self.output_f32(candidates)?;
+            let candidate_count = blocks * top_k;
+            let mut stage_scores = self.output_f32(candidate_count)?;
+            let mut stage_ids = self.output_f32(candidate_count)?;
             unsafe {
                 self.sampling.topk_stage1(
                     &self.stream,
