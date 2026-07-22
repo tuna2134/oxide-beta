@@ -175,5 +175,8 @@ fn to_i32(value: usize) -> Result<c_int> {
 }
 
 fn ffi_error(error: libloading::Error) -> Error {
-    Error::Execution(format!("failed to load cuBLAS symbol: {error}"))
+    Error::DynamicLibrary {
+        component: "cuBLAS",
+        source: error,
+    }
 }

@@ -689,6 +689,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -699,6 +700,7 @@ dependencies = [
  "cuda-device",
  "cuda-host",
  "libloading",
+ "thiserror",
 ]
 
 [[package]]

@@ -40,14 +40,14 @@ impl KvCache {
         self.key.extend_from_slice(key);
         self.value.extend_from_slice(value);
         self.sequence_len += positions;
-        if let Some(window) = window {
-            if self.sequence_len > window {
-                let discard_positions = self.sequence_len - window;
-                let discard = discard_positions * kv_heads * head_dim;
-                self.key.drain(..discard);
-                self.value.drain(..discard);
-                self.sequence_len = window;
-            }
+        if let Some(window) = window
+            && self.sequence_len > window
+        {
+            let discard_positions = self.sequence_len - window;
+            let discard = discard_positions * kv_heads * head_dim;
+            self.key.drain(..discard);
+            self.value.drain(..discard);
+            self.sequence_len = window;
         }
         Ok(())
     }

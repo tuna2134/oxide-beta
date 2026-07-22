@@ -8,6 +8,23 @@ pub struct Gemma4Tokenizer {
     inner: Tokenizer,
 }
 
+/// Stateful decoder for text emitted one token at a time.
+pub struct Gemma4DecodeStream<'tokenizer> {
+    step: Box<dyn FnMut(u32) -> Result<Option<String>> + 'tokenizer>,
+}
+
+impl Gemma4DecodeStream<'_> {
+    /// Decodes one token, returning a chunk once it forms valid text.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the token does not extend the decoder state with a
+    /// valid prefix.
+    pub fn step(&mut self, token_id: u32) -> Result<Option<String>> {
+        (self.step)(token_id)
+    }
+}
+
 impl std::fmt::Debug for Gemma4Tokenizer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -64,6 +81,22 @@ impl Gemma4Tokenizer {
         self.inner
             .decode(ids, skip_special_tokens)
             .map_err(|error| Error::Execution(format!("Gemma 4 decoding failed: {error}")))
+    }
+
+    /// Creates a stateful decoder suitable for `Gemma4ForCausalLM::generate_stream`.
+    ///
+    /// Unlike decoding each token independently, this preserves whitespace and
+    /// buffers incomplete multi-token Unicode sequences.
+    #[must_use]
+    pub fn decode_stream(&self, skip_special_tokens: bool) -> Gemma4DecodeStream<'_> {
+        let mut stream = self.inner.decode_stream(skip_special_tokens);
+        Gemma4DecodeStream {
+            step: Box::new(move |token_id| {
+                stream.step(token_id).map_err(|error| {
+                    Error::Execution(format!("Gemma 4 streaming decode failed: {error}"))
+                })
+            }),
+        }
     }
 
     #[must_use]
