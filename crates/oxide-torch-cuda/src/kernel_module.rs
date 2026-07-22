@@ -1410,7 +1410,7 @@ pub mod module {
             mut output: DisjointSlice<f32>,
         ) {
             static mut PROBABILITIES: SharedArray<f32, 4096> = SharedArray::UNINIT;
-            static mut NORMALIZER: SharedArray<f32, 1> = SharedArray::UNINIT;
+            static mut REDUCTION: SharedArray<f32, 256> = SharedArray::UNINIT;
             let head = thread::blockIdx_x() as usize;
             let lane = thread::threadIdx_x() as usize;
             if head >= heads {
@@ -1422,38 +1422,57 @@ pub mod module {
             } else {
                 sequence - window
             };
-            if lane == 0 {
-                let mut maximum = f32::NEG_INFINITY;
-                let mut position = start;
-                while position < sequence {
-                    let physical = (cache_start + position) % cache_capacity;
-                    let mut score = 0.0;
-                    let mut inner = 0;
-                    while inner < head_dim {
-                        score += query[head * head_dim + inner]
-                            * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
-                        inner += 1;
-                    }
-                    unsafe { PROBABILITIES[position - start] = score };
-                    if score > maximum {
-                        maximum = score;
-                    }
-                    position += 1;
+            let mut local_maximum = f32::NEG_INFINITY;
+            let mut position = start + lane;
+            while position < sequence {
+                let physical = (cache_start + position) % cache_capacity;
+                let mut score = 0.0;
+                let mut inner = 0;
+                while inner < head_dim {
+                    score += query[head * head_dim + inner]
+                        * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
+                    inner += 1;
                 }
-                let mut normalizer = 0.0;
-                position = start;
-                while position < sequence {
-                    let probability = core::intrinsics::expf32(
-                        unsafe { PROBABILITIES[position - start] } - maximum,
-                    );
-                    unsafe { PROBABILITIES[position - start] = probability };
-                    normalizer += probability;
-                    position += 1;
+                unsafe { PROBABILITIES[position - start] = score };
+                if score > local_maximum {
+                    local_maximum = score;
                 }
-                unsafe { NORMALIZER[0] = normalizer };
+                position += 256;
             }
+            unsafe { REDUCTION[lane] = local_maximum };
             thread::sync_threads();
-            let normalizer = unsafe { NORMALIZER[0] };
+            let mut stride = 128;
+            while stride > 0 {
+                if lane < stride {
+                    let other = unsafe { REDUCTION[lane + stride] };
+                    if other > unsafe { REDUCTION[lane] } {
+                        unsafe { REDUCTION[lane] = other };
+                    }
+                }
+                thread::sync_threads();
+                stride /= 2;
+            }
+            let maximum = unsafe { REDUCTION[0] };
+            let mut local_normalizer = 0.0;
+            position = start + lane;
+            while position < sequence {
+                let probability =
+                    core::intrinsics::expf32(unsafe { PROBABILITIES[position - start] } - maximum);
+                unsafe { PROBABILITIES[position - start] = probability };
+                local_normalizer += probability;
+                position += 256;
+            }
+            unsafe { REDUCTION[lane] = local_normalizer };
+            thread::sync_threads();
+            stride = 128;
+            while stride > 0 {
+                if lane < stride {
+                    unsafe { REDUCTION[lane] += REDUCTION[lane + stride] };
+                }
+                thread::sync_threads();
+                stride /= 2;
+            }
+            let normalizer = unsafe { REDUCTION[0] };
             let mut dimension = lane;
             while dimension < head_dim {
                 let mut weighted = 0.0;
@@ -1486,7 +1505,7 @@ pub mod module {
             mut output: DisjointSlice<f32>,
         ) {
             static mut PROBABILITIES: SharedArray<f32, 4096> = SharedArray::UNINIT;
-            static mut NORMALIZER: SharedArray<f32, 1> = SharedArray::UNINIT;
+            static mut REDUCTION: SharedArray<f32, 256> = SharedArray::UNINIT;
             let head = thread::blockIdx_x() as usize;
             let lane = thread::threadIdx_x() as usize;
             if head >= heads {
@@ -1509,38 +1528,57 @@ pub mod module {
             } else {
                 sequence - window
             };
-            if lane == 0 {
-                let mut maximum = f32::NEG_INFINITY;
-                let mut position = start;
-                while position < sequence {
-                    let physical = (cache_start + position) % cache_capacity;
-                    let mut score = 0.0;
-                    let mut inner = 0;
-                    while inner < head_dim {
-                        score += query[head * head_dim + inner]
-                            * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
-                        inner += 1;
-                    }
-                    unsafe { PROBABILITIES[position - start] = score };
-                    if score > maximum {
-                        maximum = score;
-                    }
-                    position += 1;
+            let mut local_maximum = f32::NEG_INFINITY;
+            let mut position = start + lane;
+            while position < sequence {
+                let physical = (cache_start + position) % cache_capacity;
+                let mut score = 0.0;
+                let mut inner = 0;
+                while inner < head_dim {
+                    score += query[head * head_dim + inner]
+                        * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
+                    inner += 1;
                 }
-                let mut normalizer = 0.0;
-                position = start;
-                while position < sequence {
-                    let probability = core::intrinsics::expf32(
-                        unsafe { PROBABILITIES[position - start] } - maximum,
-                    );
-                    unsafe { PROBABILITIES[position - start] = probability };
-                    normalizer += probability;
-                    position += 1;
+                unsafe { PROBABILITIES[position - start] = score };
+                if score > local_maximum {
+                    local_maximum = score;
                 }
-                unsafe { NORMALIZER[0] = normalizer };
+                position += 256;
             }
+            unsafe { REDUCTION[lane] = local_maximum };
             thread::sync_threads();
-            let normalizer = unsafe { NORMALIZER[0] };
+            let mut stride = 128;
+            while stride > 0 {
+                if lane < stride {
+                    let other = unsafe { REDUCTION[lane + stride] };
+                    if other > unsafe { REDUCTION[lane] } {
+                        unsafe { REDUCTION[lane] = other };
+                    }
+                }
+                thread::sync_threads();
+                stride /= 2;
+            }
+            let maximum = unsafe { REDUCTION[0] };
+            let mut local_normalizer = 0.0;
+            position = start + lane;
+            while position < sequence {
+                let probability =
+                    core::intrinsics::expf32(unsafe { PROBABILITIES[position - start] } - maximum);
+                unsafe { PROBABILITIES[position - start] = probability };
+                local_normalizer += probability;
+                position += 256;
+            }
+            unsafe { REDUCTION[lane] = local_normalizer };
+            thread::sync_threads();
+            stride = 128;
+            while stride > 0 {
+                if lane < stride {
+                    unsafe { REDUCTION[lane] += REDUCTION[lane + stride] };
+                }
+                thread::sync_threads();
+                stride /= 2;
+            }
+            let normalizer = unsafe { REDUCTION[0] };
             let mut dimension = lane;
             while dimension < head_dim {
                 let mut weighted = 0.0;
@@ -1707,8 +1745,7 @@ pub mod module {
             top_k: usize,
             input_scores: &[f32],
             input_ids: &[f32],
-            mut scores: DisjointSlice<f32>,
-            mut ids: DisjointSlice<f32>,
+            mut output: DisjointSlice<f32>,
         ) {
             if thread::index_1d().get() != 0 {
                 return;
@@ -1733,8 +1770,8 @@ pub mod module {
             let mut rank = 0;
             while rank < top_k {
                 unsafe {
-                    *scores.get_unchecked_mut(rank) = best_scores[rank];
-                    *ids.get_unchecked_mut(rank) = best_ids[rank] as f32;
+                    *output.get_unchecked_mut(rank) = best_scores[rank];
+                    *output.get_unchecked_mut(top_k + rank) = best_ids[rank] as f32;
                 }
                 rank += 1;
             }

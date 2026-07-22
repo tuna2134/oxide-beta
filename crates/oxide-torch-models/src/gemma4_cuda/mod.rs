@@ -128,8 +128,7 @@ pub struct Gemma4CudaCacheTable {
 
 struct Gemma4CudaDecodeGraph {
     executable: CudaGraphExec,
-    scores: DeviceBuffer<f32>,
-    ids: DeviceBuffer<f32>,
+    candidates: DeviceBuffer<f32>,
     _fixed_f32: Vec<DeviceBuffer<f32>>,
     _fixed_bf16: Vec<DeviceBuffer<u16>>,
     top_k: usize,

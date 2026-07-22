@@ -549,8 +549,7 @@ impl Gemma4CudaState {
             ));
         }
         let blocks = config.vocab_size.div_ceil(256);
-        let mut scores = self.output_f32(top_k)?.into_inner();
-        let mut ids = self.output_f32(top_k)?.into_inner();
+        let mut candidates = self.output_f32(top_k * 2)?.into_inner();
         let executable = CudaGraphExec::capture(&self.stream, || {
             let logits = self.decode_logits_state(config, table)?;
             let candidates = blocks * top_k;
@@ -580,8 +579,7 @@ impl Gemma4CudaState {
                     top_k,
                     &stage_scores,
                     &stage_ids,
-                    &mut scores,
-                    &mut ids,
+                    &mut candidates,
                 )
             }
             .map_err(cuda_error)
@@ -604,8 +602,7 @@ impl Gemma4CudaState {
             .collect();
         Ok(Gemma4CudaDecodeGraph {
             executable,
-            scores,
-            ids,
+            candidates,
             _fixed_f32: fixed_f32,
             _fixed_bf16: fixed_bf16,
             top_k,
@@ -638,8 +635,12 @@ impl Gemma4CudaState {
         }
         .map_err(cuda_error)?;
         graph.executable.launch(&self.stream)?;
-        let mut scores = graph.scores.to_host_vec(&self.stream).map_err(cuda_error)?;
-        let ids = graph.ids.to_host_vec(&self.stream).map_err(cuda_error)?;
+        let candidates = graph
+            .candidates
+            .to_host_vec(&self.stream)
+            .map_err(cuda_error)?;
+        let (scores, ids) = candidates.split_at(graph.top_k);
+        let mut scores = scores.to_vec();
         apply_logit_softcap(&mut scores, config.final_logit_softcapping);
         table.position += 1;
         for cache in table.layers.iter_mut().flatten() {
@@ -652,7 +653,8 @@ impl Gemma4CudaState {
             };
         }
         Ok(ids
-            .into_iter()
+            .iter()
+            .copied()
             .zip(scores)
             .map(|(id, score)| (id as u32, score))
             .collect())
@@ -724,8 +726,7 @@ impl Gemma4CudaState {
             )
         }
         .map_err(cuda_error)?;
-        let mut final_scores = self.output_f32(top_k)?;
-        let mut final_ids = self.output_f32(top_k)?;
+        let mut final_candidates = self.output_f32(top_k * 2)?;
         unsafe {
             self.sampling.topk_stage2(
                 &self.stream,
@@ -733,24 +734,26 @@ impl Gemma4CudaState {
                 top_k,
                 &stage_scores,
                 &stage_ids,
-                &mut final_scores,
-                &mut final_ids,
+                &mut final_candidates,
             )
         }
         .map_err(cuda_error)?;
-        let mut scores = final_scores.to_host_vec(&self.stream).map_err(cuda_error)?;
-        let ids = final_ids.to_host_vec(&self.stream).map_err(cuda_error)?;
+        let candidates = final_candidates
+            .to_host_vec(&self.stream)
+            .map_err(cuda_error)?;
+        let (scores, ids) = candidates.split_at(top_k);
+        let mut scores = scores.to_vec();
         apply_logit_softcap(&mut scores, config.final_logit_softcapping);
         let candidates: Vec<_> = ids
-            .into_iter()
+            .iter()
+            .copied()
             .zip(scores)
             .map(|(id, score)| (id as u32, score))
             .collect();
         // Return the complete warm-up allocation set before capture. This
         // prevents `cuMemAllocAsync` graph nodes and gives every captured
         // operation a stable, already allocated pointer.
-        drop(final_ids);
-        drop(final_scores);
+        drop(final_candidates);
         drop(stage_ids);
         drop(stage_scores);
         drop(logits);
