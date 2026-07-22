@@ -59,8 +59,16 @@ struct Norm {
 impl Norm {
     fn load(l: &SafeTensorLoader, n: &str, h: usize, e: f32, device: Device) -> Result<Self> {
         Ok(Self {
-            w: param(l.load(&format!("{n}.weight"))?, vec![h], device)?,
-            b: param(l.load(&format!("{n}.bias"))?, vec![h], device)?,
+            w: param(
+                l.load_any([&*format!("{n}.weight"), &*format!("{n}.gamma")])?,
+                vec![h],
+                device,
+            )?,
+            b: param(
+                l.load_any([&*format!("{n}.bias"), &*format!("{n}.beta")])?,
+                vec![h],
+                device,
+            )?,
             eps: e,
         })
     }

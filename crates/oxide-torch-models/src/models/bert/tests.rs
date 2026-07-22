@@ -102,6 +102,13 @@ fn encoder_runs_through_the_shared_cpu_jit() {
     assert_eq!(compiled.cached_specializations(), 1);
 }
 
+#[test]
+fn legacy_layer_norm_names_are_supported() {
+    let directory = tempfile::tempdir().unwrap();
+    write_tiny_checkpoint_with_layer_norm_names(directory.path(), true);
+    BertForSequenceClassification::from_pretrained(directory.path(), Device::Cpu).unwrap();
+}
+
 fn first_parameter_values(model: &BertForSequenceClassification) -> Vec<f32> {
     let mut result = None;
     model.visit_parameters(&mut |parameter| {
@@ -114,6 +121,11 @@ fn first_parameter_values(model: &BertForSequenceClassification) -> Vec<f32> {
 
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn write_tiny_checkpoint(directory: &Path) {
+    write_tiny_checkpoint_with_layer_norm_names(directory, false);
+}
+
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+fn write_tiny_checkpoint_with_layer_norm_names(directory: &Path, legacy: bool) {
     let mut tensors = BTreeMap::<String, (Vec<usize>, Vec<u8>)>::new();
     let mut insert = |name: &str, shape: Vec<usize>, values: Vec<f32>| {
         let bytes = values.into_iter().flat_map(f32::to_le_bytes).collect();
@@ -139,8 +151,18 @@ fn write_tiny_checkpoint(directory: &Path) {
         vec![2, 4],
         values(8),
     );
-    insert("bert.embeddings.LayerNorm.weight", vec![4], vec![1.0; 4]);
-    insert("bert.embeddings.LayerNorm.bias", vec![4], vec![0.0; 4]);
+    let norm_weight = if legacy { "gamma" } else { "weight" };
+    let norm_bias = if legacy { "beta" } else { "bias" };
+    insert(
+        &format!("bert.embeddings.LayerNorm.{norm_weight}"),
+        vec![4],
+        vec![1.0; 4],
+    );
+    insert(
+        &format!("bert.embeddings.LayerNorm.{norm_bias}"),
+        vec![4],
+        vec![0.0; 4],
+    );
     for name in ["query", "key", "value"] {
         insert(
             &format!("bert.encoder.layer.0.attention.self.{name}.weight"),
@@ -165,12 +187,12 @@ fn write_tiny_checkpoint(directory: &Path) {
             vec![0.0; 4],
         ),
         (
-            "bert.encoder.layer.0.attention.output.LayerNorm.weight",
+            &format!("bert.encoder.layer.0.attention.output.LayerNorm.{norm_weight}"),
             vec![4],
             vec![1.0; 4],
         ),
         (
-            "bert.encoder.layer.0.attention.output.LayerNorm.bias",
+            &format!("bert.encoder.layer.0.attention.output.LayerNorm.{norm_bias}"),
             vec![4],
             vec![0.0; 4],
         ),
@@ -195,12 +217,12 @@ fn write_tiny_checkpoint(directory: &Path) {
             vec![0.0; 4],
         ),
         (
-            "bert.encoder.layer.0.output.LayerNorm.weight",
+            &format!("bert.encoder.layer.0.output.LayerNorm.{norm_weight}"),
             vec![4],
             vec![1.0; 4],
         ),
         (
-            "bert.encoder.layer.0.output.LayerNorm.bias",
+            &format!("bert.encoder.layer.0.output.LayerNorm.{norm_bias}"),
             vec![4],
             vec![0.0; 4],
         ),
