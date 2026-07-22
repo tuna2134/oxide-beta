@@ -105,8 +105,19 @@ fn encoder_runs_through_the_shared_cpu_jit() {
 #[test]
 fn legacy_layer_norm_names_are_supported() {
     let directory = tempfile::tempdir().unwrap();
-    write_tiny_checkpoint_with_layer_norm_names(directory.path(), true);
+    write_tiny_checkpoint_with_options(directory.path(), true, true);
     BertForSequenceClassification::from_pretrained(directory.path(), Device::Cpu).unwrap();
+}
+
+#[test]
+fn missing_classification_head_is_initialized() {
+    let directory = tempfile::tempdir().unwrap();
+    write_tiny_checkpoint_with_options(directory.path(), false, false);
+    let model =
+        BertForSequenceClassification::from_pretrained(directory.path(), Device::Cpu).unwrap();
+    let mut shapes = Vec::new();
+    model.visit_parameters(&mut |parameter| shapes.push(parameter.value().shape().to_vec()));
+    assert_eq!(&shapes[shapes.len() - 2..], &[vec![2, 4], vec![2]]);
 }
 
 fn first_parameter_values(model: &BertForSequenceClassification) -> Vec<f32> {
@@ -121,11 +132,11 @@ fn first_parameter_values(model: &BertForSequenceClassification) -> Vec<f32> {
 
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn write_tiny_checkpoint(directory: &Path) {
-    write_tiny_checkpoint_with_layer_norm_names(directory, false);
+    write_tiny_checkpoint_with_options(directory, false, true);
 }
 
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
-fn write_tiny_checkpoint_with_layer_norm_names(directory: &Path, legacy: bool) {
+fn write_tiny_checkpoint_with_options(directory: &Path, legacy: bool, classifier: bool) {
     let mut tensors = BTreeMap::<String, (Vec<usize>, Vec<u8>)>::new();
     let mut insert = |name: &str, shape: Vec<usize>, values: Vec<f32>| {
         let bytes = values.into_iter().flat_map(f32::to_le_bytes).collect();
@@ -228,10 +239,12 @@ fn write_tiny_checkpoint_with_layer_norm_names(directory: &Path, legacy: bool) {
         ),
         ("bert.pooler.dense.weight", vec![4, 4], values(16)),
         ("bert.pooler.dense.bias", vec![4], vec![0.0; 4]),
-        ("classifier.weight", vec![2, 4], values(8)),
-        ("classifier.bias", vec![2], vec![0.0; 2]),
     ] {
         insert(name, shape, data);
+    }
+    if classifier {
+        insert("classifier.weight", vec![2, 4], values(8));
+        insert("classifier.bias", vec![2], vec![0.0; 2]);
     }
     let views = tensors
         .iter()

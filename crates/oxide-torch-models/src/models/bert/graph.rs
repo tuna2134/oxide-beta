@@ -41,6 +41,23 @@ impl Linear {
     fn f(&self, x: &Tensor) -> Result<Tensor> {
         ops::linear(x, self.w.value(), self.b.value(), self.out)
     }
+    fn initialized(input: usize, out: usize, scale: f32, device: Device) -> Result<Self> {
+        let mut state = 0x4d59_5df4_d0f3_3173_u64;
+        let weights = (0..out * input)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let unit = (state >> 40) as f32 / 16_777_216.0;
+                (unit * 2.0 - 1.0) * scale
+            })
+            .collect();
+        Ok(Self {
+            w: Parameter::new(Tensor::from_vec(weights, vec![out, input])?.to(device)),
+            b: Parameter::new(Tensor::zeros(vec![out])?.to(device)),
+            out,
+        })
+    }
     fn visit(&self, v: &mut dyn FnMut(&Parameter)) {
         v(&self.w);
         v(&self.b)
@@ -315,13 +332,22 @@ impl BertForSequenceClassification {
         let d = d.as_ref();
         let bert = BertModel::from_pretrained(d, dev)?;
         let l = SafeTensorLoader::open(d)?;
-        let classifier = Linear::load(
-            &l,
-            "classifier",
-            bert.config.hidden_size,
-            bert.config.num_labels,
-            dev,
-        )?;
+        let classifier = if l.contains("classifier.weight") || l.contains("classifier.bias") {
+            Linear::load(
+                &l,
+                "classifier",
+                bert.config.hidden_size,
+                bert.config.num_labels,
+                dev,
+            )?
+        } else {
+            Linear::initialized(
+                bert.config.hidden_size,
+                bert.config.num_labels,
+                bert.config.initializer_range,
+                dev,
+            )?
+        };
         Ok(Self { bert, classifier })
     }
 }
