@@ -2,7 +2,7 @@ use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 use cuda_host::cuda_module;
 
 #[cuda_module]
-pub(crate) mod module {
+pub mod module {
     use super::*;
 
     #[kernel]
@@ -830,7 +830,7 @@ pub(crate) mod module {
     }
 
     /// Model-independent kernels used by autoregressive inference backends.
-    pub(crate) mod inference {
+    pub mod inference {
         use super::*;
 
         #[kernel]
@@ -1162,7 +1162,7 @@ pub(crate) mod module {
     }
 
     /// Kernels whose math or memory layout follows the Gemma 4 architecture.
-    pub(crate) mod gemma4 {
+    pub mod gemma4 {
         use super::*;
 
         #[kernel]
@@ -1640,7 +1640,7 @@ pub(crate) mod module {
     }
 
     /// Model-independent token sampling kernels.
-    pub(crate) mod sampling {
+    pub mod sampling {
         use super::*;
 
         #[kernel]

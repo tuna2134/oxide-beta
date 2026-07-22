@@ -11,22 +11,19 @@ pub mod data;
 mod error;
 pub mod jit;
 pub mod loss;
-pub mod models;
 pub mod nn;
 pub mod optim;
 pub mod safetensors;
 mod tensor;
 
 #[cfg(feature = "cuda")]
-mod cublas;
+pub mod cublas;
 #[cfg(feature = "cuda")]
-mod cuda;
+pub mod cuda;
 #[cfg(feature = "cuda")]
-mod cuda_graph;
+pub mod cuda_graph;
 #[cfg(feature = "cudnn")]
 mod cudnn;
-#[cfg(feature = "cuda")]
-pub mod gemma4_cuda;
 
 pub use error::{Error, Result};
 pub use tensor::{Device, Tensor};

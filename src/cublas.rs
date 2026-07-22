@@ -40,7 +40,8 @@ const CUDA_R_16BF: c_int = 14;
 const COMPUTE_32F: c_int = 68;
 const GEMM_DEFAULT_TENSOR_OP: c_int = 99;
 
-pub(crate) struct Cublas {
+/// Dynamically loaded cuBLAS handle used by external model crates.
+pub struct Cublas {
     handle: Handle,
     destroy: Destroy,
     set_stream: SetStream,
@@ -49,7 +50,13 @@ pub(crate) struct Cublas {
 }
 
 impl Cublas {
-    pub(crate) fn new() -> Result<Self> {
+    /// Opens cuBLAS and creates one handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shared library, required symbols, or handle
+    /// creation are unavailable.
+    pub fn new() -> Result<Self> {
         let library = ["libcublas.so.13", "libcublas.so.12", "libcublas.so"]
             .into_iter()
             .find_map(|name| unsafe { Library::new(name).ok() })
@@ -76,7 +83,11 @@ impl Cublas {
     /// single stream for the lifetime of the handle, so repeating
     /// `cublasSetStream_v2` before every projection only adds host API
     /// overhead between small decode GEMMs.
-    pub(crate) fn bind_stream(&self, stream: &CudaStream) -> Result<()> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when cuBLAS rejects the CUDA stream.
+    pub fn bind_stream(&self, stream: &CudaStream) -> Result<()> {
         // SAFETY: the handle is live and `stream` belongs to the CUDA context
         // used by all buffers passed to this handle.
         unsafe {
@@ -88,7 +99,12 @@ impl Cublas {
     }
 
     /// Computes row-major `output[m,n] = input[m,k] * weight[n,k]^T`.
-    pub(crate) fn linear_bf16_f32(
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for incompatible buffer extents, dimensions exceeding
+    /// the cuBLAS ABI, or a failed GEMM launch.
+    pub fn linear_bf16_f32(
         &self,
         _stream: &CudaStream,
         m: usize,

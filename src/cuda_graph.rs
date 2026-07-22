@@ -27,7 +27,7 @@ type GraphExecDestroy = unsafe extern "C" fn(CuGraphExec) -> CuResult;
 const STREAM_CAPTURE_MODE_THREAD_LOCAL: c_uint = 1;
 
 /// Owns an instantiated CUDA graph and the driver library containing its ABI.
-pub(crate) struct CudaGraphExec {
+pub struct CudaGraphExec {
     graph: NonNull<c_void>,
     executable: NonNull<c_void>,
     graph_destroy: GraphDestroy,
@@ -39,10 +39,12 @@ pub(crate) struct CudaGraphExec {
 
 impl CudaGraphExec {
     /// Captures all work enqueued by `record` onto `stream` and instantiates it.
-    pub(crate) fn capture(
-        stream: &CudaStream,
-        record: impl FnOnce() -> Result<()>,
-    ) -> Result<Self> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the CUDA Driver API is unavailable or capture,
+    /// recording, or graph instantiation fails.
+    pub fn capture(stream: &CudaStream, record: impl FnOnce() -> Result<()>) -> Result<Self> {
         stream.synchronize().map_err(cuda_error)?;
         let library = ["libcuda.so.1", "libcuda.so"]
             .into_iter()
@@ -139,7 +141,12 @@ impl CudaGraphExec {
         })
     }
 
-    pub(crate) fn launch(&self, stream: &CudaStream) -> Result<()> {
+    /// Enqueues one replay on `stream`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the context cannot be bound or graph launch fails.
+    pub fn launch(&self, stream: &CudaStream) -> Result<()> {
         self.context.bind_to_thread().map_err(cuda_error)?;
         // SAFETY: both handles remain live for `self` and `stream` lifetimes.
         check(

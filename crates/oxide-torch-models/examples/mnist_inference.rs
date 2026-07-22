@@ -1,7 +1,7 @@
 use oxide_torch::data::Mnist;
-use oxide_torch::models::mobilenet_v4::MobileNetV4ConvSmall;
 use oxide_torch::nn::Module;
 use oxide_torch::{Device, Result};
+use oxide_torch_models::mobilenet_v4::MobileNetV4ConvSmall;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

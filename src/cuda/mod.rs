@@ -8,5 +8,5 @@ mod kernel_module;
 mod runtime;
 
 pub(crate) use jit::CudaJitPlan;
-pub(crate) use kernel_module::module as kernels;
+pub use kernel_module::module as kernels;
 pub(crate) use runtime::*;

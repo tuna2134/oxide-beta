@@ -692,6 +692,17 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "oxide-torch-models"
+version = "0.1.0"
+dependencies = [
+ "cuda-core",
+ "oxide-torch",
+ "safetensors",
+ "serde",
+ "serde_json",
  "tokenizers",
 ]
 

@@ -4,8 +4,8 @@
 //! token embeddings, 5:1 local/global decoder layers, GQA, PLE, gated MLP,
 //! final `RMSNorm`, and a tied or independent LM head.
 
-use crate::safetensors::{LoadedTensor, SafeTensorLoader, TensorMetadata};
-use crate::{Device, Error, Result, Tensor};
+use oxide_torch::safetensors::{LoadedTensor, SafeTensorLoader, TensorMetadata};
+use oxide_torch::{Device, Error, Result, Tensor};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;

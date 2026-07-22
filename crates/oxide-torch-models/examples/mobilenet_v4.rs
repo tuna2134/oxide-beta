@@ -1,5 +1,5 @@
-use oxide_torch::models::mobilenet_v4::MobileNetV4ConvSmall;
 use oxide_torch::{Device, Result, Tensor};
+use oxide_torch_models::mobilenet_v4::MobileNetV4ConvSmall;
 
 fn main() -> Result<()> {
     let model = MobileNetV4ConvSmall::new(1000, Device::Cpu)?;

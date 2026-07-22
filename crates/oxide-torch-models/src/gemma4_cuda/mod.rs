@@ -1,11 +1,11 @@
 //! Gemma 4 persistent BF16 CUDA state.
 #![allow(unsafe_code)]
 
-use crate::cublas::Cublas;
-use crate::cuda_graph::CudaGraphExec;
 use crate::models::gemma4::{Gemma4ForCausalLM, Gemma4TextConfig};
-use crate::{Error, Result};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
+use oxide_torch::cublas::Cublas;
+use oxide_torch::cuda_graph::CudaGraphExec;
+use oxide_torch::{Error, Result};
 use safetensors::Dtype;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -163,10 +163,10 @@ pub struct Gemma4CudaState {
     pub(crate) _context: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) cublas: Cublas,
-    module: crate::cuda::kernels::LoadedModule,
-    inference: crate::cuda::kernels::inference::LoadedModule,
-    gemma4: crate::cuda::kernels::gemma4::LoadedModule,
-    sampling: crate::cuda::kernels::sampling::LoadedModule,
+    module: oxide_torch::cuda::kernels::LoadedModule,
+    inference: oxide_torch::cuda::kernels::inference::LoadedModule,
+    gemma4: oxide_torch::cuda::kernels::gemma4::LoadedModule,
+    sampling: oxide_torch::cuda::kernels::sampling::LoadedModule,
     weights: Vec<CudaWeight>,
     weight_indices: HashMap<String, usize>,
     decode_plan: Vec<Gemma4DecodeLayerPlan>,
@@ -223,12 +223,12 @@ impl Gemma4CudaState {
         let stream = context.new_stream().map_err(cuda_error)?;
         let cublas = Cublas::new()?;
         cublas.bind_stream(&stream)?;
-        let module = crate::cuda::kernels::load(&context).map_err(cuda_error)?;
-        let inference = crate::cuda::kernels::inference::LoadedModule::from_parent(&module)
+        let module = oxide_torch::cuda::kernels::load(&context).map_err(cuda_error)?;
+        let inference = oxide_torch::cuda::kernels::inference::LoadedModule::from_parent(&module)
             .map_err(cuda_error)?;
-        let gemma4 =
-            crate::cuda::kernels::gemma4::LoadedModule::from_parent(&module).map_err(cuda_error)?;
-        let sampling = crate::cuda::kernels::sampling::LoadedModule::from_parent(&module)
+        let gemma4 = oxide_torch::cuda::kernels::gemma4::LoadedModule::from_parent(&module)
+            .map_err(cuda_error)?;
+        let sampling = oxide_torch::cuda::kernels::sampling::LoadedModule::from_parent(&module)
             .map_err(cuda_error)?;
         let names: Vec<_> = model
             .checkpoint_weight_names()
