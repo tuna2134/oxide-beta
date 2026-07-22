@@ -228,7 +228,7 @@ source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a15
 dependencies = [
  "anyhow",
  "cuda-bindings",
- "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
+ "cuda-macros",
  "half",
  "oxide-artifacts",
 ]
@@ -236,9 +236,9 @@ dependencies = [
 [[package]]
 name = "cuda-device"
 version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14#2b1269964beaeab789a1512d0089fe42d9336e14"
 dependencies = [
- "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b)",
+ "cuda-macros",
 ]
 
 [[package]]
@@ -248,21 +248,10 @@ source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a15
 dependencies = [
  "cuda-artifact-finalizer",
  "cuda-core",
- "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
+ "cuda-macros",
  "half",
  "sha2",
  "thiserror",
-]
-
-[[package]]
-name = "cuda-macros"
-version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
-dependencies = [
- "proc-macro2",
- "quote",
- "reserved-oxide-symbols 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b)",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -272,7 +261,7 @@ source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a15
 dependencies = [
  "proc-macro2",
  "quote",
- "reserved-oxide-symbols 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
+ "reserved-oxide-symbols",
  "syn 2.0.119",
 ]
 
@@ -871,11 +860,6 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
-
-[[package]]
-name = "reserved-oxide-symbols"
-version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=072318bc5e2ef3b5686e6ec8078e892a2a82bf2b#072318bc5e2ef3b5686e6ec8078e892a2a82bf2b"
 
 [[package]]
 name = "reserved-oxide-symbols"
