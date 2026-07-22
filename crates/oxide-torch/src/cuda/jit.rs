@@ -27,7 +27,7 @@ impl CudaJitPlan {
         // Legacy default streams cannot be captured. One dedicated stream also
         // gives copies and graph replays a stable ordering.
         let stream = context.new_stream().map_err(cuda_error)?;
-        let module = kernels::load(&context).map_err(cuda_error)?;
+        let module = oxide_torch_cuda::load_kernels(&context).map_err(cuda_error)?;
         let mut buffers = plan
             .buffers
             .iter()

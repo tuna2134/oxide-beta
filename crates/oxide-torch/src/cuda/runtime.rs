@@ -45,7 +45,7 @@ impl Executor {
     fn new(device: usize) -> Result<Self> {
         let context = CudaContext::new(device).map_err(cuda_error)?;
         let stream = context.default_stream();
-        let module = kernels::load(&context).map_err(cuda_error)?;
+        let module = oxide_torch_cuda::load_kernels(&context).map_err(cuda_error)?;
         let root_gradient = Arc::new(DeviceBuffer::from_host(&stream, &[1.0]).map_err(cuda_error)?);
         #[cfg(feature = "cudnn")]
         let cudnn = oxide_torch_cuda::cudnn::Cudnn::try_new();
