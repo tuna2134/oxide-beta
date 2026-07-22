@@ -2,7 +2,7 @@
 
 use super::kernels;
 use crate::jit::{BufferPlan, GraphPlan, PlanOperation};
-use crate::{CustomOpKind, Error, Result, Tensor};
+use crate::{Error, Result, Tensor};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig};
 use oxide_torch_cuda::cuda_graph::CudaGraphExec;
 use std::sync::{Arc, Mutex};
@@ -128,7 +128,7 @@ fn launch_operations(
                 columns,
                 ..
             } => (*left, Some(*right), *output, rows * columns),
-            PlanOperation::Custom { output, .. } => (0, None, *output, buffers[*output].len()),
+            PlanOperation::Transformer { output, .. } => (0, None, *output, buffers[*output].len()),
         };
         // PlanBuilder emits each output after all of its inputs. Splitting here
         // makes non-aliasing visible to Rust as well as to the CUDA launcher.
@@ -171,16 +171,16 @@ fn launch_operations(
                     &sources[right.expect("matmul right input")],
                     destination,
                 ),
-                PlanOperation::Custom {
+                PlanOperation::Transformer {
                     inputs,
                     input_shapes,
-                    operation,
+                    primitive,
                     ..
-                } => launch_custom(
+                } => launch_transformer(
                     transformer,
                     stream,
                     config,
-                    operation.kind(),
+                    *primitive,
                     inputs,
                     input_shapes,
                     sources,
@@ -194,11 +194,11 @@ fn launch_operations(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_custom(
+fn launch_transformer(
     module: &kernels::transformer::LoadedModule,
     stream: &CudaStream,
     config: LaunchConfig,
-    kind: CustomOpKind,
+    primitive: crate::transformer::Primitive,
     inputs: &[usize],
     shapes: &[Vec<usize>],
     buffers: &[DeviceBuffer<f32>],
@@ -207,8 +207,8 @@ fn launch_custom(
     // SAFETY: GraphPlan shape validation and fixed non-aliasing buffers satisfy
     // every generated kernel launch contract.
     unsafe {
-        match kind {
-            CustomOpKind::Linear => module.linear(
+        match primitive {
+            crate::transformer::Primitive::Linear => module.linear(
                 stream,
                 config,
                 shapes[0][shapes[0].len() - 1],
@@ -218,9 +218,13 @@ fn launch_custom(
                 &buffers[inputs[2]],
                 output,
             ),
-            CustomOpKind::Gelu => module.gelu(stream, config, &buffers[inputs[0]], output),
-            CustomOpKind::Tanh => module.tanh(stream, config, &buffers[inputs[0]], output),
-            CustomOpKind::Embedding => module.embedding(
+            crate::transformer::Primitive::Gelu => {
+                module.gelu(stream, config, &buffers[inputs[0]], output)
+            }
+            crate::transformer::Primitive::Tanh => {
+                module.tanh(stream, config, &buffers[inputs[0]], output)
+            }
+            crate::transformer::Primitive::Embedding => module.embedding(
                 stream,
                 config,
                 shapes[1][1],
@@ -229,7 +233,7 @@ fn launch_custom(
                 &buffers[inputs[1]],
                 output,
             ),
-            CustomOpKind::LayerNorm { epsilon } => module.layer_norm(
+            crate::transformer::Primitive::LayerNorm { epsilon } => module.layer_norm(
                 stream,
                 config,
                 shapes[1].iter().product(),
@@ -239,7 +243,7 @@ fn launch_custom(
                 &buffers[inputs[2]],
                 output,
             ),
-            CustomOpKind::SelectFirst => module.select_first(
+            crate::transformer::Primitive::SelectFirst => module.select_first(
                 stream,
                 config,
                 shapes[0][1],
@@ -247,7 +251,7 @@ fn launch_custom(
                 &buffers[inputs[0]],
                 output,
             ),
-            CustomOpKind::ScaledDotProductAttention { heads } => module
+            crate::transformer::Primitive::ScaledDotProductAttention { heads } => module
                 .scaled_dot_product_attention(
                     stream,
                     config,
@@ -264,7 +268,6 @@ fn launch_custom(
                     &buffers[inputs[7]],
                     output,
                 ),
-            CustomOpKind::User => panic!("user custom operations cannot enter a CUDA JIT plan"),
         }
     }
 }

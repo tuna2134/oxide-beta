@@ -25,26 +25,8 @@ pub struct CustomInput<'a> {
     pub values: &'a [f32],
 }
 
-/// Backend-dispatch identifier for built-in extensible operations.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum CustomOpKind {
-    User,
-    Linear,
-    Gelu,
-    Tanh,
-    Embedding,
-    LayerNorm { epsilon: f32 },
-    SelectFirst,
-    ScaledDotProductAttention { heads: usize },
-}
-
 /// Extensible differentiable CPU operation used by higher-level model crates.
 pub trait CustomOp: std::fmt::Debug + Send + Sync {
-    /// Identifies operations that have native backend implementations.
-    fn kind(&self) -> CustomOpKind {
-        CustomOpKind::User
-    }
-
     /// Evaluates the operation on materialized CPU inputs.
     ///
     /// # Errors
@@ -94,6 +76,35 @@ pub(crate) enum Op {
     Mul(Tensor, Tensor),
     Relu(Tensor),
     MatMul(Tensor, Tensor),
+    Linear {
+        input: Tensor,
+        weight: Tensor,
+        bias: Tensor,
+    },
+    Gelu(Tensor),
+    Tanh(Tensor),
+    Embedding {
+        ids: Tensor,
+        weight: Tensor,
+    },
+    LayerNorm {
+        input: Tensor,
+        weight: Tensor,
+        bias: Tensor,
+        epsilon: f32,
+    },
+    SelectFirst(Tensor),
+    ScaledDotProductAttention {
+        input: Tensor,
+        mask: Tensor,
+        query_weight: Tensor,
+        query_bias: Tensor,
+        key_weight: Tensor,
+        key_bias: Tensor,
+        value_weight: Tensor,
+        value_bias: Tensor,
+        heads: usize,
+    },
     Conv2d {
         input: Tensor,
         weight: Tensor,
@@ -689,6 +700,7 @@ impl Mul<&Tensor> for &Tensor {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn eval_cpu(
     tensor: &Tensor,
     cache: &mut HashMap<u64, Vec<f32>>,
@@ -735,6 +747,70 @@ pub(crate) fn eval_cpu(
             }
             output
         }
+        Op::Linear {
+            input,
+            weight,
+            bias,
+        } => eval_transformer(
+            crate::transformer::Primitive::Linear,
+            &[input, weight, bias],
+            cache,
+            inputs,
+        )?,
+        Op::Gelu(input) => {
+            eval_transformer(crate::transformer::Primitive::Gelu, &[input], cache, inputs)?
+        }
+        Op::Tanh(input) => {
+            eval_transformer(crate::transformer::Primitive::Tanh, &[input], cache, inputs)?
+        }
+        Op::Embedding { ids, weight } => eval_transformer(
+            crate::transformer::Primitive::Embedding,
+            &[ids, weight],
+            cache,
+            inputs,
+        )?,
+        Op::LayerNorm {
+            input,
+            weight,
+            bias,
+            epsilon,
+        } => eval_transformer(
+            crate::transformer::Primitive::LayerNorm { epsilon: *epsilon },
+            &[input, weight, bias],
+            cache,
+            inputs,
+        )?,
+        Op::SelectFirst(input) => eval_transformer(
+            crate::transformer::Primitive::SelectFirst,
+            &[input],
+            cache,
+            inputs,
+        )?,
+        Op::ScaledDotProductAttention {
+            input,
+            mask,
+            query_weight,
+            query_bias,
+            key_weight,
+            key_bias,
+            value_weight,
+            value_bias,
+            heads,
+        } => eval_transformer(
+            crate::transformer::Primitive::ScaledDotProductAttention { heads: *heads },
+            &[
+                input,
+                mask,
+                query_weight,
+                query_bias,
+                key_weight,
+                key_bias,
+                value_weight,
+                value_bias,
+            ],
+            cache,
+            inputs,
+        )?,
         Op::Conv2d {
             input,
             weight,
@@ -796,6 +872,28 @@ pub(crate) fn eval_cpu(
     Ok(value)
 }
 
+fn eval_transformer(
+    primitive: crate::transformer::Primitive,
+    operands: &[&Tensor],
+    cache: &mut HashMap<u64, Vec<f32>>,
+    inputs: Option<&[Vec<f32>]>,
+) -> Result<Vec<f32>> {
+    let values = operands
+        .iter()
+        .map(|operand| eval_cpu(operand, cache, inputs))
+        .collect::<Result<Vec<_>>>()?;
+    let inputs = operands
+        .iter()
+        .zip(&values)
+        .map(|(operand, values)| CustomInput {
+            shape: operand.shape(),
+            values,
+        })
+        .collect::<Vec<_>>();
+    crate::transformer::forward(primitive, &inputs)
+}
+
+#[allow(clippy::too_many_lines)]
 fn clone_to_device(tensor: &Tensor, device: Device, cache: &mut HashMap<u64, Tensor>) -> Tensor {
     if let Some(value) = cache.get(&tensor.node.id) {
         return value.clone();
@@ -816,6 +914,54 @@ fn clone_to_device(tensor: &Tensor, device: Device, cache: &mut HashMap<u64, Ten
             clone_to_device(a, device, cache),
             clone_to_device(b, device, cache),
         ),
+        Op::Linear {
+            input,
+            weight,
+            bias,
+        } => Op::Linear {
+            input: clone_to_device(input, device, cache),
+            weight: clone_to_device(weight, device, cache),
+            bias: clone_to_device(bias, device, cache),
+        },
+        Op::Gelu(input) => Op::Gelu(clone_to_device(input, device, cache)),
+        Op::Tanh(input) => Op::Tanh(clone_to_device(input, device, cache)),
+        Op::Embedding { ids, weight } => Op::Embedding {
+            ids: clone_to_device(ids, device, cache),
+            weight: clone_to_device(weight, device, cache),
+        },
+        Op::LayerNorm {
+            input,
+            weight,
+            bias,
+            epsilon,
+        } => Op::LayerNorm {
+            input: clone_to_device(input, device, cache),
+            weight: clone_to_device(weight, device, cache),
+            bias: clone_to_device(bias, device, cache),
+            epsilon: *epsilon,
+        },
+        Op::SelectFirst(input) => Op::SelectFirst(clone_to_device(input, device, cache)),
+        Op::ScaledDotProductAttention {
+            input,
+            mask,
+            query_weight,
+            query_bias,
+            key_weight,
+            key_bias,
+            value_weight,
+            value_bias,
+            heads,
+        } => Op::ScaledDotProductAttention {
+            input: clone_to_device(input, device, cache),
+            mask: clone_to_device(mask, device, cache),
+            query_weight: clone_to_device(query_weight, device, cache),
+            query_bias: clone_to_device(query_bias, device, cache),
+            key_weight: clone_to_device(key_weight, device, cache),
+            key_bias: clone_to_device(key_bias, device, cache),
+            value_weight: clone_to_device(value_weight, device, cache),
+            value_bias: clone_to_device(value_bias, device, cache),
+            heads: *heads,
+        },
         Op::Conv2d {
             input,
             weight,
@@ -1193,10 +1339,26 @@ fn clear_graph_grads(tensor: &Tensor, visited: &mut HashSet<u64>) -> Result<()> 
             clear_graph_grads(left, visited)?;
             clear_graph_grads(right, visited)?;
         }
-        Op::Relu(input) | Op::Reshape(input) | Op::AvgPool2d { input, .. } => {
+        Op::Relu(input)
+        | Op::Gelu(input)
+        | Op::Tanh(input)
+        | Op::SelectFirst(input)
+        | Op::Reshape(input)
+        | Op::AvgPool2d { input, .. } => {
             clear_graph_grads(input, visited)?;
         }
-        Op::Conv2d {
+        Op::Linear {
+            input,
+            weight,
+            bias,
+        }
+        | Op::LayerNorm {
+            input,
+            weight,
+            bias,
+            ..
+        }
+        | Op::Conv2d {
             input,
             weight,
             bias,
@@ -1211,6 +1373,34 @@ fn clear_graph_grads(tensor: &Tensor, visited: &mut HashSet<u64>) -> Result<()> 
             clear_graph_grads(input, visited)?;
             clear_graph_grads(weight, visited)?;
             clear_graph_grads(bias, visited)?;
+        }
+        Op::Embedding { ids, weight } => {
+            clear_graph_grads(ids, visited)?;
+            clear_graph_grads(weight, visited)?;
+        }
+        Op::ScaledDotProductAttention {
+            input,
+            mask,
+            query_weight,
+            query_bias,
+            key_weight,
+            key_bias,
+            value_weight,
+            value_bias,
+            ..
+        } => {
+            for operand in [
+                input,
+                mask,
+                query_weight,
+                query_bias,
+                key_weight,
+                key_bias,
+                value_weight,
+                value_bias,
+            ] {
+                clear_graph_grads(operand, visited)?;
+            }
         }
         Op::CrossEntropy { logits, targets } => {
             clear_graph_grads(logits, visited)?;
@@ -1241,6 +1431,7 @@ fn accumulate_gradient(tensor: &Tensor, incoming: &[f32]) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn backward_node(
     tensor: &Tensor,
     gradient: Vec<f32>,
@@ -1280,6 +1471,76 @@ fn backward_node(
         }
         Op::Reshape(input) => backward_node(input, gradient, values),
         Op::MatMul(left, right) => backward_matmul(left, right, &gradient, values),
+        Op::Linear {
+            input,
+            weight,
+            bias,
+        } => backward_transformer(
+            crate::transformer::Primitive::Linear,
+            &[input, weight, bias],
+            &gradient,
+            values,
+        ),
+        Op::Gelu(input) => backward_transformer(
+            crate::transformer::Primitive::Gelu,
+            &[input],
+            &gradient,
+            values,
+        ),
+        Op::Tanh(input) => backward_transformer(
+            crate::transformer::Primitive::Tanh,
+            &[input],
+            &gradient,
+            values,
+        ),
+        Op::Embedding { ids, weight } => backward_transformer(
+            crate::transformer::Primitive::Embedding,
+            &[ids, weight],
+            &gradient,
+            values,
+        ),
+        Op::LayerNorm {
+            input,
+            weight,
+            bias,
+            epsilon,
+        } => backward_transformer(
+            crate::transformer::Primitive::LayerNorm { epsilon: *epsilon },
+            &[input, weight, bias],
+            &gradient,
+            values,
+        ),
+        Op::SelectFirst(input) => backward_transformer(
+            crate::transformer::Primitive::SelectFirst,
+            &[input],
+            &gradient,
+            values,
+        ),
+        Op::ScaledDotProductAttention {
+            input,
+            mask,
+            query_weight,
+            query_bias,
+            key_weight,
+            key_bias,
+            value_weight,
+            value_bias,
+            heads,
+        } => backward_transformer(
+            crate::transformer::Primitive::ScaledDotProductAttention { heads: *heads },
+            &[
+                input,
+                mask,
+                query_weight,
+                query_bias,
+                key_weight,
+                key_bias,
+                value_weight,
+                value_bias,
+            ],
+            &gradient,
+            values,
+        ),
         Op::Conv2d {
             input,
             weight,
@@ -1345,6 +1606,33 @@ fn backward_node(
             Ok(())
         }
     }
+}
+
+fn backward_transformer(
+    primitive: crate::transformer::Primitive,
+    operands: &[&Tensor],
+    output_gradient: &[f32],
+    values: &mut HashMap<u64, Vec<f32>>,
+) -> Result<()> {
+    let input_values = operands
+        .iter()
+        .map(|input| eval_cpu(input, values, None))
+        .collect::<Result<Vec<_>>>()?;
+    let inputs = operands
+        .iter()
+        .zip(&input_values)
+        .map(|(input, values)| CustomInput {
+            shape: input.shape(),
+            values,
+        })
+        .collect::<Vec<_>>();
+    let gradients = crate::transformer::backward(primitive, &inputs, output_gradient)?;
+    for (input, gradient) in operands.iter().zip(gradients) {
+        if let Some(gradient) = gradient {
+            backward_node(input, gradient, values)?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

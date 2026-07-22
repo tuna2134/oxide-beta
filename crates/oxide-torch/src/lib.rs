@@ -20,7 +20,7 @@ pub mod cuda;
 pub use oxide_torch_cuda::{cublas, cuda_graph};
 
 pub use error::{Error, Result};
-pub use tensor::{CustomInput, CustomOp, CustomOpKind, Device, Tensor};
+pub use tensor::{CustomInput, CustomOp, Device, Tensor};
 
 /// Creates a tensor from row-major `f32` data.
 ///

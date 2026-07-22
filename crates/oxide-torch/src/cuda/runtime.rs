@@ -1,6 +1,6 @@
 use crate::nn::Parameter;
 use crate::tensor::{BatchNormState, Op, Tensor};
-use crate::{CustomInput, CustomOp, CustomOpKind, Device, Error, Result};
+use crate::{CustomInput, Device, Error, Result};
 use cuda_core::{CudaContext, DeviceBuffer, LaunchConfig};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -187,6 +187,65 @@ impl Executor {
                 .map_err(cuda_error)?;
                 output
             }
+            Op::Linear {
+                input,
+                weight,
+                bias,
+            } => self.eval_transformer_cuda(
+                tensor,
+                &[input, weight, bias],
+                crate::transformer::Primitive::Linear,
+            )?,
+            Op::Gelu(input) => {
+                self.eval_transformer_cuda(tensor, &[input], crate::transformer::Primitive::Gelu)?
+            }
+            Op::Tanh(input) => {
+                self.eval_transformer_cuda(tensor, &[input], crate::transformer::Primitive::Tanh)?
+            }
+            Op::Embedding { ids, weight } => self.eval_transformer_cuda(
+                tensor,
+                &[ids, weight],
+                crate::transformer::Primitive::Embedding,
+            )?,
+            Op::LayerNorm {
+                input,
+                weight,
+                bias,
+                epsilon,
+            } => self.eval_transformer_cuda(
+                tensor,
+                &[input, weight, bias],
+                crate::transformer::Primitive::LayerNorm { epsilon: *epsilon },
+            )?,
+            Op::SelectFirst(input) => self.eval_transformer_cuda(
+                tensor,
+                &[input],
+                crate::transformer::Primitive::SelectFirst,
+            )?,
+            Op::ScaledDotProductAttention {
+                input,
+                mask,
+                query_weight,
+                query_bias,
+                key_weight,
+                key_bias,
+                value_weight,
+                value_bias,
+                heads,
+            } => self.eval_transformer_cuda(
+                tensor,
+                &[
+                    input,
+                    mask,
+                    query_weight,
+                    query_bias,
+                    key_weight,
+                    key_bias,
+                    value_weight,
+                    value_bias,
+                ],
+                crate::transformer::Primitive::ScaledDotProductAttention { heads: *heads },
+            )?,
             Op::Conv2d {
                 input,
                 weight,
@@ -308,8 +367,10 @@ impl Executor {
             } => self.eval_batch_norm(
                 tensor, input, weight, bias, state, *training, *momentum, *epsilon,
             )?,
-            Op::Custom { inputs, operation } => {
-                self.eval_builtin_custom(tensor, inputs, operation.kind())?
+            Op::Custom { .. } => {
+                return Err(Error::Execution(
+                    "user-defined custom operations currently require the CPU backend".into(),
+                ));
             }
         };
         let output = Arc::new(output);
@@ -317,22 +378,17 @@ impl Executor {
         Ok(output)
     }
 
-    fn eval_builtin_custom(
+    fn eval_transformer_cuda(
         &mut self,
         tensor: &Tensor,
         inputs: &[Tensor],
-        kind: CustomOpKind,
+        primitive: crate::transformer::Primitive,
     ) -> Result<DeviceBuffer<f32>> {
-        if kind == CustomOpKind::User {
-            return Err(Error::Execution(
-                "user-defined custom operations currently require the CPU backend".into(),
-            ));
-        }
         let buffers = inputs
             .iter()
             .map(|input| self.eval_node(input))
             .collect::<Result<Vec<_>>>()?;
-        if let CustomOpKind::ScaledDotProductAttention { heads } = kind {
+        if let crate::transformer::Primitive::ScaledDotProductAttention { heads } = primitive {
             return self.eval_attention_custom(tensor, inputs, &buffers, heads);
         }
         let mut output = self.output_buffer(tensor.numel())?;
@@ -340,8 +396,8 @@ impl Executor {
         // SAFETY: the public transformer constructors validate shapes and all
         // kernels bounds-check their output index.
         unsafe {
-            match kind {
-                CustomOpKind::Linear => self.transformer.linear(
+            match primitive {
+                crate::transformer::Primitive::Linear => self.transformer.linear(
                     &self.stream,
                     config,
                     inputs[0].shape()[inputs[0].shape().len() - 1],
@@ -351,15 +407,15 @@ impl Executor {
                     &buffers[2],
                     &mut output,
                 ),
-                CustomOpKind::Gelu => {
+                crate::transformer::Primitive::Gelu => {
                     self.transformer
                         .gelu(&self.stream, config, &buffers[0], &mut output)
                 }
-                CustomOpKind::Tanh => {
+                crate::transformer::Primitive::Tanh => {
                     self.transformer
                         .tanh(&self.stream, config, &buffers[0], &mut output)
                 }
-                CustomOpKind::Embedding => self.transformer.embedding(
+                crate::transformer::Primitive::Embedding => self.transformer.embedding(
                     &self.stream,
                     config,
                     inputs[1].shape()[1],
@@ -368,17 +424,19 @@ impl Executor {
                     &buffers[1],
                     &mut output,
                 ),
-                CustomOpKind::LayerNorm { epsilon } => self.transformer.layer_norm(
-                    &self.stream,
-                    config,
-                    inputs[1].numel(),
-                    epsilon,
-                    &buffers[0],
-                    &buffers[1],
-                    &buffers[2],
-                    &mut output,
-                ),
-                CustomOpKind::SelectFirst => self.transformer.select_first(
+                crate::transformer::Primitive::LayerNorm { epsilon } => {
+                    self.transformer.layer_norm(
+                        &self.stream,
+                        config,
+                        inputs[1].numel(),
+                        epsilon,
+                        &buffers[0],
+                        &buffers[1],
+                        &buffers[2],
+                        &mut output,
+                    )
+                }
+                crate::transformer::Primitive::SelectFirst => self.transformer.select_first(
                     &self.stream,
                     config,
                     inputs[0].shape()[1],
@@ -386,8 +444,7 @@ impl Executor {
                     &buffers[0],
                     &mut output,
                 ),
-                CustomOpKind::ScaledDotProductAttention { .. } => unreachable!(),
-                CustomOpKind::User => unreachable!(),
+                crate::transformer::Primitive::ScaledDotProductAttention { .. } => unreachable!(),
             }
         }
         .map_err(cuda_error)?;
@@ -692,6 +749,69 @@ impl Executor {
             }
             Op::Reshape(input) => self.accumulate_gradient(input, &gradient),
             Op::MatMul(left, right) => self.backward_matmul(left, right, &gradient),
+            Op::Linear {
+                input,
+                weight,
+                bias,
+            } => self.backward_transformer_cuda(
+                &[input, weight, bias],
+                crate::transformer::Primitive::Linear,
+                &gradient,
+            ),
+            Op::Gelu(input) => self.backward_transformer_cuda(
+                &[input],
+                crate::transformer::Primitive::Gelu,
+                &gradient,
+            ),
+            Op::Tanh(input) => self.backward_transformer_cuda(
+                &[input],
+                crate::transformer::Primitive::Tanh,
+                &gradient,
+            ),
+            Op::Embedding { ids, weight } => self.backward_transformer_cuda(
+                &[ids, weight],
+                crate::transformer::Primitive::Embedding,
+                &gradient,
+            ),
+            Op::LayerNorm {
+                input,
+                weight,
+                bias,
+                epsilon,
+            } => self.backward_transformer_cuda(
+                &[input, weight, bias],
+                crate::transformer::Primitive::LayerNorm { epsilon: *epsilon },
+                &gradient,
+            ),
+            Op::SelectFirst(input) => self.backward_transformer_cuda(
+                &[input],
+                crate::transformer::Primitive::SelectFirst,
+                &gradient,
+            ),
+            Op::ScaledDotProductAttention {
+                input,
+                mask,
+                query_weight,
+                query_bias,
+                key_weight,
+                key_bias,
+                value_weight,
+                value_bias,
+                heads,
+            } => self.backward_transformer_cuda(
+                &[
+                    input,
+                    mask,
+                    query_weight,
+                    query_bias,
+                    key_weight,
+                    key_bias,
+                    value_weight,
+                    value_bias,
+                ],
+                crate::transformer::Primitive::ScaledDotProductAttention { heads: *heads },
+                &gradient,
+            ),
             Op::Conv2d {
                 input,
                 weight,
@@ -733,23 +853,18 @@ impl Executor {
                 training,
                 ..
             } => self.backward_batch_norm(tensor, input, weight, bias, *training, &gradient),
-            Op::Custom { inputs, operation } => {
-                self.backward_custom(inputs, operation.as_ref(), &gradient)
-            }
+            Op::Custom { .. } => Err(Error::Execution(
+                "user-defined custom operations currently require CPU autograd".into(),
+            )),
         }
     }
 
-    fn backward_custom(
+    fn backward_transformer_cuda(
         &mut self,
         inputs: &[Tensor],
-        operation: &dyn CustomOp,
+        primitive: crate::transformer::Primitive,
         gradient: &Buffer,
     ) -> Result<()> {
-        if operation.kind() == CustomOpKind::User {
-            return Err(Error::Execution(
-                "user-defined custom operations currently require CPU autograd".into(),
-            ));
-        }
         let input_values = inputs
             .iter()
             .map(|input| {
@@ -767,7 +882,7 @@ impl Executor {
                 values,
             })
             .collect::<Vec<_>>();
-        let gradients = operation.backward(&custom_inputs, &host_gradient)?;
+        let gradients = crate::transformer::backward(primitive, &custom_inputs, &host_gradient)?;
         if gradients.len() != inputs.len() {
             return Err(Error::Execution(
                 "built-in custom operation returned the wrong gradient count".into(),
@@ -1280,8 +1395,56 @@ fn collect_topological(tensor: &Tensor, seen: &mut HashSet<u64>, output: &mut Ve
             collect_topological(left, seen, output);
             collect_topological(right, seen, output);
         }
-        Op::Relu(input) | Op::Reshape(input) | Op::AvgPool2d { input, .. } => {
+        Op::Relu(input)
+        | Op::Gelu(input)
+        | Op::Tanh(input)
+        | Op::SelectFirst(input)
+        | Op::Reshape(input)
+        | Op::AvgPool2d { input, .. } => {
             collect_topological(input, seen, output);
+        }
+        Op::Linear {
+            input,
+            weight,
+            bias,
+        }
+        | Op::LayerNorm {
+            input,
+            weight,
+            bias,
+            ..
+        } => {
+            collect_topological(input, seen, output);
+            collect_topological(weight, seen, output);
+            collect_topological(bias, seen, output);
+        }
+        Op::Embedding { ids, weight } => {
+            collect_topological(ids, seen, output);
+            collect_topological(weight, seen, output);
+        }
+        Op::ScaledDotProductAttention {
+            input,
+            mask,
+            query_weight,
+            query_bias,
+            key_weight,
+            key_bias,
+            value_weight,
+            value_bias,
+            ..
+        } => {
+            for operand in [
+                input,
+                mask,
+                query_weight,
+                query_bias,
+                key_weight,
+                key_bias,
+                value_weight,
+                value_bias,
+            ] {
+                collect_topological(operand, seen, output);
+            }
         }
         Op::Conv2d {
             input,

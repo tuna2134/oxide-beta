@@ -9,8 +9,18 @@
     clippy::type_complexity
 )]
 
-use crate::{CustomInput, CustomOp, CustomOpKind, Error, Result, Tensor};
-use std::sync::Arc;
+use crate::tensor::Op;
+use crate::{CustomInput, Error, Result, Tensor};
+
+trait CpuPrimitive {
+    fn forward(&self, inputs: &[CustomInput<'_>]) -> Result<Vec<f32>>;
+
+    fn backward(
+        &self,
+        inputs: &[CustomInput<'_>],
+        output_gradient: &[f32],
+    ) -> Result<Vec<Option<Vec<f32>>>>;
+}
 
 /// Applies a row-major affine projection using `[output, input]` weights.
 ///
@@ -30,20 +40,23 @@ pub fn linear(x: &Tensor, weight: &Tensor, bias: &Tensor, output: usize) -> Resu
     *shape
         .last_mut()
         .ok_or_else(|| Error::InvalidShape("linear requires rank >= 1".into()))? = output;
-    Tensor::custom(
-        vec![x.clone(), weight.clone(), bias.clone()],
+    if x.device() != weight.device() || x.device() != bias.device() {
+        return Err(Error::DeviceMismatch);
+    }
+    Ok(Tensor::new(
         shape,
-        Arc::new(LinearOp),
-    )
+        x.device(),
+        Op::Linear {
+            input: x.clone(),
+            weight: weight.clone(),
+            bias: bias.clone(),
+        },
+    ))
 }
 
 #[derive(Debug)]
 struct LinearOp;
-impl CustomOp for LinearOp {
-    fn kind(&self) -> CustomOpKind {
-        CustomOpKind::Linear
-    }
-
+impl CpuPrimitive for LinearOp {
     fn forward(&self, i: &[CustomInput<'_>]) -> Result<Vec<f32>> {
         let input = i[0].shape[i[0].shape.len() - 1];
         let output = i[1].shape[0];
@@ -89,15 +102,15 @@ impl CustomOp for LinearOp {
 ///
 /// Returns an error if graph construction fails.
 pub fn gelu(x: &Tensor) -> Result<Tensor> {
-    Tensor::custom(vec![x.clone()], x.shape().to_vec(), Arc::new(GeluOp))
+    Ok(Tensor::new(
+        x.shape().to_vec(),
+        x.device(),
+        Op::Gelu(x.clone()),
+    ))
 }
 #[derive(Debug)]
 struct GeluOp;
-impl CustomOp for GeluOp {
-    fn kind(&self) -> CustomOpKind {
-        CustomOpKind::Gelu
-    }
-
+impl CpuPrimitive for GeluOp {
     fn forward(&self, i: &[CustomInput<'_>]) -> Result<Vec<f32>> {
         Ok(i[0].values.iter().map(|&x| gelu_value(x)).collect())
     }
@@ -126,15 +139,15 @@ fn gelu_value(x: f32) -> f32 {
 ///
 /// Returns an error if graph construction fails.
 pub fn tanh(x: &Tensor) -> Result<Tensor> {
-    Tensor::custom(vec![x.clone()], x.shape().to_vec(), Arc::new(TanhOp))
+    Ok(Tensor::new(
+        x.shape().to_vec(),
+        x.device(),
+        Op::Tanh(x.clone()),
+    ))
 }
 #[derive(Debug)]
 struct TanhOp;
-impl CustomOp for TanhOp {
-    fn kind(&self) -> CustomOpKind {
-        CustomOpKind::Tanh
-    }
-
+impl CpuPrimitive for TanhOp {
     fn forward(&self, i: &[CustomInput<'_>]) -> Result<Vec<f32>> {
         Ok(i[0].values.iter().map(|x| x.tanh()).collect())
     }
@@ -162,19 +175,21 @@ pub fn embedding(ids: &Tensor, weight: &Tensor, hidden: usize) -> Result<Tensor>
     }
     let mut shape = ids.shape().to_vec();
     shape.push(hidden);
-    Tensor::custom(
-        vec![ids.clone(), weight.clone()],
+    if ids.device() != weight.device() {
+        return Err(Error::DeviceMismatch);
+    }
+    Ok(Tensor::new(
         shape,
-        Arc::new(EmbeddingOp),
-    )
+        ids.device(),
+        Op::Embedding {
+            ids: ids.clone(),
+            weight: weight.clone(),
+        },
+    ))
 }
 #[derive(Debug)]
 struct EmbeddingOp;
-impl CustomOp for EmbeddingOp {
-    fn kind(&self) -> CustomOpKind {
-        CustomOpKind::Embedding
-    }
-
+impl CpuPrimitive for EmbeddingOp {
     fn forward(&self, i: &[CustomInput<'_>]) -> Result<Vec<f32>> {
         let h = i[1].shape[1];
         let mut y = Vec::with_capacity(i[0].values.len() * h);
@@ -221,19 +236,23 @@ pub fn layer_norm(x: &Tensor, w: &Tensor, b: &Tensor, eps: f32) -> Result<Tensor
             "layer_norm parameters must match the final dimension".into(),
         ));
     }
-    Tensor::custom(
-        vec![x.clone(), w.clone(), b.clone()],
+    if x.device() != w.device() || x.device() != b.device() {
+        return Err(Error::DeviceMismatch);
+    }
+    Ok(Tensor::new(
         x.shape().to_vec(),
-        Arc::new(LayerNormOp(eps)),
-    )
+        x.device(),
+        Op::LayerNorm {
+            input: x.clone(),
+            weight: w.clone(),
+            bias: b.clone(),
+            epsilon: eps,
+        },
+    ))
 }
 #[derive(Debug)]
 struct LayerNormOp(f32);
-impl CustomOp for LayerNormOp {
-    fn kind(&self) -> CustomOpKind {
-        CustomOpKind::LayerNorm { epsilon: self.0 }
-    }
-
+impl CpuPrimitive for LayerNormOp {
     fn forward(&self, i: &[CustomInput<'_>]) -> Result<Vec<f32>> {
         let n = i[1].values.len();
         let mut y = vec![0.; i[0].values.len()];
@@ -287,15 +306,15 @@ pub fn select_first(x: &Tensor, hidden: usize) -> Result<Tensor> {
         ));
     }
     let batch = x.shape()[0];
-    Tensor::custom(vec![x.clone()], vec![batch, hidden], Arc::new(ClsOp))
+    Ok(Tensor::new(
+        vec![batch, hidden],
+        x.device(),
+        Op::SelectFirst(x.clone()),
+    ))
 }
 #[derive(Debug)]
 struct ClsOp;
-impl CustomOp for ClsOp {
-    fn kind(&self) -> CustomOpKind {
-        CustomOpKind::SelectFirst
-    }
-
+impl CpuPrimitive for ClsOp {
     fn forward(&self, i: &[CustomInput<'_>]) -> Result<Vec<f32>> {
         let (b, s, h) = (i[0].shape[0], i[0].shape[1], i[0].shape[2]);
         let mut y = vec![0.; b * h];
@@ -350,20 +369,27 @@ pub fn scaled_dot_product_attention(
             "attention projections must use [hidden, hidden] weights and [hidden] biases".into(),
         ));
     }
-    Tensor::custom(
-        vec![
-            x.clone(),
-            mask.clone(),
-            qw.clone(),
-            qb.clone(),
-            kw.clone(),
-            kb.clone(),
-            vw.clone(),
-            vb.clone(),
-        ],
+    if [mask, qw, qb, kw, kb, vw, vb]
+        .iter()
+        .any(|tensor| tensor.device() != x.device())
+    {
+        return Err(Error::DeviceMismatch);
+    }
+    Ok(Tensor::new(
         x.shape().to_vec(),
-        Arc::new(AttentionOp { heads }),
-    )
+        x.device(),
+        Op::ScaledDotProductAttention {
+            input: x.clone(),
+            mask: mask.clone(),
+            query_weight: qw.clone(),
+            query_bias: qb.clone(),
+            key_weight: kw.clone(),
+            key_bias: kb.clone(),
+            value_weight: vw.clone(),
+            value_bias: vb.clone(),
+            heads,
+        },
+    ))
 }
 #[derive(Debug)]
 struct AttentionOp {
@@ -430,11 +456,7 @@ impl AttentionOp {
         p
     }
 }
-impl CustomOp for AttentionOp {
-    fn kind(&self) -> CustomOpKind {
-        CustomOpKind::ScaledDotProductAttention { heads: self.heads }
-    }
-
+impl CpuPrimitive for AttentionOp {
     fn forward(&self, i: &[CustomInput<'_>]) -> Result<Vec<f32>> {
         let (q, k, v) = self.projections(i);
         let p = self.probabilities(i, &q, &k);
@@ -507,5 +529,48 @@ impl CustomOp for AttentionOp {
         }
         grads[0] = Some(dx);
         Ok(grads)
+    }
+}
+
+/// Compact execution descriptor used after the public graph has already been
+/// lowered from concrete [`Op`] variants.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Primitive {
+    Linear,
+    Gelu,
+    Tanh,
+    Embedding,
+    LayerNorm { epsilon: f32 },
+    SelectFirst,
+    ScaledDotProductAttention { heads: usize },
+}
+
+pub(crate) fn forward(primitive: Primitive, inputs: &[CustomInput<'_>]) -> Result<Vec<f32>> {
+    match primitive {
+        Primitive::Linear => LinearOp.forward(inputs),
+        Primitive::Gelu => GeluOp.forward(inputs),
+        Primitive::Tanh => TanhOp.forward(inputs),
+        Primitive::Embedding => EmbeddingOp.forward(inputs),
+        Primitive::LayerNorm { epsilon } => LayerNormOp(epsilon).forward(inputs),
+        Primitive::SelectFirst => ClsOp.forward(inputs),
+        Primitive::ScaledDotProductAttention { heads } => AttentionOp { heads }.forward(inputs),
+    }
+}
+
+pub(crate) fn backward(
+    primitive: Primitive,
+    inputs: &[CustomInput<'_>],
+    output_gradient: &[f32],
+) -> Result<Vec<Option<Vec<f32>>>> {
+    match primitive {
+        Primitive::Linear => LinearOp.backward(inputs, output_gradient),
+        Primitive::Gelu => GeluOp.backward(inputs, output_gradient),
+        Primitive::Tanh => TanhOp.backward(inputs, output_gradient),
+        Primitive::Embedding => EmbeddingOp.backward(inputs, output_gradient),
+        Primitive::LayerNorm { epsilon } => LayerNormOp(epsilon).backward(inputs, output_gradient),
+        Primitive::SelectFirst => ClsOp.backward(inputs, output_gradient),
+        Primitive::ScaledDotProductAttention { heads } => {
+            AttentionOp { heads }.backward(inputs, output_gradient)
+        }
     }
 }
