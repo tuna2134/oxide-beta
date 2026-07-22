@@ -12,6 +12,7 @@ pub mod nn;
 pub mod optim;
 pub mod safetensors;
 mod tensor;
+pub mod transformer;
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
@@ -19,7 +20,7 @@ pub mod cuda;
 pub use oxide_torch_cuda::{cublas, cuda_graph};
 
 pub use error::{Error, Result};
-pub use tensor::{Device, Tensor};
+pub use tensor::{CustomInput, CustomOp, Device, Tensor};
 
 /// Creates a tensor from row-major `f32` data.
 ///

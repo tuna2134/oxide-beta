@@ -348,6 +348,8 @@ fn checkpoint_error(error: std::io::Error) -> Error {
 }
 
 impl Module for MobileNetV4ConvSmall {
+    type Output = Tensor;
+
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         self.forward_with_shapes(input).map(|(output, _)| output)
     }

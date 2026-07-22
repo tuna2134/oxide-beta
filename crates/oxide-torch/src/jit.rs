@@ -7,7 +7,7 @@
 
 use crate::nn::Module;
 use crate::tensor::{Op, eval_cpu};
-use crate::{Device, Error, Result, Tensor};
+use crate::{CustomInput, Device, Error, Result, Tensor};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -59,6 +59,12 @@ pub(crate) enum PlanOperation {
         rows: usize,
         columns: usize,
         inner: usize,
+    },
+    Transformer {
+        inputs: Vec<usize>,
+        input_shapes: Vec<Vec<usize>>,
+        primitive: crate::transformer::Primitive,
+        output: usize,
     },
 }
 
@@ -122,7 +128,7 @@ pub fn trace(
 ///
 /// Returns an error when tracing fails or the model output is on a different
 /// device than `example`.
-pub fn compile<M: Module>(model: &M, example: &Tensor) -> Result<JitModule> {
+pub fn compile<M: Module<Output = Tensor>>(model: &M, example: &Tensor) -> Result<JitModule> {
     trace(std::slice::from_ref(example), |inputs| {
         model.forward(&inputs[0])
     })
@@ -276,6 +282,7 @@ struct PlanBuilder {
 }
 
 impl PlanBuilder {
+    #[allow(clippy::too_many_lines)]
     fn lower(&mut self, tensor: &Tensor) -> Result<usize> {
         if let Some(slot) = self.nodes.get(&tensor.node.id) {
             return Ok(*slot);
@@ -336,6 +343,65 @@ impl PlanBuilder {
                 output
             }
             Op::Reshape(input) => self.lower(input)?,
+            Op::Linear {
+                input,
+                weight,
+                bias,
+            } => self.lower_transformer(
+                tensor,
+                crate::transformer::Primitive::Linear,
+                &[input, weight, bias],
+            )?,
+            Op::Gelu(input) => {
+                self.lower_transformer(tensor, crate::transformer::Primitive::Gelu, &[input])?
+            }
+            Op::Tanh(input) => {
+                self.lower_transformer(tensor, crate::transformer::Primitive::Tanh, &[input])?
+            }
+            Op::Embedding { ids, weight } => self.lower_transformer(
+                tensor,
+                crate::transformer::Primitive::Embedding,
+                &[ids, weight],
+            )?,
+            Op::LayerNorm {
+                input,
+                weight,
+                bias,
+                epsilon,
+            } => self.lower_transformer(
+                tensor,
+                crate::transformer::Primitive::LayerNorm { epsilon: *epsilon },
+                &[input, weight, bias],
+            )?,
+            Op::SelectFirst(input) => self.lower_transformer(
+                tensor,
+                crate::transformer::Primitive::SelectFirst,
+                &[input],
+            )?,
+            Op::ScaledDotProductAttention {
+                input,
+                mask,
+                query_weight,
+                query_bias,
+                key_weight,
+                key_bias,
+                value_weight,
+                value_bias,
+                heads,
+            } => self.lower_transformer(
+                tensor,
+                crate::transformer::Primitive::ScaledDotProductAttention { heads: *heads },
+                &[
+                    input,
+                    mask,
+                    query_weight,
+                    query_bias,
+                    key_weight,
+                    key_bias,
+                    value_weight,
+                    value_bias,
+                ],
+            )?,
             _ => {
                 self.supported = false;
                 self.push_workspace(tensor.numel())
@@ -343,6 +409,26 @@ impl PlanBuilder {
         };
         self.nodes.insert(tensor.node.id, slot);
         Ok(slot)
+    }
+
+    fn lower_transformer(
+        &mut self,
+        tensor: &Tensor,
+        primitive: crate::transformer::Primitive,
+        inputs: &[&Tensor],
+    ) -> Result<usize> {
+        let input_slots = inputs
+            .iter()
+            .map(|input| self.lower(input))
+            .collect::<Result<Vec<_>>>()?;
+        let output = self.push_workspace(tensor.numel());
+        self.operations.push(PlanOperation::Transformer {
+            inputs: input_slots,
+            input_shapes: inputs.iter().map(|input| input.shape().to_vec()).collect(),
+            primitive,
+            output,
+        });
+        Ok(output)
     }
 
     fn push_workspace(&mut self, elements: usize) -> usize {
@@ -384,13 +470,13 @@ impl CpuCompiledPlan {
             buffers[*slot].copy_from_slice(&values);
         }
         for operation in &self.graph.operations {
-            execute_cpu(operation, &mut buffers);
+            execute_cpu(operation, &mut buffers)?;
         }
         Ok(buffers[self.graph.output].clone())
     }
 }
 
-fn execute_cpu(operation: &PlanOperation, buffers: &mut [Vec<f32>]) {
+fn execute_cpu(operation: &PlanOperation, buffers: &mut [Vec<f32>]) -> Result<()> {
     let (left, right, output) = match operation {
         PlanOperation::Add {
             left,
@@ -409,6 +495,7 @@ fn execute_cpu(operation: &PlanOperation, buffers: &mut [Vec<f32>]) {
             ..
         } => (*left, Some(*right), *output),
         PlanOperation::Relu { input, output } => (*input, None, *output),
+        PlanOperation::Transformer { output, .. } => (0, None, *output),
     };
     let (sources, destination) = buffers.split_at_mut(output);
     let output_buffer = &mut destination[0];
@@ -446,10 +533,35 @@ fn execute_cpu(operation: &PlanOperation, buffers: &mut [Vec<f32>]) {
                 }
             }
         }
+        PlanOperation::Transformer {
+            inputs,
+            input_shapes,
+            primitive,
+            ..
+        } => {
+            let custom_inputs = inputs
+                .iter()
+                .zip(input_shapes)
+                .map(|(slot, shape)| CustomInput {
+                    shape,
+                    values: &sources[*slot],
+                })
+                .collect::<Vec<_>>();
+            let values = crate::transformer::forward(*primitive, &custom_inputs)?;
+            if values.len() != output_buffer.len() {
+                return Err(Error::Execution(
+                    "custom JIT operation returned the wrong output size".into(),
+                ));
+            }
+            output_buffer.copy_from_slice(&values);
+        }
     }
+    Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn bind_placeholders(graph: &Tensor, inputs: &[Tensor]) -> Result<Tensor> {
+    #[allow(clippy::too_many_lines)]
     fn bind(
         tensor: &Tensor,
         inputs: &[Tensor],
@@ -472,6 +584,65 @@ fn bind_placeholders(graph: &Tensor, inputs: &[Tensor]) -> Result<Tensor> {
             Op::Mul(a, b) => bind(a, inputs, cache)?.mul(&bind(b, inputs, cache)?)?,
             Op::Relu(input) => bind(input, inputs, cache)?.relu(),
             Op::MatMul(a, b) => bind(a, inputs, cache)?.matmul(&bind(b, inputs, cache)?)?,
+            Op::Linear {
+                input,
+                weight,
+                bias,
+            } => {
+                let weight = bind(weight, inputs, cache)?;
+                crate::transformer::linear(
+                    &bind(input, inputs, cache)?,
+                    &weight,
+                    &bind(bias, inputs, cache)?,
+                    weight.shape()[0],
+                )?
+            }
+            Op::Gelu(input) => crate::transformer::gelu(&bind(input, inputs, cache)?)?,
+            Op::Tanh(input) => crate::transformer::tanh(&bind(input, inputs, cache)?)?,
+            Op::Embedding { ids, weight } => {
+                let weight = bind(weight, inputs, cache)?;
+                crate::transformer::embedding(
+                    &bind(ids, inputs, cache)?,
+                    &weight,
+                    weight.shape()[1],
+                )?
+            }
+            Op::LayerNorm {
+                input,
+                weight,
+                bias,
+                epsilon,
+            } => crate::transformer::layer_norm(
+                &bind(input, inputs, cache)?,
+                &bind(weight, inputs, cache)?,
+                &bind(bias, inputs, cache)?,
+                *epsilon,
+            )?,
+            Op::SelectFirst(input) => {
+                let input = bind(input, inputs, cache)?;
+                crate::transformer::select_first(&input, input.shape()[2])?
+            }
+            Op::ScaledDotProductAttention {
+                input,
+                mask,
+                query_weight,
+                query_bias,
+                key_weight,
+                key_bias,
+                value_weight,
+                value_bias,
+                heads,
+            } => crate::transformer::scaled_dot_product_attention(
+                &bind(input, inputs, cache)?,
+                &bind(mask, inputs, cache)?,
+                &bind(query_weight, inputs, cache)?,
+                &bind(query_bias, inputs, cache)?,
+                &bind(key_weight, inputs, cache)?,
+                &bind(key_bias, inputs, cache)?,
+                &bind(value_weight, inputs, cache)?,
+                &bind(value_bias, inputs, cache)?,
+                *heads,
+            )?,
             Op::Conv2d {
                 input,
                 weight,
@@ -512,6 +683,17 @@ fn bind_placeholders(graph: &Tensor, inputs: &[Tensor]) -> Result<Tensor> {
                 *momentum,
                 *epsilon,
             )?,
+            Op::Custom {
+                inputs: operands,
+                operation,
+            } => Tensor::custom(
+                operands
+                    .iter()
+                    .map(|operand| bind(operand, inputs, cache))
+                    .collect::<Result<Vec<_>>>()?,
+                tensor.shape().to_vec(),
+                Arc::clone(operation),
+            )?,
         };
         cache.insert(tensor.node.id, result.clone());
         Ok(result)
@@ -529,6 +711,8 @@ mod tests {
     }
 
     impl Module for CustomModel {
+        type Output = Tensor;
+
         fn forward(&self, input: &Tensor) -> Result<Tensor> {
             Ok(input.matmul(&self.weight)?.add(&self.bias)?.relu())
         }
