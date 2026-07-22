@@ -176,6 +176,10 @@ pub struct Gemma4CudaState {
 }
 
 impl Gemma4CudaState {
+    pub(crate) fn reset_generation_state(&self) {
+        *self.seen_tokens.borrow_mut() = None;
+    }
+
     fn trace_fingerprint(
         &self,
         label: &str,
