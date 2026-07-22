@@ -38,3 +38,9 @@ path = "src/bin/mnist_training.rs"
 [[bin]]
 name = "mnist-inference"
 path = "src/bin/mnist_inference.rs"
+
+[[example]]
+name = "bert_inference"
+
+[[example]]
+name = "bert_finetune"

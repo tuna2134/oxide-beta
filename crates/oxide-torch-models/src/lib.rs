@@ -5,4 +5,4 @@ pub mod models;
 #[cfg(feature = "cuda")]
 pub mod gemma4_cuda;
 
-pub use models::{gemma4, mobilenet_v4};
+pub use models::{bert, gemma4, mobilenet_v4};
