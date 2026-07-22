@@ -58,16 +58,16 @@ impl Gemma4ForCausalLM {
         let root = directory.as_ref().to_owned();
         let config_path = root.join("config.json");
         let bytes = fs::read(&config_path).map_err(|error| {
-            Error::Execution(format!("failed to read {}: {error}", config_path.display()))
+            Error::io(format!("failed to read {}", config_path.display()), error)
         })?;
         let value: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|error| Error::Execution(format!("invalid Gemma 4 config: {error}")))?;
+            .map_err(|error| Error::json("invalid Gemma 4 config", error))?;
         let config = if let Some(text) = value.get("text_config") {
             serde_json::from_value::<Gemma4TextConfig>(text.clone())
         } else {
             serde_json::from_value::<Gemma4TextConfig>(value)
         }
-        .map_err(|error| Error::Execution(format!("invalid Gemma4TextConfig: {error}")))?
+        .map_err(|error| Error::json("invalid Gemma4TextConfig", error))?
         .finish()?;
         let weights = SafeTensorLoader::open(&root)?;
         let model = Self {

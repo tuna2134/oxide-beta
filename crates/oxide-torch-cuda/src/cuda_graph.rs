@@ -193,5 +193,8 @@ fn cuda_error(error: impl std::fmt::Display) -> Error {
 }
 
 fn ffi_error(error: libloading::Error) -> Error {
-    Error::Execution(format!("failed to load CUDA graph symbol: {error}"))
+    Error::DynamicLibrary {
+        component: "CUDA driver",
+        source: error,
+    }
 }

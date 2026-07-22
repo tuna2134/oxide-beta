@@ -1,20 +1,18 @@
-use std::fmt::{Display, Formatter};
-
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("invalid shape: {0}")]
     InvalidShape(String),
+
+    #[error("CUDA execution failed: {0}")]
     Execution(String),
-}
 
-impl Display for Error {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidShape(message) => write!(formatter, "invalid shape: {message}"),
-            Self::Execution(message) => write!(formatter, "CUDA execution failed: {message}"),
-        }
-    }
+    #[cfg(feature = "cuda")]
+    #[error("failed to load {component} shared library or symbol: {source}")]
+    DynamicLibrary {
+        component: &'static str,
+        #[source]
+        source: libloading::Error,
+    },
 }
-
-impl std::error::Error for Error {}

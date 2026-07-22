@@ -83,7 +83,7 @@ impl SafeTensorLoader {
 
     fn from_file(path: &Path) -> Result<Self> {
         let mapping = map_file(path)?;
-        let tensors = SafeTensors::deserialize(&mapping).map_err(safetensor_error)?;
+        let tensors = SafeTensors::deserialize(&mapping).map_err(Error::from)?;
         let file_name = path
             .file_name()
             .ok_or_else(|| load_error("SafeTensors path has no file name"))?;
@@ -101,9 +101,9 @@ impl SafeTensorLoader {
 
     fn from_index(path: &Path) -> Result<Self> {
         let json = fs::read(path)
-            .map_err(|error| load_error(format!("failed to read {}: {error}", path.display())))?;
+            .map_err(|error| Error::io(format!("failed to read {}", path.display()), error))?;
         let index: ShardIndex = serde_json::from_slice(&json)
-            .map_err(|error| load_error(format!("invalid SafeTensors index: {error}")))?;
+            .map_err(|error| Error::json("invalid SafeTensors index", error))?;
         let root = path.parent().unwrap_or_else(|| Path::new(".")).to_owned();
         let mut validated = BTreeSet::new();
         let mut shards = HashMap::new();
@@ -228,12 +228,12 @@ impl SafeTensorLoader {
 #[allow(unsafe_code)]
 fn map_file(path: &Path) -> Result<Mmap> {
     let file = File::open(path)
-        .map_err(|error| load_error(format!("failed to open {}: {error}", path.display())))?;
+        .map_err(|error| Error::io(format!("failed to open {}", path.display()), error))?;
     // SAFETY: the mapping is read-only and kept alive in an Arc for every
     // TensorView derived from it. The checkpoint file must remain immutable
     // and must not be truncated while SafeTensorLoader is alive.
     unsafe { MmapOptions::new().map(&file) }
-        .map_err(|error| load_error(format!("failed to map {}: {error}", path.display())))
+        .map_err(|error| Error::io(format!("failed to map {}", path.display()), error))
 }
 
 fn decode_f32(dtype: Dtype, bytes: &[u8]) -> Result<Vec<f32>> {
@@ -268,7 +268,7 @@ fn decode_f32(dtype: Dtype, bytes: &[u8]) -> Result<Vec<f32>> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn safetensor_error(error: safetensors::SafeTensorError) -> Error {
-    load_error(format!("invalid SafeTensors data: {error}"))
+    Error::from(error)
 }
 
 fn load_error(message: impl Into<String>) -> Error {
