@@ -840,522 +840,669 @@ pub(crate) mod kernels {
         }
     }
 
-    #[kernel]
-    pub fn gemma_rms_norm(
-        hidden: usize,
-        epsilon: f32,
-        input: &[f32],
-        weight_bf16: &[u16],
-        mut output: DisjointSlice<f32>,
-    ) {
-        static mut SCALE: SharedArray<f32, 1> = SharedArray::UNINIT;
-        let row = thread::blockIdx_x() as usize;
-        let lane = thread::threadIdx_x() as usize;
-        let row_offset = row * hidden;
-        if lane == 0 {
-            let mut square_sum = 0.0;
-            let mut offset = 0;
-            while offset < hidden {
-                let x = input[row_offset + offset];
-                square_sum += x * x;
-                offset += 1;
+    /// Model-independent kernels used by autoregressive inference backends.
+    pub(crate) mod inference {
+        use super::*;
+
+        #[kernel]
+        pub fn rms_norm(
+            hidden: usize,
+            epsilon: f32,
+            input: &[f32],
+            weight_bf16: &[u16],
+            mut output: DisjointSlice<f32>,
+        ) {
+            static mut SCALE: SharedArray<f32, 1> = SharedArray::UNINIT;
+            let row = thread::blockIdx_x() as usize;
+            let lane = thread::threadIdx_x() as usize;
+            let row_offset = row * hidden;
+            if lane == 0 {
+                let mut square_sum = 0.0;
+                let mut offset = 0;
+                while offset < hidden {
+                    let x = input[row_offset + offset];
+                    square_sum += x * x;
+                    offset += 1;
+                }
+                // SAFETY: lane zero is the sole writer and the block barrier below
+                // publishes the value to every lane.
+                unsafe {
+                    SCALE[0] = 1.0 / core::intrinsics::sqrtf32(square_sum / hidden as f32 + epsilon)
+                };
             }
-            // SAFETY: lane zero is the sole writer and the block barrier below
-            // publishes the value to every lane.
-            unsafe {
-                SCALE[0] = 1.0 / core::intrinsics::sqrtf32(square_sum / hidden as f32 + epsilon)
-            };
-        }
-        thread::sync_threads();
-        let scale = unsafe { SCALE[0] };
-        let mut column = lane;
-        while column < hidden {
-            let weight = f32::from_bits((weight_bf16[column] as u32) << 16);
-            // SAFETY: each lane owns columns congruent to its lane index and
-            // the host launches one block for every complete row.
-            unsafe {
-                *output.get_unchecked_mut(row_offset + column) =
-                    input[row_offset + column] * scale * weight
-            };
-            column += 256;
-        }
-    }
-
-    #[kernel]
-    pub fn gemma_rms_norm_bf16(
-        hidden: usize,
-        epsilon: f32,
-        input: &[f32],
-        weight_bf16: &[u16],
-        mut output: DisjointSlice<u16>,
-    ) {
-        static mut SCALE: SharedArray<f32, 1> = SharedArray::UNINIT;
-        let row = thread::blockIdx_x() as usize;
-        let lane = thread::threadIdx_x() as usize;
-        let row_offset = row * hidden;
-        if lane == 0 {
-            let mut square_sum = 0.0;
-            let mut offset = 0;
-            while offset < hidden {
-                let x = input[row_offset + offset];
-                square_sum += x * x;
-                offset += 1;
+            thread::sync_threads();
+            let scale = unsafe { SCALE[0] };
+            let mut column = lane;
+            while column < hidden {
+                let weight = f32::from_bits((weight_bf16[column] as u32) << 16);
+                // SAFETY: each lane owns columns congruent to its lane index and
+                // the host launches one block for every complete row.
+                unsafe {
+                    *output.get_unchecked_mut(row_offset + column) =
+                        input[row_offset + column] * scale * weight
+                };
+                column += 256;
             }
-            unsafe {
-                SCALE[0] = 1.0 / core::intrinsics::sqrtf32(square_sum / hidden as f32 + epsilon)
-            };
         }
-        thread::sync_threads();
-        let scale = unsafe { SCALE[0] };
-        let mut column = lane;
-        while column < hidden {
-            let weight = f32::from_bits((weight_bf16[column] as u32) << 16);
-            let bits = (input[row_offset + column] * scale * weight).to_bits();
-            let rounding_bias = 0x7fff + ((bits >> 16) & 1);
-            unsafe {
-                *output.get_unchecked_mut(row_offset + column) =
-                    bits.wrapping_add(rounding_bias).wrapping_shr(16) as u16
-            };
-            column += 256;
-        }
-    }
 
-    #[kernel]
-    pub fn gemma_rms_norm_unit(
-        hidden: usize,
-        epsilon: f32,
-        input: &[f32],
-        mut output: DisjointSlice<f32>,
-    ) {
-        static mut SCALE: SharedArray<f32, 1> = SharedArray::UNINIT;
-        let row = thread::blockIdx_x() as usize;
-        let lane = thread::threadIdx_x() as usize;
-        let row_offset = row * hidden;
-        if lane == 0 {
-            let mut square_sum = 0.0;
-            let mut offset = 0;
-            while offset < hidden {
-                let x = input[row_offset + offset];
-                square_sum += x * x;
-                offset += 1;
+        #[kernel]
+        pub fn rms_norm_bf16(
+            hidden: usize,
+            epsilon: f32,
+            input: &[f32],
+            weight_bf16: &[u16],
+            mut output: DisjointSlice<u16>,
+        ) {
+            static mut SCALE: SharedArray<f32, 1> = SharedArray::UNINIT;
+            let row = thread::blockIdx_x() as usize;
+            let lane = thread::threadIdx_x() as usize;
+            let row_offset = row * hidden;
+            if lane == 0 {
+                let mut square_sum = 0.0;
+                let mut offset = 0;
+                while offset < hidden {
+                    let x = input[row_offset + offset];
+                    square_sum += x * x;
+                    offset += 1;
+                }
+                unsafe {
+                    SCALE[0] = 1.0 / core::intrinsics::sqrtf32(square_sum / hidden as f32 + epsilon)
+                };
             }
-            unsafe {
-                SCALE[0] = 1.0 / core::intrinsics::sqrtf32(square_sum / hidden as f32 + epsilon)
-            };
+            thread::sync_threads();
+            let scale = unsafe { SCALE[0] };
+            let mut column = lane;
+            while column < hidden {
+                let weight = f32::from_bits((weight_bf16[column] as u32) << 16);
+                let bits = (input[row_offset + column] * scale * weight).to_bits();
+                let rounding_bias = 0x7fff + ((bits >> 16) & 1);
+                unsafe {
+                    *output.get_unchecked_mut(row_offset + column) =
+                        bits.wrapping_add(rounding_bias).wrapping_shr(16) as u16
+                };
+                column += 256;
+            }
         }
-        thread::sync_threads();
-        let scale = unsafe { SCALE[0] };
-        let mut column = lane;
-        while column < hidden {
-            unsafe {
-                *output.get_unchecked_mut(row_offset + column) = input[row_offset + column] * scale
-            };
-            column += 256;
-        }
-    }
 
-    #[kernel]
-    pub fn gemma_mul_bf16_scalar(
-        input: &[f32],
-        scalar_bf16: &[u16],
-        mut output: DisjointSlice<f32>,
-    ) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            let scalar = f32::from_bits((scalar_bf16[0] as u32) << 16);
-            *value = input[raw] * scalar;
+        #[kernel]
+        pub fn rms_norm_unit(
+            hidden: usize,
+            epsilon: f32,
+            input: &[f32],
+            mut output: DisjointSlice<f32>,
+        ) {
+            static mut SCALE: SharedArray<f32, 1> = SharedArray::UNINIT;
+            let row = thread::blockIdx_x() as usize;
+            let lane = thread::threadIdx_x() as usize;
+            let row_offset = row * hidden;
+            if lane == 0 {
+                let mut square_sum = 0.0;
+                let mut offset = 0;
+                while offset < hidden {
+                    let x = input[row_offset + offset];
+                    square_sum += x * x;
+                    offset += 1;
+                }
+                unsafe {
+                    SCALE[0] = 1.0 / core::intrinsics::sqrtf32(square_sum / hidden as f32 + epsilon)
+                };
+            }
+            thread::sync_threads();
+            let scale = unsafe { SCALE[0] };
+            let mut column = lane;
+            while column < hidden {
+                unsafe {
+                    *output.get_unchecked_mut(row_offset + column) =
+                        input[row_offset + column] * scale
+                };
+                column += 256;
+            }
         }
-    }
 
-    #[kernel]
-    pub fn gemma_bf16_to_f32_scaled(
-        offset: usize,
-        scale: f32,
-        input: &[u16],
-        mut output: DisjointSlice<f32>,
-    ) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            *value = f32::from_bits((input[offset + raw] as u32) << 16) * scale;
+        #[kernel]
+        pub fn mul_bf16_scalar(input: &[f32], scalar_bf16: &[u16], mut output: DisjointSlice<f32>) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                let scalar = f32::from_bits((scalar_bf16[0] as u32) << 16);
+                *value = input[raw] * scalar;
+            }
         }
-    }
 
-    #[kernel]
-    pub fn gemma_bf16_row_scaled_state(
-        row_width: usize,
-        scale: f32,
-        state: &[usize],
-        input: &[u16],
-        mut output: DisjointSlice<f32>,
-    ) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            *value = f32::from_bits((input[state[0] * row_width + raw] as u32) << 16) * scale;
+        #[kernel]
+        pub fn bf16_to_f32_scaled(
+            offset: usize,
+            scale: f32,
+            input: &[u16],
+            mut output: DisjointSlice<f32>,
+        ) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                *value = f32::from_bits((input[offset + raw] as u32) << 16) * scale;
+            }
         }
-    }
 
-    #[kernel]
-    pub fn gemma_decode_state_update(
-        token: usize,
-        position: usize,
-        mark_seen: bool,
-        mut state: DisjointSlice<usize>,
-        mut seen: DisjointSlice<u8>,
-    ) {
-        if thread::index_1d().get() == 0 {
-            // SAFETY: host launches one thread, state has two elements, and
-            // validated token ids are within the seen-token bitmap.
-            unsafe {
-                *state.get_unchecked_mut(0) = token;
-                *state.get_unchecked_mut(1) = position;
-                if mark_seen {
-                    *seen.get_unchecked_mut(token) = 1;
+        #[kernel]
+        pub fn bf16_row_scaled_state(
+            row_width: usize,
+            scale: f32,
+            state: &[usize],
+            input: &[u16],
+            mut output: DisjointSlice<f32>,
+        ) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                *value = f32::from_bits((input[state[0] * row_width + raw] as u32) << 16) * scale;
+            }
+        }
+
+        #[kernel]
+        pub fn decode_state_update(
+            token: usize,
+            position: usize,
+            mark_seen: bool,
+            mut state: DisjointSlice<usize>,
+            mut seen: DisjointSlice<u8>,
+        ) {
+            if thread::index_1d().get() == 0 {
+                // SAFETY: host launches one thread, state has two elements, and
+                // validated token ids are within the seen-token bitmap.
+                unsafe {
+                    *state.get_unchecked_mut(0) = token;
+                    *state.get_unchecked_mut(1) = position;
+                    if mark_seen {
+                        *seen.get_unchecked_mut(token) = 1;
+                    }
                 }
             }
         }
-    }
 
-    #[kernel]
-    pub fn gemma_decode_state_set(token: usize, position: usize, mut state: DisjointSlice<usize>) {
-        if thread::index_1d().get() == 0 {
-            // SAFETY: host always supplies a two-element state allocation.
-            unsafe {
-                *state.get_unchecked_mut(0) = token;
-                *state.get_unchecked_mut(1) = position;
+        #[kernel]
+        pub fn decode_state_set(token: usize, position: usize, mut state: DisjointSlice<usize>) {
+            if thread::index_1d().get() == 0 {
+                // SAFETY: host always supplies a two-element state allocation.
+                unsafe {
+                    *state.get_unchecked_mut(0) = token;
+                    *state.get_unchecked_mut(1) = position;
+                }
+            }
+        }
+
+        #[kernel]
+        pub fn embedding_rows_bf16(
+            hidden: usize,
+            scale: f32,
+            tokens: &[u32],
+            embedding_bf16: &[u16],
+            mut output: DisjointSlice<f32>,
+        ) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                let row = raw / hidden;
+                let column = raw % hidden;
+                let token = tokens[row] as usize;
+                *value =
+                    f32::from_bits((embedding_bf16[token * hidden + column] as u32) << 16) * scale;
+            }
+        }
+
+        #[kernel]
+        pub fn f32_to_bf16(input: &[f32], mut output: DisjointSlice<u16>) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                // Round-to-nearest-even before discarding the low 16 bits.
+                let bits = input[raw].to_bits();
+                let rounding_bias = 0x7fff + ((bits >> 16) & 1);
+                *value = bits.wrapping_add(rounding_bias).wrapping_shr(16) as u16;
+            }
+        }
+
+        #[kernel]
+        pub fn copy_bf16(output_offset: usize, input: &[u16], mut output: DisjointSlice<u16>) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if raw < input.len() {
+                unsafe { *output.get_unchecked_mut(output_offset + raw) = input[raw] };
+            }
+        }
+
+        #[kernel]
+        pub fn scale_f32(scale: f32, input: &[f32], mut output: DisjointSlice<f32>) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                *value = input[raw] * scale;
+            }
+        }
+
+        #[kernel]
+        pub fn slice_f32(offset: usize, input: &[f32], mut output: DisjointSlice<f32>) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                *value = input[offset + raw];
+            }
+        }
+
+        #[kernel]
+        pub fn slice_rows_f32(
+            input_width: usize,
+            output_width: usize,
+            column_offset: usize,
+            input: &[f32],
+            mut output: DisjointSlice<f32>,
+        ) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                let row = raw / output_width;
+                let column = raw % output_width;
+                *value = input[row * input_width + column_offset + column];
+            }
+        }
+
+        #[kernel]
+        pub fn gelu_f32(input: &[f32], mut output: DisjointSlice<f32>) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                let x = input[raw];
+                let inner = 0.797_884_6 * (x + 0.044_715 * x * x * x);
+                let tanh = if inner >= 0.0 {
+                    let exponential = core::intrinsics::expf32(-2.0 * inner);
+                    (1.0 - exponential) / (1.0 + exponential)
+                } else {
+                    let exponential = core::intrinsics::expf32(2.0 * inner);
+                    (exponential - 1.0) / (exponential + 1.0)
+                };
+                *value = 0.5 * x * (1.0 + tanh);
+            }
+        }
+
+        #[kernel]
+        pub fn cache_write_f32(offset: usize, input: &[f32], mut cache: DisjointSlice<f32>) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if raw < input.len() {
+                // SAFETY: the host checks the destination extent and every
+                // thread writes one unique cache element.
+                unsafe { *cache.get_unchecked_mut(offset + raw) = input[raw] };
+            }
+        }
+
+        #[kernel]
+        pub fn cache_write_f32_state(
+            width: usize,
+            cache_capacity: usize,
+            state: &[usize],
+            input: &[f32],
+            mut cache: DisjointSlice<f32>,
+        ) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if raw < width {
+                let destination = (state[1] % cache_capacity) * width + raw;
+                // SAFETY: cache has `cache_capacity * width` elements and each
+                // launched thread writes one distinct `raw` destination.
+                unsafe { *cache.get_unchecked_mut(destination) = input[raw] };
+            }
+        }
+
+        #[kernel]
+        pub fn gelu_mul_f32(gate: &[f32], up: &[f32], mut output: DisjointSlice<f32>) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                let x = gate[raw];
+                let inner = 0.797_884_6 * (x + 0.044_715 * x * x * x);
+                let tanh = if inner >= 0.0 {
+                    let exponential = core::intrinsics::expf32(-2.0 * inner);
+                    (1.0 - exponential) / (1.0 + exponential)
+                } else {
+                    let exponential = core::intrinsics::expf32(2.0 * inner);
+                    (exponential - 1.0) / (exponential + 1.0)
+                };
+                let gelu = 0.5 * x * (1.0 + tanh);
+                *value = gelu * up[raw];
             }
         }
     }
 
-    #[kernel]
-    pub fn gemma_embedding_rows(
-        hidden: usize,
-        scale: f32,
-        tokens: &[u32],
-        embedding_bf16: &[u16],
-        mut output: DisjointSlice<f32>,
-    ) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            let row = raw / hidden;
-            let column = raw % hidden;
-            let token = tokens[row] as usize;
-            *value = f32::from_bits((embedding_bf16[token * hidden + column] as u32) << 16) * scale;
-        }
-    }
+    /// Kernels whose math or memory layout follows the Gemma 4 architecture.
+    pub(crate) mod gemma4 {
+        use super::*;
 
-    #[kernel]
-    pub fn gemma_f32_to_bf16(input: &[f32], mut output: DisjointSlice<u16>) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            // Round-to-nearest-even before discarding the low 16 bits.
-            let bits = input[raw].to_bits();
-            let rounding_bias = 0x7fff + ((bits >> 16) & 1);
-            *value = bits.wrapping_add(rounding_bias).wrapping_shr(16) as u16;
+        #[kernel]
+        #[allow(clippy::too_many_arguments)]
+        pub fn rope(
+            heads: usize,
+            head_dim: usize,
+            rotary_dim: usize,
+            position_offset: usize,
+            theta: f32,
+            factor: f32,
+            input: &[f32],
+            mut output: DisjointSlice<f32>,
+        ) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                let dimension = raw % head_dim;
+                let half = head_dim / 2;
+                let frequency_index = dimension % half;
+                if frequency_index >= rotary_dim / 2 {
+                    *value = input[raw];
+                    return;
+                }
+                let token = raw / (heads * head_dim);
+                let head_base = raw - dimension;
+                let pair = if dimension < half {
+                    dimension + half
+                } else {
+                    dimension - half
+                };
+                // Proportional RoPE may rotate only a prefix of the frequency
+                // lanes, but Transformers still divides the exponent by the full
+                // head dimension (e.g. 512, not the 128 rotated dimensions).
+                let exponent = -((2 * frequency_index) as f32) / head_dim as f32;
+                let frequency = core::intrinsics::powf32(theta, exponent) / factor;
+                let angle = (position_offset + token) as f32 * frequency;
+                let rotated = if dimension < half {
+                    -input[head_base + pair]
+                } else {
+                    input[head_base + pair]
+                };
+                *value = input[raw] * core::intrinsics::cosf32(angle)
+                    + rotated * core::intrinsics::sinf32(angle);
+            }
         }
-    }
 
-    #[kernel]
-    pub fn gemma_copy_bf16(output_offset: usize, input: &[u16], mut output: DisjointSlice<u16>) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if raw < input.len() {
-            unsafe { *output.get_unchecked_mut(output_offset + raw) = input[raw] };
+        #[kernel]
+        #[allow(clippy::too_many_arguments)]
+        pub fn rope_state(
+            heads: usize,
+            head_dim: usize,
+            rotary_dim: usize,
+            theta: f32,
+            factor: f32,
+            state: &[usize],
+            input: &[f32],
+            mut output: DisjointSlice<f32>,
+        ) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                let dimension = raw % head_dim;
+                let half = head_dim / 2;
+                let frequency_index = dimension % half;
+                if frequency_index >= rotary_dim / 2 {
+                    *value = input[raw];
+                    return;
+                }
+                let token = raw / (heads * head_dim);
+                let head_base = raw - dimension;
+                let pair = if dimension < half {
+                    dimension + half
+                } else {
+                    dimension - half
+                };
+                let exponent = -((2 * frequency_index) as f32) / head_dim as f32;
+                let frequency = core::intrinsics::powf32(theta, exponent) / factor;
+                let angle = (state[1] + token) as f32 * frequency;
+                let rotated = if dimension < half {
+                    -input[head_base + pair]
+                } else {
+                    input[head_base + pair]
+                };
+                *value = input[raw] * core::intrinsics::cosf32(angle)
+                    + rotated * core::intrinsics::sinf32(angle);
+            }
         }
-    }
 
-    #[kernel]
-    pub fn gemma_add(left: &[f32], right: &[f32], mut output: DisjointSlice<f32>) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            *value = left[raw] + right[raw];
+        #[kernel]
+        #[allow(clippy::too_many_arguments)]
+        pub fn gqa_decode(
+            heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            sequence: usize,
+            window: usize,
+            cache_start: usize,
+            cache_capacity: usize,
+            query: &[f32],
+            key_cache: &[f32],
+            value_cache: &[f32],
+            mut output: DisjointSlice<f32>,
+        ) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                let head = raw / head_dim;
+                let dimension = raw % head_dim;
+                let kv_head = head / (heads / kv_heads);
+                let start = if window == 0 || sequence <= window {
+                    0
+                } else {
+                    sequence - window
+                };
+                let mut maximum = f32::NEG_INFINITY;
+                let mut position = start;
+                while position < sequence {
+                    let mut score = 0.0;
+                    let mut inner = 0;
+                    while inner < head_dim {
+                        let physical = (cache_start + position) % cache_capacity;
+                        score += query[head * head_dim + inner]
+                            * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
+                        inner += 1;
+                    }
+                    if score > maximum {
+                        maximum = score;
+                    }
+                    position += 1;
+                }
+                let mut normalizer = 0.0;
+                let mut weighted = 0.0;
+                position = start;
+                while position < sequence {
+                    let mut score = 0.0;
+                    let mut inner = 0;
+                    while inner < head_dim {
+                        let physical = (cache_start + position) % cache_capacity;
+                        score += query[head * head_dim + inner]
+                            * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
+                        inner += 1;
+                    }
+                    let probability = core::intrinsics::expf32(score - maximum);
+                    normalizer += probability;
+                    let physical = (cache_start + position) % cache_capacity;
+                    weighted += probability
+                        * value_cache[(physical * kv_heads + kv_head) * head_dim + dimension];
+                    position += 1;
+                }
+                *value = weighted / normalizer;
+            }
         }
-    }
 
-    #[kernel]
-    pub fn gemma_mul(left: &[f32], right: &[f32], mut output: DisjointSlice<f32>) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            *value = left[raw] * right[raw];
+        #[kernel]
+        #[allow(clippy::too_many_arguments)]
+        pub fn gqa_decode_state(
+            heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            window: usize,
+            cache_capacity: usize,
+            state: &[usize],
+            query: &[f32],
+            key_cache: &[f32],
+            value_cache: &[f32],
+            mut output: DisjointSlice<f32>,
+        ) {
+            let index = thread::index_1d();
+            let raw = index.get();
+            if let Some(value) = output.get_mut(index) {
+                let total_seen = state[1] + 1;
+                let sequence = if total_seen < cache_capacity {
+                    total_seen
+                } else {
+                    cache_capacity
+                };
+                let cache_start = if total_seen > cache_capacity {
+                    total_seen % cache_capacity
+                } else {
+                    0
+                };
+                let head = raw / head_dim;
+                let dimension = raw % head_dim;
+                let kv_head = head / (heads / kv_heads);
+                let start = if window == 0 || sequence <= window {
+                    0
+                } else {
+                    sequence - window
+                };
+                let mut maximum = f32::NEG_INFINITY;
+                let mut position = start;
+                while position < sequence {
+                    let physical = (cache_start + position) % cache_capacity;
+                    let mut score = 0.0;
+                    let mut inner = 0;
+                    while inner < head_dim {
+                        score += query[head * head_dim + inner]
+                            * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
+                        inner += 1;
+                    }
+                    if score > maximum {
+                        maximum = score;
+                    }
+                    position += 1;
+                }
+                let mut normalizer = 0.0;
+                let mut weighted = 0.0;
+                position = start;
+                while position < sequence {
+                    let physical = (cache_start + position) % cache_capacity;
+                    let mut score = 0.0;
+                    let mut inner = 0;
+                    while inner < head_dim {
+                        score += query[head * head_dim + inner]
+                            * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
+                        inner += 1;
+                    }
+                    let probability = core::intrinsics::expf32(score - maximum);
+                    normalizer += probability;
+                    weighted += probability
+                        * value_cache[(physical * kv_heads + kv_head) * head_dim + dimension];
+                    position += 1;
+                }
+                *value = weighted / normalizer;
+            }
         }
-    }
 
-    #[kernel]
-    pub fn gemma_scale(scale: f32, input: &[f32], mut output: DisjointSlice<f32>) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            *value = input[raw] * scale;
-        }
-    }
-
-    #[kernel]
-    pub fn gemma_slice(offset: usize, input: &[f32], mut output: DisjointSlice<f32>) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            *value = input[offset + raw];
-        }
-    }
-
-    #[kernel]
-    pub fn gemma_slice_rows(
-        input_width: usize,
-        output_width: usize,
-        column_offset: usize,
-        input: &[f32],
-        mut output: DisjointSlice<f32>,
-    ) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            let row = raw / output_width;
-            let column = raw % output_width;
-            *value = input[row * input_width + column_offset + column];
-        }
-    }
-
-    #[kernel]
-    pub fn gemma_gelu(input: &[f32], mut output: DisjointSlice<f32>) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            let x = input[raw];
-            let inner = 0.797_884_6 * (x + 0.044_715 * x * x * x);
-            let tanh = if inner >= 0.0 {
-                let exponential = core::intrinsics::expf32(-2.0 * inner);
-                (1.0 - exponential) / (1.0 + exponential)
-            } else {
-                let exponential = core::intrinsics::expf32(2.0 * inner);
-                (exponential - 1.0) / (exponential + 1.0)
-            };
-            *value = 0.5 * x * (1.0 + tanh);
-        }
-    }
-
-    #[kernel]
-    pub fn gemma_cache_write(offset: usize, input: &[f32], mut cache: DisjointSlice<f32>) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if raw < input.len() {
-            // SAFETY: the host checks the destination extent and every
-            // thread writes one unique cache element.
-            unsafe { *cache.get_unchecked_mut(offset + raw) = input[raw] };
-        }
-    }
-
-    #[kernel]
-    pub fn gemma_cache_write_state(
-        width: usize,
-        cache_capacity: usize,
-        state: &[usize],
-        input: &[f32],
-        mut cache: DisjointSlice<f32>,
-    ) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if raw < width {
-            let destination = (state[1] % cache_capacity) * width + raw;
-            // SAFETY: cache has `cache_capacity * width` elements and each
-            // launched thread writes one distinct `raw` destination.
-            unsafe { *cache.get_unchecked_mut(destination) = input[raw] };
-        }
-    }
-
-    #[kernel]
-    pub fn gemma_gelu_mul(gate: &[f32], up: &[f32], mut output: DisjointSlice<f32>) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            let x = gate[raw];
-            let inner = 0.797_884_6 * (x + 0.044_715 * x * x * x);
-            let tanh = if inner >= 0.0 {
-                let exponential = core::intrinsics::expf32(-2.0 * inner);
-                (1.0 - exponential) / (1.0 + exponential)
-            } else {
-                let exponential = core::intrinsics::expf32(2.0 * inner);
-                (exponential - 1.0) / (exponential + 1.0)
-            };
-            let gelu = 0.5 * x * (1.0 + tanh);
-            *value = gelu * up[raw];
-        }
-    }
-
-    #[kernel]
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemma_rope(
-        heads: usize,
-        head_dim: usize,
-        rotary_dim: usize,
-        position_offset: usize,
-        theta: f32,
-        factor: f32,
-        input: &[f32],
-        mut output: DisjointSlice<f32>,
-    ) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            let dimension = raw % head_dim;
-            let half = head_dim / 2;
-            let frequency_index = dimension % half;
-            if frequency_index >= rotary_dim / 2 {
-                *value = input[raw];
+        /// Single-query GQA specialized for decode. Attention scores are computed
+        /// once per head and shared by all head dimensions, instead of recomputing
+        /// the same dot product twice for every output element.
+        #[kernel]
+        #[allow(clippy::too_many_arguments)]
+        pub fn gqa_decode_block(
+            heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            sequence: usize,
+            window: usize,
+            cache_start: usize,
+            cache_capacity: usize,
+            query: &[f32],
+            key_cache: &[f32],
+            value_cache: &[f32],
+            mut output: DisjointSlice<f32>,
+        ) {
+            static mut PROBABILITIES: SharedArray<f32, 4096> = SharedArray::UNINIT;
+            static mut NORMALIZER: SharedArray<f32, 1> = SharedArray::UNINIT;
+            let head = thread::blockIdx_x() as usize;
+            let lane = thread::threadIdx_x() as usize;
+            if head >= heads {
                 return;
             }
-            let token = raw / (heads * head_dim);
-            let head_base = raw - dimension;
-            let pair = if dimension < half {
-                dimension + half
-            } else {
-                dimension - half
-            };
-            // Proportional RoPE may rotate only a prefix of the frequency
-            // lanes, but Transformers still divides the exponent by the full
-            // head dimension (e.g. 512, not the 128 rotated dimensions).
-            let exponent = -((2 * frequency_index) as f32) / head_dim as f32;
-            let frequency = core::intrinsics::powf32(theta, exponent) / factor;
-            let angle = (position_offset + token) as f32 * frequency;
-            let rotated = if dimension < half {
-                -input[head_base + pair]
-            } else {
-                input[head_base + pair]
-            };
-            *value = input[raw] * core::intrinsics::cosf32(angle)
-                + rotated * core::intrinsics::sinf32(angle);
-        }
-    }
-
-    #[kernel]
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemma_rope_state(
-        heads: usize,
-        head_dim: usize,
-        rotary_dim: usize,
-        theta: f32,
-        factor: f32,
-        state: &[usize],
-        input: &[f32],
-        mut output: DisjointSlice<f32>,
-    ) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            let dimension = raw % head_dim;
-            let half = head_dim / 2;
-            let frequency_index = dimension % half;
-            if frequency_index >= rotary_dim / 2 {
-                *value = input[raw];
-                return;
-            }
-            let token = raw / (heads * head_dim);
-            let head_base = raw - dimension;
-            let pair = if dimension < half {
-                dimension + half
-            } else {
-                dimension - half
-            };
-            let exponent = -((2 * frequency_index) as f32) / head_dim as f32;
-            let frequency = core::intrinsics::powf32(theta, exponent) / factor;
-            let angle = (state[1] + token) as f32 * frequency;
-            let rotated = if dimension < half {
-                -input[head_base + pair]
-            } else {
-                input[head_base + pair]
-            };
-            *value = input[raw] * core::intrinsics::cosf32(angle)
-                + rotated * core::intrinsics::sinf32(angle);
-        }
-    }
-
-    #[kernel]
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemma_gqa_decode(
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        sequence: usize,
-        window: usize,
-        cache_start: usize,
-        cache_capacity: usize,
-        query: &[f32],
-        key_cache: &[f32],
-        value_cache: &[f32],
-        mut output: DisjointSlice<f32>,
-    ) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
-            let head = raw / head_dim;
-            let dimension = raw % head_dim;
             let kv_head = head / (heads / kv_heads);
             let start = if window == 0 || sequence <= window {
                 0
             } else {
                 sequence - window
             };
-            let mut maximum = f32::NEG_INFINITY;
-            let mut position = start;
-            while position < sequence {
-                let mut score = 0.0;
-                let mut inner = 0;
-                while inner < head_dim {
+            if lane == 0 {
+                let mut maximum = f32::NEG_INFINITY;
+                let mut position = start;
+                while position < sequence {
                     let physical = (cache_start + position) % cache_capacity;
-                    score += query[head * head_dim + inner]
-                        * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
-                    inner += 1;
+                    let mut score = 0.0;
+                    let mut inner = 0;
+                    while inner < head_dim {
+                        score += query[head * head_dim + inner]
+                            * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
+                        inner += 1;
+                    }
+                    unsafe { PROBABILITIES[position - start] = score };
+                    if score > maximum {
+                        maximum = score;
+                    }
+                    position += 1;
                 }
-                if score > maximum {
-                    maximum = score;
+                let mut normalizer = 0.0;
+                position = start;
+                while position < sequence {
+                    let probability = core::intrinsics::expf32(
+                        unsafe { PROBABILITIES[position - start] } - maximum,
+                    );
+                    unsafe { PROBABILITIES[position - start] = probability };
+                    normalizer += probability;
+                    position += 1;
                 }
-                position += 1;
+                unsafe { NORMALIZER[0] = normalizer };
             }
-            let mut normalizer = 0.0;
-            let mut weighted = 0.0;
-            position = start;
-            while position < sequence {
-                let mut score = 0.0;
-                let mut inner = 0;
-                while inner < head_dim {
+            thread::sync_threads();
+            let normalizer = unsafe { NORMALIZER[0] };
+            let mut dimension = lane;
+            while dimension < head_dim {
+                let mut weighted = 0.0;
+                let mut position = start;
+                while position < sequence {
                     let physical = (cache_start + position) % cache_capacity;
-                    score += query[head * head_dim + inner]
-                        * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
-                    inner += 1;
+                    weighted += unsafe { PROBABILITIES[position - start] }
+                        * value_cache[(physical * kv_heads + kv_head) * head_dim + dimension];
+                    position += 1;
                 }
-                let probability = core::intrinsics::expf32(score - maximum);
-                normalizer += probability;
-                let physical = (cache_start + position) % cache_capacity;
-                weighted += probability
-                    * value_cache[(physical * kv_heads + kv_head) * head_dim + dimension];
-                position += 1;
+                unsafe {
+                    *output.get_unchecked_mut(head * head_dim + dimension) = weighted / normalizer
+                };
+                dimension += 256;
             }
-            *value = weighted / normalizer;
         }
-    }
 
-    #[kernel]
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemma_gqa_decode_state(
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        window: usize,
-        cache_capacity: usize,
-        state: &[usize],
-        query: &[f32],
-        key_cache: &[f32],
-        value_cache: &[f32],
-        mut output: DisjointSlice<f32>,
-    ) {
-        let index = thread::index_1d();
-        let raw = index.get();
-        if let Some(value) = output.get_mut(index) {
+        #[kernel]
+        #[allow(clippy::too_many_arguments)]
+        pub fn gqa_decode_block_state(
+            heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            window: usize,
+            cache_capacity: usize,
+            state: &[usize],
+            query: &[f32],
+            key_cache: &[f32],
+            value_cache: &[f32],
+            mut output: DisjointSlice<f32>,
+        ) {
+            static mut PROBABILITIES: SharedArray<f32, 4096> = SharedArray::UNINIT;
+            static mut NORMALIZER: SharedArray<f32, 1> = SharedArray::UNINIT;
+            let head = thread::blockIdx_x() as usize;
+            let lane = thread::threadIdx_x() as usize;
+            if head >= heads {
+                return;
+            }
             let total_seen = state[1] + 1;
             let sequence = if total_seen < cache_capacity {
                 total_seen
@@ -1367,390 +1514,241 @@ pub(crate) mod kernels {
             } else {
                 0
             };
-            let head = raw / head_dim;
-            let dimension = raw % head_dim;
             let kv_head = head / (heads / kv_heads);
             let start = if window == 0 || sequence <= window {
                 0
             } else {
                 sequence - window
             };
-            let mut maximum = f32::NEG_INFINITY;
-            let mut position = start;
-            while position < sequence {
-                let physical = (cache_start + position) % cache_capacity;
-                let mut score = 0.0;
-                let mut inner = 0;
-                while inner < head_dim {
-                    score += query[head * head_dim + inner]
-                        * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
-                    inner += 1;
+            if lane == 0 {
+                let mut maximum = f32::NEG_INFINITY;
+                let mut position = start;
+                while position < sequence {
+                    let physical = (cache_start + position) % cache_capacity;
+                    let mut score = 0.0;
+                    let mut inner = 0;
+                    while inner < head_dim {
+                        score += query[head * head_dim + inner]
+                            * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
+                        inner += 1;
+                    }
+                    unsafe { PROBABILITIES[position - start] = score };
+                    if score > maximum {
+                        maximum = score;
+                    }
+                    position += 1;
                 }
-                if score > maximum {
-                    maximum = score;
+                let mut normalizer = 0.0;
+                position = start;
+                while position < sequence {
+                    let probability = core::intrinsics::expf32(
+                        unsafe { PROBABILITIES[position - start] } - maximum,
+                    );
+                    unsafe { PROBABILITIES[position - start] = probability };
+                    normalizer += probability;
+                    position += 1;
                 }
-                position += 1;
+                unsafe { NORMALIZER[0] = normalizer };
             }
-            let mut normalizer = 0.0;
-            let mut weighted = 0.0;
-            position = start;
-            while position < sequence {
-                let physical = (cache_start + position) % cache_capacity;
-                let mut score = 0.0;
-                let mut inner = 0;
-                while inner < head_dim {
-                    score += query[head * head_dim + inner]
-                        * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
-                    inner += 1;
+            thread::sync_threads();
+            let normalizer = unsafe { NORMALIZER[0] };
+            let mut dimension = lane;
+            while dimension < head_dim {
+                let mut weighted = 0.0;
+                let mut position = start;
+                while position < sequence {
+                    let physical = (cache_start + position) % cache_capacity;
+                    weighted += unsafe { PROBABILITIES[position - start] }
+                        * value_cache[(physical * kv_heads + kv_head) * head_dim + dimension];
+                    position += 1;
                 }
-                let probability = core::intrinsics::expf32(score - maximum);
-                normalizer += probability;
-                weighted += probability
-                    * value_cache[(physical * kv_heads + kv_head) * head_dim + dimension];
-                position += 1;
-            }
-            *value = weighted / normalizer;
-        }
-    }
-
-    /// Single-query GQA specialized for decode. Attention scores are computed
-    /// once per head and shared by all head dimensions, instead of recomputing
-    /// the same dot product twice for every output element.
-    #[kernel]
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemma_gqa_decode_block(
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        sequence: usize,
-        window: usize,
-        cache_start: usize,
-        cache_capacity: usize,
-        query: &[f32],
-        key_cache: &[f32],
-        value_cache: &[f32],
-        mut output: DisjointSlice<f32>,
-    ) {
-        static mut PROBABILITIES: SharedArray<f32, 4096> = SharedArray::UNINIT;
-        static mut NORMALIZER: SharedArray<f32, 1> = SharedArray::UNINIT;
-        let head = thread::blockIdx_x() as usize;
-        let lane = thread::threadIdx_x() as usize;
-        if head >= heads {
-            return;
-        }
-        let kv_head = head / (heads / kv_heads);
-        let start = if window == 0 || sequence <= window {
-            0
-        } else {
-            sequence - window
-        };
-        if lane == 0 {
-            let mut maximum = f32::NEG_INFINITY;
-            let mut position = start;
-            while position < sequence {
-                let physical = (cache_start + position) % cache_capacity;
-                let mut score = 0.0;
-                let mut inner = 0;
-                while inner < head_dim {
-                    score += query[head * head_dim + inner]
-                        * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
-                    inner += 1;
-                }
-                unsafe { PROBABILITIES[position - start] = score };
-                if score > maximum {
-                    maximum = score;
-                }
-                position += 1;
-            }
-            let mut normalizer = 0.0;
-            position = start;
-            while position < sequence {
-                let probability =
-                    core::intrinsics::expf32(unsafe { PROBABILITIES[position - start] } - maximum);
-                unsafe { PROBABILITIES[position - start] = probability };
-                normalizer += probability;
-                position += 1;
-            }
-            unsafe { NORMALIZER[0] = normalizer };
-        }
-        thread::sync_threads();
-        let normalizer = unsafe { NORMALIZER[0] };
-        let mut dimension = lane;
-        while dimension < head_dim {
-            let mut weighted = 0.0;
-            let mut position = start;
-            while position < sequence {
-                let physical = (cache_start + position) % cache_capacity;
-                weighted += unsafe { PROBABILITIES[position - start] }
-                    * value_cache[(physical * kv_heads + kv_head) * head_dim + dimension];
-                position += 1;
-            }
-            unsafe {
-                *output.get_unchecked_mut(head * head_dim + dimension) = weighted / normalizer
-            };
-            dimension += 256;
-        }
-    }
-
-    #[kernel]
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemma_gqa_decode_block_state(
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        window: usize,
-        cache_capacity: usize,
-        state: &[usize],
-        query: &[f32],
-        key_cache: &[f32],
-        value_cache: &[f32],
-        mut output: DisjointSlice<f32>,
-    ) {
-        static mut PROBABILITIES: SharedArray<f32, 4096> = SharedArray::UNINIT;
-        static mut NORMALIZER: SharedArray<f32, 1> = SharedArray::UNINIT;
-        let head = thread::blockIdx_x() as usize;
-        let lane = thread::threadIdx_x() as usize;
-        if head >= heads {
-            return;
-        }
-        let total_seen = state[1] + 1;
-        let sequence = if total_seen < cache_capacity {
-            total_seen
-        } else {
-            cache_capacity
-        };
-        let cache_start = if total_seen > cache_capacity {
-            total_seen % cache_capacity
-        } else {
-            0
-        };
-        let kv_head = head / (heads / kv_heads);
-        let start = if window == 0 || sequence <= window {
-            0
-        } else {
-            sequence - window
-        };
-        if lane == 0 {
-            let mut maximum = f32::NEG_INFINITY;
-            let mut position = start;
-            while position < sequence {
-                let physical = (cache_start + position) % cache_capacity;
-                let mut score = 0.0;
-                let mut inner = 0;
-                while inner < head_dim {
-                    score += query[head * head_dim + inner]
-                        * key_cache[(physical * kv_heads + kv_head) * head_dim + inner];
-                    inner += 1;
-                }
-                unsafe { PROBABILITIES[position - start] = score };
-                if score > maximum {
-                    maximum = score;
-                }
-                position += 1;
-            }
-            let mut normalizer = 0.0;
-            position = start;
-            while position < sequence {
-                let probability =
-                    core::intrinsics::expf32(unsafe { PROBABILITIES[position - start] } - maximum);
-                unsafe { PROBABILITIES[position - start] = probability };
-                normalizer += probability;
-                position += 1;
-            }
-            unsafe { NORMALIZER[0] = normalizer };
-        }
-        thread::sync_threads();
-        let normalizer = unsafe { NORMALIZER[0] };
-        let mut dimension = lane;
-        while dimension < head_dim {
-            let mut weighted = 0.0;
-            let mut position = start;
-            while position < sequence {
-                let physical = (cache_start + position) % cache_capacity;
-                weighted += unsafe { PROBABILITIES[position - start] }
-                    * value_cache[(physical * kv_heads + kv_head) * head_dim + dimension];
-                position += 1;
-            }
-            unsafe {
-                *output.get_unchecked_mut(head * head_dim + dimension) = weighted / normalizer
-            };
-            dimension += 256;
-        }
-    }
-
-    /// Causal GQA for a complete prompt resident in a contiguous KV cache.
-    /// Each block owns one `(token, query_head)` pair and shares its attention
-    /// probabilities across all dimensions of that head.
-    #[kernel]
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemma_gqa_prefill_block(
-        rows: usize,
-        heads: usize,
-        kv_heads: usize,
-        head_dim: usize,
-        window: usize,
-        query: &[f32],
-        key_cache: &[f32],
-        value_cache: &[f32],
-        mut output: DisjointSlice<f32>,
-    ) {
-        static mut PROBABILITIES: SharedArray<f32, 4096> = SharedArray::UNINIT;
-        static mut NORMALIZER: SharedArray<f32, 1> = SharedArray::UNINIT;
-        let block = thread::blockIdx_x() as usize;
-        let lane = thread::threadIdx_x() as usize;
-        let row = block / heads;
-        let head = block % heads;
-        if row >= rows {
-            return;
-        }
-        let visible = row + 1;
-        let start = if window == 0 || visible <= window {
-            0
-        } else {
-            visible - window
-        };
-        let kv_head = head / (heads / kv_heads);
-        if lane == 0 {
-            let mut maximum = f32::NEG_INFINITY;
-            let mut position = start;
-            while position < visible {
-                let mut score = 0.0;
-                let mut inner = 0;
-                while inner < head_dim {
-                    score += query[(row * heads + head) * head_dim + inner]
-                        * key_cache[(position * kv_heads + kv_head) * head_dim + inner];
-                    inner += 1;
-                }
-                unsafe { PROBABILITIES[position - start] = score };
-                if score > maximum {
-                    maximum = score;
-                }
-                position += 1;
-            }
-            let mut normalizer = 0.0;
-            position = start;
-            while position < visible {
-                let probability =
-                    core::intrinsics::expf32(unsafe { PROBABILITIES[position - start] } - maximum);
-                unsafe { PROBABILITIES[position - start] = probability };
-                normalizer += probability;
-                position += 1;
-            }
-            unsafe { NORMALIZER[0] = normalizer };
-        }
-        thread::sync_threads();
-        let normalizer = unsafe { NORMALIZER[0] };
-        let mut dimension = lane;
-        while dimension < head_dim {
-            let mut weighted = 0.0;
-            let mut position = start;
-            while position < visible {
-                weighted += unsafe { PROBABILITIES[position - start] }
-                    * value_cache[(position * kv_heads + kv_head) * head_dim + dimension];
-                position += 1;
-            }
-            unsafe {
-                *output.get_unchecked_mut((row * heads + head) * head_dim + dimension) =
-                    weighted / normalizer
-            };
-            dimension += 256;
-        }
-    }
-
-    #[kernel]
-    pub fn gemma_mark_seen(token: usize, mut seen: DisjointSlice<u8>) {
-        if thread::index_1d().get() == 0 && token < seen.len() {
-            unsafe { *seen.get_unchecked_mut(token) = 1 };
-        }
-    }
-
-    /// Produces sorted local top-k lists, one list per 256-logit block.
-    #[kernel]
-    pub fn gemma_topk_stage1(
-        top_k: usize,
-        repetition_penalty: f32,
-        logits: &[f32],
-        seen: &[u8],
-        mut scores: DisjointSlice<f32>,
-        mut ids: DisjointSlice<f32>,
-    ) {
-        if thread::threadIdx_x() != 0 {
-            return;
-        }
-        let block = thread::blockIdx_x() as usize;
-        let mut best_scores = [f32::NEG_INFINITY; 64];
-        let mut best_ids = [0_u32; 64];
-        let start = block * 256;
-        let end = (start + 256).min(logits.len());
-        let mut index = start;
-        while index < end {
-            let mut score = logits[index];
-            if seen[index] != 0 && repetition_penalty > 1.0 {
-                score = if score >= 0.0 {
-                    score / repetition_penalty
-                } else {
-                    score * repetition_penalty
+                unsafe {
+                    *output.get_unchecked_mut(head * head_dim + dimension) = weighted / normalizer
                 };
+                dimension += 256;
             }
-            if score == score && score > best_scores[top_k - 1] {
-                let mut position = top_k - 1;
-                while position > 0 && score > best_scores[position - 1] {
-                    best_scores[position] = best_scores[position - 1];
-                    best_ids[position] = best_ids[position - 1];
-                    position -= 1;
-                }
-                best_scores[position] = score;
-                best_ids[position] = index as u32;
-            }
-            index += 1;
         }
-        let mut rank = 0;
-        while rank < top_k {
-            let output_index = block * top_k + rank;
-            unsafe {
-                *scores.get_unchecked_mut(output_index) = best_scores[rank];
-                *ids.get_unchecked_mut(output_index) = best_ids[rank] as f32;
+
+        /// Causal GQA for a complete prompt resident in a contiguous KV cache.
+        /// Each block owns one `(token, query_head)` pair and shares its attention
+        /// probabilities across all dimensions of that head.
+        #[kernel]
+        #[allow(clippy::too_many_arguments)]
+        pub fn gqa_prefill_block(
+            rows: usize,
+            heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            window: usize,
+            query: &[f32],
+            key_cache: &[f32],
+            value_cache: &[f32],
+            mut output: DisjointSlice<f32>,
+        ) {
+            static mut PROBABILITIES: SharedArray<f32, 4096> = SharedArray::UNINIT;
+            static mut NORMALIZER: SharedArray<f32, 1> = SharedArray::UNINIT;
+            let block = thread::blockIdx_x() as usize;
+            let lane = thread::threadIdx_x() as usize;
+            let row = block / heads;
+            let head = block % heads;
+            if row >= rows {
+                return;
             }
-            rank += 1;
+            let visible = row + 1;
+            let start = if window == 0 || visible <= window {
+                0
+            } else {
+                visible - window
+            };
+            let kv_head = head / (heads / kv_heads);
+            if lane == 0 {
+                let mut maximum = f32::NEG_INFINITY;
+                let mut position = start;
+                while position < visible {
+                    let mut score = 0.0;
+                    let mut inner = 0;
+                    while inner < head_dim {
+                        score += query[(row * heads + head) * head_dim + inner]
+                            * key_cache[(position * kv_heads + kv_head) * head_dim + inner];
+                        inner += 1;
+                    }
+                    unsafe { PROBABILITIES[position - start] = score };
+                    if score > maximum {
+                        maximum = score;
+                    }
+                    position += 1;
+                }
+                let mut normalizer = 0.0;
+                position = start;
+                while position < visible {
+                    let probability = core::intrinsics::expf32(
+                        unsafe { PROBABILITIES[position - start] } - maximum,
+                    );
+                    unsafe { PROBABILITIES[position - start] = probability };
+                    normalizer += probability;
+                    position += 1;
+                }
+                unsafe { NORMALIZER[0] = normalizer };
+            }
+            thread::sync_threads();
+            let normalizer = unsafe { NORMALIZER[0] };
+            let mut dimension = lane;
+            while dimension < head_dim {
+                let mut weighted = 0.0;
+                let mut position = start;
+                while position < visible {
+                    weighted += unsafe { PROBABILITIES[position - start] }
+                        * value_cache[(position * kv_heads + kv_head) * head_dim + dimension];
+                    position += 1;
+                }
+                unsafe {
+                    *output.get_unchecked_mut((row * heads + head) * head_dim + dimension) =
+                        weighted / normalizer
+                };
+                dimension += 256;
+            }
         }
     }
 
-    /// Merges the block-local lists into the final global top-k list.
-    #[kernel]
-    pub fn gemma_topk_stage2(
-        top_k: usize,
-        input_scores: &[f32],
-        input_ids: &[f32],
-        mut scores: DisjointSlice<f32>,
-        mut ids: DisjointSlice<f32>,
-    ) {
-        if thread::index_1d().get() != 0 {
-            return;
+    /// Model-independent token sampling kernels.
+    pub(crate) mod sampling {
+        use super::*;
+
+        #[kernel]
+        pub fn mark_seen(token: usize, mut seen: DisjointSlice<u8>) {
+            if thread::index_1d().get() == 0 && token < seen.len() {
+                unsafe { *seen.get_unchecked_mut(token) = 1 };
+            }
         }
-        let mut best_scores = [f32::NEG_INFINITY; 64];
-        let mut best_ids = [0_u32; 64];
-        let mut index = 0;
-        while index < input_scores.len() {
-            let score = input_scores[index];
-            if score > best_scores[top_k - 1] {
-                let mut position = top_k - 1;
-                while position > 0 && score > best_scores[position - 1] {
-                    best_scores[position] = best_scores[position - 1];
-                    best_ids[position] = best_ids[position - 1];
-                    position -= 1;
+
+        /// Produces sorted local top-k lists, one list per 256-logit block.
+        #[kernel]
+        pub fn topk_stage1(
+            top_k: usize,
+            repetition_penalty: f32,
+            logits: &[f32],
+            seen: &[u8],
+            mut scores: DisjointSlice<f32>,
+            mut ids: DisjointSlice<f32>,
+        ) {
+            if thread::threadIdx_x() != 0 {
+                return;
+            }
+            let block = thread::blockIdx_x() as usize;
+            let mut best_scores = [f32::NEG_INFINITY; 64];
+            let mut best_ids = [0_u32; 64];
+            let start = block * 256;
+            let end = (start + 256).min(logits.len());
+            let mut index = start;
+            while index < end {
+                let mut score = logits[index];
+                if seen[index] != 0 && repetition_penalty > 1.0 {
+                    score = if score >= 0.0 {
+                        score / repetition_penalty
+                    } else {
+                        score * repetition_penalty
+                    };
                 }
-                best_scores[position] = score;
-                best_ids[position] = input_ids[index] as u32;
+                if score == score && score > best_scores[top_k - 1] {
+                    let mut position = top_k - 1;
+                    while position > 0 && score > best_scores[position - 1] {
+                        best_scores[position] = best_scores[position - 1];
+                        best_ids[position] = best_ids[position - 1];
+                        position -= 1;
+                    }
+                    best_scores[position] = score;
+                    best_ids[position] = index as u32;
+                }
+                index += 1;
             }
-            index += 1;
+            let mut rank = 0;
+            while rank < top_k {
+                let output_index = block * top_k + rank;
+                unsafe {
+                    *scores.get_unchecked_mut(output_index) = best_scores[rank];
+                    *ids.get_unchecked_mut(output_index) = best_ids[rank] as f32;
+                }
+                rank += 1;
+            }
         }
-        let mut rank = 0;
-        while rank < top_k {
-            unsafe {
-                *scores.get_unchecked_mut(rank) = best_scores[rank];
-                *ids.get_unchecked_mut(rank) = best_ids[rank] as f32;
+
+        /// Merges the block-local lists into the final global top-k list.
+        #[kernel]
+        pub fn topk_stage2(
+            top_k: usize,
+            input_scores: &[f32],
+            input_ids: &[f32],
+            mut scores: DisjointSlice<f32>,
+            mut ids: DisjointSlice<f32>,
+        ) {
+            if thread::index_1d().get() != 0 {
+                return;
             }
-            rank += 1;
+            let mut best_scores = [f32::NEG_INFINITY; 64];
+            let mut best_ids = [0_u32; 64];
+            let mut index = 0;
+            while index < input_scores.len() {
+                let score = input_scores[index];
+                if score > best_scores[top_k - 1] {
+                    let mut position = top_k - 1;
+                    while position > 0 && score > best_scores[position - 1] {
+                        best_scores[position] = best_scores[position - 1];
+                        best_ids[position] = best_ids[position - 1];
+                        position -= 1;
+                    }
+                    best_scores[position] = score;
+                    best_ids[position] = input_ids[index] as u32;
+                }
+                index += 1;
+            }
+            let mut rank = 0;
+            while rank < top_k {
+                unsafe {
+                    *scores.get_unchecked_mut(rank) = best_scores[rank];
+                    *ids.get_unchecked_mut(rank) = best_ids[rank] as f32;
+                }
+                rank += 1;
+            }
         }
     }
 }

@@ -276,7 +276,7 @@ impl Gemma4CudaState {
                 ));
             }
             unsafe {
-                self.module.gemma_cache_write(
+                self.inference.cache_write_f32(
                     &self.stream,
                     Self::launch_config(rows * width)?,
                     0,
@@ -286,7 +286,7 @@ impl Gemma4CudaState {
             }
             .map_err(cuda_error)?;
             unsafe {
-                self.module.gemma_cache_write(
+                self.inference.cache_write_f32(
                     &self.stream,
                     Self::launch_config(rows * width)?,
                     0,
@@ -557,7 +557,7 @@ impl Gemma4CudaState {
             let mut stage_scores = self.output_f32(candidates)?;
             let mut stage_ids = self.output_f32(candidates)?;
             unsafe {
-                self.module.gemma_topk_stage1(
+                self.sampling.topk_stage1(
                     &self.stream,
                     LaunchConfig {
                         grid_dim: (blocks as u32, 1, 1),
@@ -574,7 +574,7 @@ impl Gemma4CudaState {
             }
             .map_err(cuda_error)?;
             unsafe {
-                self.module.gemma_topk_stage2(
+                self.sampling.topk_stage2(
                     &self.stream,
                     Self::launch_config(1)?,
                     top_k,
@@ -626,7 +626,7 @@ impl Gemma4CudaState {
             .as_ref()
             .ok_or_else(|| Error::Execution("CUDA decode graph is missing".into()))?;
         unsafe {
-            self.module.gemma_decode_state_update(
+            self.inference.decode_state_update(
                 &self.stream,
                 Self::launch_config(1)?,
                 token as usize,
@@ -697,12 +697,8 @@ impl Gemma4CudaState {
         }
         if mark_seen {
             unsafe {
-                self.module.gemma_mark_seen(
-                    &self.stream,
-                    Self::launch_config(1)?,
-                    token as usize,
-                    seen,
-                )
+                self.module
+                    .mark_seen(&self.stream, Self::launch_config(1)?, token as usize, seen)
             }
             .map_err(cuda_error)?;
         }
@@ -712,7 +708,7 @@ impl Gemma4CudaState {
         let mut stage_scores = self.output_f32(candidates)?;
         let mut stage_ids = self.output_f32(candidates)?;
         unsafe {
-            self.module.gemma_topk_stage1(
+            self.sampling.topk_stage1(
                 &self.stream,
                 LaunchConfig {
                     grid_dim: (blocks as u32, 1, 1),
@@ -731,7 +727,7 @@ impl Gemma4CudaState {
         let mut final_scores = self.output_f32(top_k)?;
         let mut final_ids = self.output_f32(top_k)?;
         unsafe {
-            self.module.gemma_topk_stage2(
+            self.sampling.topk_stage2(
                 &self.stream,
                 Self::launch_config(1)?,
                 top_k,

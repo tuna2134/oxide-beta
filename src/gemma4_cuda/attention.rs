@@ -20,7 +20,7 @@ impl Gemma4CudaState {
         let scale = (hidden_size as f32).sqrt();
         // SAFETY: bounds and output extent were validated above.
         unsafe {
-            self.module.gemma_bf16_to_f32_scaled(
+            self.inference.bf16_to_f32_scaled(
                 &self.stream,
                 Self::launch_config(hidden_size)?,
                 token * hidden_size,
@@ -39,7 +39,7 @@ impl Gemma4CudaState {
         table: &mut Gemma4CudaCacheTable,
     ) -> Result<()> {
         unsafe {
-            self.module.gemma_decode_state_set(
+            self.inference.decode_state_set(
                 &self.stream,
                 Self::launch_config(1)?,
                 token as usize,
@@ -65,7 +65,7 @@ impl Gemma4CudaState {
         #[allow(clippy::cast_precision_loss)]
         let scale = (hidden_size as f32).sqrt();
         unsafe {
-            self.module.gemma_bf16_row_scaled_state(
+            self.inference.bf16_row_scaled_state(
                 &self.stream,
                 Self::launch_config(hidden_size)?,
                 hidden_size,
@@ -101,7 +101,7 @@ impl Gemma4CudaState {
         #[allow(clippy::cast_precision_loss)]
         let scale = (hidden_size as f32).sqrt();
         unsafe {
-            self.module.gemma_embedding_rows(
+            self.inference.embedding_rows_bf16(
                 &self.stream,
                 Self::launch_config(hidden.len())?,
                 hidden_size,
@@ -119,7 +119,7 @@ impl Gemma4CudaState {
         let mut output = self.output_bf16(input.len())?;
         // SAFETY: input/output have equal lengths and are disjoint.
         unsafe {
-            self.module.gemma_f32_to_bf16(
+            self.inference.f32_to_bf16(
                 &self.stream,
                 Self::launch_config(input.len())?,
                 input,
@@ -151,7 +151,7 @@ impl Gemma4CudaState {
         // SAFETY: the kernel indexes weight by column modulo `hidden`; input
         // consists of complete rows and output has the same extent.
         unsafe {
-            self.module.gemma_rms_norm(
+            self.inference.rms_norm(
                 &self.stream,
                 Self::row_launch_config(input.len() / hidden)?,
                 hidden,
@@ -184,7 +184,7 @@ impl Gemma4CudaState {
         }
         let mut output = self.output_f32(input.len())?;
         unsafe {
-            self.module.gemma_rms_norm(
+            self.inference.rms_norm(
                 &self.stream,
                 Self::row_launch_config(input.len() / hidden)?,
                 hidden,
@@ -217,7 +217,7 @@ impl Gemma4CudaState {
         }
         let mut output = self.output_bf16(input.len())?;
         unsafe {
-            self.module.gemma_rms_norm_bf16(
+            self.inference.rms_norm_bf16(
                 &self.stream,
                 Self::row_launch_config(input.len() / hidden)?,
                 hidden,
@@ -250,7 +250,7 @@ impl Gemma4CudaState {
         }
         let mut output = self.output_bf16(input.len())?;
         unsafe {
-            self.module.gemma_rms_norm_bf16(
+            self.inference.rms_norm_bf16(
                 &self.stream,
                 Self::row_launch_config(input.len() / hidden)?,
                 hidden,
@@ -277,7 +277,7 @@ impl Gemma4CudaState {
         // SAFETY: input consists of complete rows of width `hidden` and
         // output has the same extent.
         unsafe {
-            self.module.gemma_rms_norm_unit(
+            self.inference.rms_norm_unit(
                 &self.stream,
                 Self::row_launch_config(input.len() / hidden)?,
                 hidden,
@@ -307,7 +307,7 @@ impl Gemma4CudaState {
         // SAFETY: the input contains complete `[heads, head_dim]` rows and
         // output has an identical extent.
         unsafe {
-            self.module.gemma_rope(
+            self.gemma4.rope(
                 &self.stream,
                 Self::launch_config(input.len())?,
                 heads,
@@ -340,7 +340,7 @@ impl Gemma4CudaState {
         }
         let mut output = self.output_f32(input.len())?;
         unsafe {
-            self.module.gemma_rope_state(
+            self.gemma4.rope_state(
                 &self.stream,
                 Self::launch_config(input.len())?,
                 heads,
@@ -393,7 +393,7 @@ impl Gemma4CudaState {
         };
         unsafe {
             if sequence <= 4096 {
-                self.module.gemma_gqa_decode_block(
+                self.gemma4.gqa_decode_block(
                     &self.stream,
                     config,
                     heads,
@@ -409,7 +409,7 @@ impl Gemma4CudaState {
                     &mut output,
                 )
             } else {
-                self.module.gemma_gqa_decode(
+                self.gemma4.gqa_decode(
                     &self.stream,
                     config,
                     heads,
@@ -455,7 +455,7 @@ impl Gemma4CudaState {
         let mut output = self.output_f32(query.len())?;
         unsafe {
             if use_block {
-                self.module.gemma_gqa_decode_block_state(
+                self.gemma4.gqa_decode_block_state(
                     &self.stream,
                     LaunchConfig {
                         grid_dim: (heads as u32, 1, 1),
@@ -474,7 +474,7 @@ impl Gemma4CudaState {
                     &mut output,
                 )
             } else {
-                self.module.gemma_gqa_decode_state(
+                self.gemma4.gqa_decode_state(
                     &self.stream,
                     Self::launch_config(query.len())?,
                     heads,
@@ -521,7 +521,7 @@ impl Gemma4CudaState {
             .ok_or_else(|| Error::InvalidShape("prefill GQA grid overflow".into()))?;
         let mut output = self.output_f32(query.len())?;
         unsafe {
-            self.module.gemma_gqa_prefill_block(
+            self.gemma4.gqa_prefill_block(
                 &self.stream,
                 LaunchConfig {
                     grid_dim: (blocks, 1, 1),

@@ -164,6 +164,9 @@ pub struct Gemma4CudaState {
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) cublas: Cublas,
     module: crate::cuda::kernels::LoadedModule,
+    inference: crate::cuda::kernels::inference::LoadedModule,
+    gemma4: crate::cuda::kernels::gemma4::LoadedModule,
+    sampling: crate::cuda::kernels::sampling::LoadedModule,
     weights: Vec<CudaWeight>,
     weight_indices: HashMap<String, usize>,
     decode_plan: Vec<Gemma4DecodeLayerPlan>,
@@ -200,7 +203,7 @@ impl Gemma4CudaState {
         let mut value = self.output_f32(weight.buffer.len())?;
         // SAFETY: output has exactly the same extent as the BF16 weight.
         unsafe {
-            self.module.gemma_bf16_to_f32_scaled(
+            self.inference.bf16_to_f32_scaled(
                 &self.stream,
                 Self::launch_config(weight.buffer.len())?,
                 0,
@@ -221,6 +224,12 @@ impl Gemma4CudaState {
         let cublas = Cublas::new()?;
         cublas.bind_stream(&stream)?;
         let module = crate::cuda::kernels::load(&context).map_err(cuda_error)?;
+        let inference = crate::cuda::kernels::inference::LoadedModule::from_parent(&module)
+            .map_err(cuda_error)?;
+        let gemma4 =
+            crate::cuda::kernels::gemma4::LoadedModule::from_parent(&module).map_err(cuda_error)?;
+        let sampling = crate::cuda::kernels::sampling::LoadedModule::from_parent(&module)
+            .map_err(cuda_error)?;
         let names: Vec<_> = model
             .checkpoint_weight_names()
             .filter(|name| {
@@ -314,7 +323,7 @@ impl Gemma4CudaState {
                     .get(name)
                     .ok_or_else(|| Error::Execution(format!("missing CUDA weight `{name}`")))?;
                 unsafe {
-                    module.gemma_copy_bf16(
+                    inference.copy_bf16(
                         &stream,
                         Self::launch_config(weight.buffer.len())?,
                         offset,
@@ -441,6 +450,9 @@ impl Gemma4CudaState {
             stream,
             cublas,
             module,
+            inference,
+            gemma4,
+            sampling,
             weights,
             weight_indices,
             decode_plan,

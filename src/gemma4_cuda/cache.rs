@@ -113,7 +113,7 @@ impl Gemma4CudaState {
         // SAFETY: one complete cache position is in bounds and allocations
         // are disjoint.
         unsafe {
-            self.module.gemma_cache_write(
+            self.inference.cache_write_f32(
                 &self.stream,
                 Self::launch_config(width)?,
                 offset,
@@ -124,7 +124,7 @@ impl Gemma4CudaState {
         .map_err(cuda_error)?;
         // SAFETY: same invariant for the separate value allocation.
         unsafe {
-            self.module.gemma_cache_write(
+            self.inference.cache_write_f32(
                 &self.stream,
                 Self::launch_config(width)?,
                 offset,
@@ -156,7 +156,7 @@ impl Gemma4CudaState {
             ));
         }
         unsafe {
-            self.module.gemma_cache_write_state(
+            self.inference.cache_write_f32_state(
                 &self.stream,
                 Self::launch_config(width)?,
                 width,
@@ -168,7 +168,7 @@ impl Gemma4CudaState {
         }
         .map_err(cuda_error)?;
         unsafe {
-            self.module.gemma_cache_write_state(
+            self.inference.cache_write_f32_state(
                 &self.stream,
                 Self::launch_config(width)?,
                 width,

@@ -168,7 +168,7 @@ pub(super) fn gelu_mul(
     let mut output = self.output_f32(gate.len())?;
     // SAFETY: both inputs and output have equal extents and are disjoint.
     unsafe {
-        self.module.gemma_gelu_mul(
+        self.inference.gelu_mul_f32(
             &self.stream,
             Self::launch_config(gate.len())?,
             gate,
@@ -191,7 +191,7 @@ pub(super) fn add(
     let mut output = self.output_f32(left.len())?;
     // SAFETY: both inputs and output have equal extents and are disjoint.
     unsafe {
-        self.module.gemma_add(
+        self.module.add(
             &self.stream,
             Self::launch_config(left.len())?,
             left,
@@ -214,7 +214,7 @@ pub(super) fn mul(
     let mut output = self.output_f32(left.len())?;
     // SAFETY: equal extents and three disjoint allocations.
     unsafe {
-        self.module.gemma_mul(
+        self.module.mul(
             &self.stream,
             Self::launch_config(left.len())?,
             left,
@@ -230,7 +230,7 @@ pub(super) fn scale(&self, input: &DeviceBuffer<f32>, scale: f32) -> Result<Work
     let mut output = self.output_f32(input.len())?;
     // SAFETY: input/output extents match and allocations are disjoint.
     unsafe {
-        self.module.gemma_scale(
+        self.inference.scale_f32(
             &self.stream,
             Self::launch_config(input.len())?,
             scale,
@@ -255,7 +255,7 @@ pub(super) fn scale_by_weight_at(
     }
     let mut output = self.output_f32(input.len())?;
     unsafe {
-        self.module.gemma_mul_bf16_scalar(
+        self.inference.mul_bf16_scalar(
             &self.stream,
             Self::launch_config(input.len())?,
             input,
@@ -279,7 +279,7 @@ pub(super) fn slice(
     let mut output = self.output_f32(len)?;
     // SAFETY: the source range was checked and output has `len` elements.
     unsafe {
-        self.module.gemma_slice(
+        self.inference.slice_f32(
             &self.stream,
             Self::launch_config(len)?,
             offset,
@@ -311,7 +311,7 @@ pub(super) fn slice_rows(
     }
     let mut output = self.output_f32(rows * output_width)?;
     unsafe {
-        self.module.gemma_slice_rows(
+        self.inference.slice_rows_f32(
             &self.stream,
             Self::launch_config(output.len())?,
             input_width,
@@ -329,7 +329,7 @@ pub(super) fn gelu(&self, input: &DeviceBuffer<f32>) -> Result<WorkspaceF32> {
     let mut output = self.output_f32(input.len())?;
     // SAFETY: input/output extents match and allocations are disjoint.
     unsafe {
-        self.module.gemma_gelu(
+        self.inference.gelu_f32(
             &self.stream,
             Self::launch_config(input.len())?,
             input,

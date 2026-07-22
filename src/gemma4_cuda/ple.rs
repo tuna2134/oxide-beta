@@ -28,7 +28,7 @@ impl Gemma4CudaState {
         let token_scale = (dimension as f32).sqrt();
         // SAFETY: token row and packed output extent were validated.
         unsafe {
-            self.module.gemma_bf16_to_f32_scaled(
+            self.inference.bf16_to_f32_scaled(
                 &self.stream,
                 Self::launch_config(packed)?,
                 token * packed,
@@ -73,7 +73,7 @@ impl Gemma4CudaState {
         #[allow(clippy::cast_precision_loss)]
         let token_scale = (dimension as f32).sqrt();
         unsafe {
-            self.module.gemma_bf16_row_scaled_state(
+            self.inference.bf16_row_scaled_state(
                 &self.stream,
                 Self::launch_config(packed)?,
                 packed,
@@ -123,7 +123,7 @@ impl Gemma4CudaState {
         #[allow(clippy::cast_precision_loss)]
         let token_scale = (dimension as f32).sqrt();
         unsafe {
-            self.module.gemma_embedding_rows(
+            self.inference.embedding_rows_bf16(
                 &self.stream,
                 Self::launch_config(token_ple.len())?,
                 packed,
