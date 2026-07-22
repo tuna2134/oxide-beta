@@ -1,7 +1,7 @@
 use oxide_torch::{Error, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BertConfig {
     pub vocab_size: usize,

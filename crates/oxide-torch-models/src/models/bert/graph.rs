@@ -12,6 +12,8 @@ use oxide_torch::nn::{Module, Parameter, Trainable};
 use oxide_torch::safetensors::{LoadedTensor, SafeTensorLoader};
 use oxide_torch::transformer as ops;
 use oxide_torch::{Device, Error, Result, Tensor};
+use safetensors::tensor::TensorView;
+use safetensors::{Dtype, serialize_to_file};
 use std::{fs, path::Path};
 
 #[derive(Clone, Debug)]
@@ -349,6 +351,95 @@ impl BertForSequenceClassification {
             )?
         };
         Ok(Self { bert, classifier })
+    }
+
+    /// Saves the complete encoder and classification head as a SafeTensors checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if parameters cannot be copied to the host or files cannot be written.
+    pub fn save_pretrained(&self, directory: impl AsRef<Path>) -> Result<()> {
+        let directory = directory.as_ref();
+        fs::create_dir_all(directory).map_err(|error| {
+            Error::io(format!("failed to create {}", directory.display()), error)
+        })?;
+        let mut tensors = Vec::new();
+        self.push_named_parameters(&mut tensors)?;
+        let views = tensors
+            .iter()
+            .map(|(name, shape, bytes)| {
+                Ok((
+                    name.as_str(),
+                    TensorView::new(Dtype::F32, shape.clone(), bytes)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        serialize_to_file(views, None, &directory.join("model.safetensors"))?;
+        let config = serde_json::to_vec_pretty(&self.bert.config)
+            .map_err(|error| Error::json("failed to serialize BERT config", error))?;
+        fs::write(directory.join("config.json"), config).map_err(|error| {
+            Error::io(
+                format!("failed to write {}/config.json", directory.display()),
+                error,
+            )
+        })
+    }
+
+    fn push_named_parameters(
+        &self,
+        tensors: &mut Vec<(String, Vec<usize>, Vec<u8>)>,
+    ) -> Result<()> {
+        let mut push = |name: String, parameter: &Parameter| -> Result<()> {
+            let values = parameter.value().to_vec()?;
+            tensors.push((
+                name,
+                parameter.value().shape().to_vec(),
+                values.into_iter().flat_map(f32::to_le_bytes).collect(),
+            ));
+            Ok(())
+        };
+        push(
+            "bert.embeddings.word_embeddings.weight".into(),
+            &self.bert.word,
+        )?;
+        push(
+            "bert.embeddings.position_embeddings.weight".into(),
+            &self.bert.pos,
+        )?;
+        push(
+            "bert.embeddings.token_type_embeddings.weight".into(),
+            &self.bert.types,
+        )?;
+        push("bert.embeddings.LayerNorm.weight".into(), &self.bert.en.w)?;
+        push("bert.embeddings.LayerNorm.bias".into(), &self.bert.en.b)?;
+        for (index, layer) in self.bert.layers.iter().enumerate() {
+            let base = format!("bert.encoder.layer.{index}");
+            for (suffix, linear) in [
+                ("attention.self.query", &layer.q),
+                ("attention.self.key", &layer.k),
+                ("attention.self.value", &layer.v),
+                ("attention.output.dense", &layer.attn),
+                ("intermediate.dense", &layer.up),
+                ("output.dense", &layer.down),
+            ] {
+                push(format!("{base}.{suffix}.weight"), &linear.w)?;
+                push(format!("{base}.{suffix}.bias"), &linear.b)?;
+            }
+            push(
+                format!("{base}.attention.output.LayerNorm.weight"),
+                &layer.an.w,
+            )?;
+            push(
+                format!("{base}.attention.output.LayerNorm.bias"),
+                &layer.an.b,
+            )?;
+            push(format!("{base}.output.LayerNorm.weight"), &layer.on.w)?;
+            push(format!("{base}.output.LayerNorm.bias"), &layer.on.b)?;
+        }
+        push("bert.pooler.dense.weight".into(), &self.bert.pool.w)?;
+        push("bert.pooler.dense.bias".into(), &self.bert.pool.b)?;
+        push("classifier.weight".into(), &self.classifier.w)?;
+        push("classifier.bias".into(), &self.classifier.b)
     }
 }
 impl Module<BertInput> for BertForSequenceClassification {

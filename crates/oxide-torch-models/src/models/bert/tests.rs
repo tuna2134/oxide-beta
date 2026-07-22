@@ -120,6 +120,24 @@ fn missing_classification_head_is_initialized() {
     assert_eq!(&shapes[shapes.len() - 2..], &[vec![2, 4], vec![2]]);
 }
 
+#[test]
+fn saved_classification_checkpoint_round_trips() {
+    let source = tempfile::tempdir().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    write_tiny_checkpoint(source.path());
+    let model = BertForSequenceClassification::from_pretrained(source.path(), Device::Cpu).unwrap();
+    let input = BertInput::from_ids(&[vec![1, 2, 3]], None, None).unwrap();
+    let expected = model.forward(&input).unwrap().to_vec().unwrap();
+
+    model.save_pretrained(output.path()).unwrap();
+    let reloaded =
+        BertForSequenceClassification::from_pretrained(output.path(), Device::Cpu).unwrap();
+    assert_eq!(
+        reloaded.forward(&input).unwrap().to_vec().unwrap(),
+        expected
+    );
+}
+
 fn first_parameter_values(model: &BertForSequenceClassification) -> Vec<f32> {
     let mut result = None;
     model.visit_parameters(&mut |parameter| {

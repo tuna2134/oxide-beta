@@ -12,12 +12,23 @@ fn main() -> Result<()> {
     let directory = std::env::args_os().nth(1).ok_or_else(|| {
         Error::Execution(
             "usage: cargo run -p oxide-torch-models --example bert_finetune -- \
-             MODEL_DIR [--device cpu|cuda[:INDEX]]"
+             MODEL_DIR [--device cpu|cuda[:INDEX]] [--epochs N] [--output DIR]"
                 .into(),
         )
     })?;
     let mut arguments = std::env::args().skip(2).collect::<Vec<_>>();
     let device = bert_support::take_device(&mut arguments)?;
+    let epochs = take_value(&mut arguments, "--epochs")?.map_or(Ok(5), |value| {
+        value
+            .parse::<usize>()
+            .map_err(|error| Error::Execution(format!("invalid --epochs value `{value}`: {error}")))
+    })?;
+    if epochs == 0 {
+        return Err(Error::Execution(
+            "--epochs must be greater than zero".into(),
+        ));
+    }
+    let output = take_value(&mut arguments, "--output")?;
     if !arguments.is_empty() {
         return Err(Error::Execution(format!(
             "unexpected arguments: {}",
@@ -56,7 +67,7 @@ fn main() -> Result<()> {
     let input = BertInput::from_ids(&encoded, Some(&masks), None)?.to(device);
     let mut optimizer = AdamW::new(2e-4, 0.01)?;
 
-    for epoch in 1..=5 {
+    for epoch in 1..=epochs {
         optimizer.zero_grad(&model)?;
         let logits = model.forward(&input)?;
         let loss = cross_entropy(&logits, &labels)?;
@@ -64,5 +75,26 @@ fn main() -> Result<()> {
         optimizer.step(&mut model)?;
         println!("device={device:?} epoch={epoch} loss={:.5}", loss.item()?);
     }
+    if let Some(output) = output {
+        model.save_pretrained(&output)?;
+        std::fs::copy(
+            std::path::Path::new(&directory).join("tokenizer.json"),
+            std::path::Path::new(&output).join("tokenizer.json"),
+        )
+        .map_err(|error| Error::io("failed to copy tokenizer.json", error))?;
+        println!("saved model to {output}");
+    }
     Ok(())
+}
+
+fn take_value(arguments: &mut Vec<String>, flag: &str) -> Result<Option<String>> {
+    let Some(index) = arguments.iter().position(|argument| argument == flag) else {
+        return Ok(None);
+    };
+    if index + 1 == arguments.len() {
+        return Err(Error::Execution(format!("{flag} requires a value")));
+    }
+    let value = arguments.remove(index + 1);
+    arguments.remove(index);
+    Ok(Some(value))
 }
