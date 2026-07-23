@@ -14,7 +14,7 @@ cuda = ["dep:cuda-core", "dep:cuda-device", "dep:cuda-host", "dep:libloading"]
 cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "2b1269964beaeab789a1512d0089fe42d9336e14", optional = true }
 cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "2b1269964beaeab789a1512d0089fe42d9336e14", optional = true }
 cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "2b1269964beaeab789a1512d0089fe42d9336e14", optional = true }
-libloading = { version = "0.8", optional = true }
+libloading = { version = "0.9", optional = true }
 thiserror = "2"
 
 [lints.rust]

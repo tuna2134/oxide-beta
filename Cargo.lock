@@ -125,7 +125,7 @@ checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
 dependencies = [
  "glob",
  "libc",
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -554,11 +554,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libnvvm-sys"
 version = "0.2.1"
 source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14#2b1269964beaeab789a1512d0089fe42d9336e14"
 dependencies = [
- "libloading",
+ "libloading 0.8.9",
  "thiserror",
 ]
 
@@ -648,7 +658,7 @@ name = "nvjitlink-sys"
 version = "0.2.1"
 source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14#2b1269964beaeab789a1512d0089fe42d9336e14"
 dependencies = [
- "libloading",
+ "libloading 0.8.9",
  "thiserror",
 ]
 
@@ -699,7 +709,7 @@ dependencies = [
  "cuda-core",
  "cuda-device",
  "cuda-host",
- "libloading",
+ "libloading 0.9.0",
  "thiserror",
 ]
 
