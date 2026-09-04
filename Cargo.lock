@@ -256,9 +256,9 @@ dependencies = [
 [[package]]
 name = "cuda-device"
 version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14#2b1269964beaeab789a1512d0089fe42d9336e14"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=8ac82ec761e950594db5f47322330b231f3d80be#8ac82ec761e950594db5f47322330b231f3d80be"
 dependencies = [
- "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
+ "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=8ac82ec761e950594db5f47322330b231f3d80be)",
 ]
 
 [[package]]
@@ -293,6 +293,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "reserved-oxide-symbols 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2db97134d9a3a79fe71c211e65a616dacdf03235)",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "cuda-macros"
+version = "0.2.1"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=8ac82ec761e950594db5f47322330b231f3d80be#8ac82ec761e950594db5f47322330b231f3d80be"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "reserved-oxide-symbols 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=8ac82ec761e950594db5f47322330b231f3d80be)",
  "syn 2.0.119",
 ]
 
@@ -909,6 +920,11 @@ source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a15
 name = "reserved-oxide-symbols"
 version = "0.2.1"
 source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2db97134d9a3a79fe71c211e65a616dacdf03235#2db97134d9a3a79fe71c211e65a616dacdf03235"
+
+[[package]]
+name = "reserved-oxide-symbols"
+version = "0.2.1"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=8ac82ec761e950594db5f47322330b231f3d80be#8ac82ec761e950594db5f47322330b231f3d80be"
 
 [[package]]
 name = "rustc-hash"
