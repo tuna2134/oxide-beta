@@ -256,9 +256,9 @@ dependencies = [
 [[package]]
 name = "cuda-device"
 version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14#2b1269964beaeab789a1512d0089fe42d9336e14"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=26754ae52c26c097dc1c465a1e42c4c5d05a3d40#26754ae52c26c097dc1c465a1e42c4c5d05a3d40"
 dependencies = [
- "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
+ "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=26754ae52c26c097dc1c465a1e42c4c5d05a3d40)",
 ]
 
 [[package]]
@@ -272,6 +272,17 @@ dependencies = [
  "half",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "cuda-macros"
+version = "0.2.1"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=26754ae52c26c097dc1c465a1e42c4c5d05a3d40#26754ae52c26c097dc1c465a1e42c4c5d05a3d40"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "reserved-oxide-symbols 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=26754ae52c26c097dc1c465a1e42c4c5d05a3d40)",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -899,6 +910,11 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "reserved-oxide-symbols"
+version = "0.2.1"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=26754ae52c26c097dc1c465a1e42c4c5d05a3d40#26754ae52c26c097dc1c465a1e42c4c5d05a3d40"
 
 [[package]]
 name = "reserved-oxide-symbols"
