@@ -18,7 +18,7 @@ cudnn = ["cuda", "oxide-torch/cudnn"]
 [dependencies]
 oxide-torch = { path = "../oxide-torch", default-features = false }
 oxide-torch-cuda = { path = "../oxide-torch-cuda", features = ["cuda"], optional = true }
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "2b1269964beaeab789a1512d0089fe42d9336e14", optional = true }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b9847e9515ed3a23096f22567d3eaf0a6e3e440c", optional = true }
 safetensors = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
