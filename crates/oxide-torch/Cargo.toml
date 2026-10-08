@@ -12,7 +12,7 @@ cuda = ["dep:cuda-core", "dep:oxide-torch-cuda"]
 cudnn = ["cuda"]
 
 [dependencies]
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "2b1269964beaeab789a1512d0089fe42d9336e14", optional = true }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "a73ec6ef7fe2922c93f5d1e1f2e3de67c891a760", optional = true }
 oxide-torch-cuda = { path = "../oxide-torch-cuda", features = ["cuda"], optional = true }
 half = "2.6"
 memmap2 = "0.9"
