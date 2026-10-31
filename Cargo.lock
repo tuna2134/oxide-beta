@@ -94,6 +94,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bytemuck"
+version = "1.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -255,10 +261,12 @@ dependencies = [
 
 [[package]]
 name = "cuda-device"
-version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14#2b1269964beaeab789a1512d0089fe42d9336e14"
+version = "0.3.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2718c23fa90109c675a35204b9ab5f37bd0fa65b#2718c23fa90109c675a35204b9ab5f37bd0fa65b"
 dependencies = [
- "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
+ "bytemuck",
+ "cuda-macros 0.3.0",
+ "cuda-repr",
 ]
 
 [[package]]
@@ -295,6 +303,23 @@ dependencies = [
  "reserved-oxide-symbols 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2db97134d9a3a79fe71c211e65a616dacdf03235)",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "cuda-macros"
+version = "0.3.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2718c23fa90109c675a35204b9ab5f37bd0fa65b#2718c23fa90109c675a35204b9ab5f37bd0fa65b"
+dependencies = [
+ "oxide-tile-export",
+ "proc-macro2",
+ "quote",
+ "reserved-oxide-symbols 0.3.0",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "cuda-repr"
+version = "0.5.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2718c23fa90109c675a35204b9ab5f37bd0fa65b#2718c23fa90109c675a35204b9ab5f37bd0fa65b"
 
 [[package]]
 name = "daachorse"
@@ -718,6 +743,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxide-tile-export"
+version = "0.3.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2718c23fa90109c675a35204b9ab5f37bd0fa65b#2718c23fa90109c675a35204b9ab5f37bd0fa65b"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "oxide-torch"
 version = "0.1.0"
 dependencies = [
@@ -909,6 +944,11 @@ source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a15
 name = "reserved-oxide-symbols"
 version = "0.2.1"
 source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2db97134d9a3a79fe71c211e65a616dacdf03235#2db97134d9a3a79fe71c211e65a616dacdf03235"
+
+[[package]]
+name = "reserved-oxide-symbols"
+version = "0.3.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2718c23fa90109c675a35204b9ab5f37bd0fa65b#2718c23fa90109c675a35204b9ab5f37bd0fa65b"
 
 [[package]]
 name = "rustc-hash"
