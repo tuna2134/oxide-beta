@@ -64,6 +64,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen"
+version = "0.72.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
+dependencies = [
+ "bitflags",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.13.0",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -91,6 +111,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "bytemuck"
+version = "1.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a1f896587b6f2c069c73d2f0913e2d590c3990285cd2f0b6aa02b786b4c679c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.2",
 ]
 
 [[package]]
@@ -216,29 +256,22 @@ dependencies = [
 [[package]]
 name = "cuda-bindings"
 version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14#2b1269964beaeab789a1512d0089fe42d9336e14"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2db97134d9a3a79fe71c211e65a616dacdf03235#2db97134d9a3a79fe71c211e65a616dacdf03235"
 dependencies = [
- "bindgen",
+ "bindgen 0.71.1",
 ]
 
 [[package]]
 name = "cuda-bindings"
-version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2db97134d9a3a79fe71c211e65a616dacdf03235#2db97134d9a3a79fe71c211e65a616dacdf03235"
+version = "0.5.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2718c23fa90109c675a35204b9ab5f37bd0fa65b#2718c23fa90109c675a35204b9ab5f37bd0fa65b"
 dependencies = [
- "bindgen",
-]
-
-[[package]]
-name = "cuda-core"
-version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14#2b1269964beaeab789a1512d0089fe42d9336e14"
-dependencies = [
- "anyhow",
- "cuda-bindings 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
- "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
- "half",
- "oxide-artifacts 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
+ "bindgen 0.72.1",
+ "libloading",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -247,10 +280,34 @@ version = "0.2.1"
 source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2db97134d9a3a79fe71c211e65a616dacdf03235#2db97134d9a3a79fe71c211e65a616dacdf03235"
 dependencies = [
  "anyhow",
- "cuda-bindings 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2db97134d9a3a79fe71c211e65a616dacdf03235)",
+ "cuda-bindings 0.2.1",
  "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2db97134d9a3a79fe71c211e65a616dacdf03235)",
  "half",
  "oxide-artifacts 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2db97134d9a3a79fe71c211e65a616dacdf03235)",
+]
+
+[[package]]
+name = "cuda-core"
+version = "0.5.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2718c23fa90109c675a35204b9ab5f37bd0fa65b#2718c23fa90109c675a35204b9ab5f37bd0fa65b"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "cuda-bindings 0.5.0",
+ "cuda-core-derive",
+ "cuda-repr",
+ "half",
+ "oxide-artifacts 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "cuda-core-derive"
+version = "0.5.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2718c23fa90109c675a35204b9ab5f37bd0fa65b#2718c23fa90109c675a35204b9ab5f37bd0fa65b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -267,7 +324,7 @@ version = "0.2.1"
 source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2db97134d9a3a79fe71c211e65a616dacdf03235#2db97134d9a3a79fe71c211e65a616dacdf03235"
 dependencies = [
  "cuda-artifact-finalizer",
- "cuda-core 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2db97134d9a3a79fe71c211e65a616dacdf03235)",
+ "cuda-core 0.2.1",
  "cuda-macros 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2db97134d9a3a79fe71c211e65a616dacdf03235)",
  "half",
  "sha2",
@@ -295,6 +352,11 @@ dependencies = [
  "reserved-oxide-symbols 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2db97134d9a3a79fe71c211e65a616dacdf03235)",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "cuda-repr"
+version = "0.5.0"
+source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2718c23fa90109c675a35204b9ab5f37bd0fa65b#2718c23fa90109c675a35204b9ab5f37bd0fa65b"
 
 [[package]]
 name = "daachorse"
@@ -495,6 +557,7 @@ version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
 dependencies = [
+ "bytemuck",
  "cfg-if",
  "crunchy",
  "zerocopy",
@@ -704,7 +767,8 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "oxide-artifacts"
 version = "0.2.1"
-source = "git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14#2b1269964beaeab789a1512d0089fe42d9336e14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74d9a941c0c43d2dceaf25f5c9ca4c9f9cceb28dfa5e4e3cfd14e476f003e7c9"
 dependencies = [
  "object",
 ]
@@ -721,7 +785,7 @@ dependencies = [
 name = "oxide-torch"
 version = "0.1.0"
 dependencies = [
- "cuda-core 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
+ "cuda-core 0.5.0",
  "half",
  "memmap2",
  "oxide-torch-cuda",
@@ -735,7 +799,7 @@ dependencies = [
 name = "oxide-torch-cuda"
 version = "0.1.0"
 dependencies = [
- "cuda-core 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
+ "cuda-core 0.5.0",
  "cuda-device",
  "cuda-host",
  "libloading",
@@ -746,7 +810,7 @@ dependencies = [
 name = "oxide-torch-models"
 version = "0.1.0"
 dependencies = [
- "cuda-core 0.2.1 (git+https://github.com/NVlabs/cuda-oxide.git?rev=2b1269964beaeab789a1512d0089fe42d9336e14)",
+ "cuda-core 0.5.0",
  "oxide-torch",
  "oxide-torch-cuda",
  "safetensors",
